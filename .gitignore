@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+
+tests/outputs/
+DepthCamera_*.json
+DepthCamera_*.png
+ScreenCamera_*.json
+ScreenCamera_*.png
+assets/
+**/data/*

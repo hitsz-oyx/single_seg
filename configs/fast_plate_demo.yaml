@@ -1,0 +1,42 @@
+# Fast demo configuration for the repo-local LIBERO spatial example.
+# This keeps debug output off and targets the currently validated fast path.
+
+segmenter:
+  target_name: plate
+  prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json
+  prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts
+  checkpoint_path: checkpoints/sam3.pt
+  output_dir: tests/outputs/fast_plate_demo
+  overwrite_output: true
+
+  confidence: 0.25
+  mask_threshold: 0.6
+  prompt_keep_score_threshold: 0.2
+  prompt_max_masks: 4
+  video_object_min_score: 0.0
+  video_mask_prob_threshold: 0.95
+
+  prompt_ref_cell: 160
+  prompt_max_cols: 10
+  prompt_canvas_gap: 24
+  seed_min_pixels: 200
+  seed_max_area_ratio: 0.35
+  seed_box_margin: 12
+
+  depth_scale: 1000.0
+  depth_min: 0.1
+  depth_max: 3.0
+  stride: 2
+  frame_voxel_size: 0.003
+
+  save_ply: false
+  save_debug_2d: false
+
+  sam3_image_device: cuda
+  video_backend: tracker_only_stitched
+  compile_video_predictor: false
+  tracker_profile: default
+  tracker_image_size: 896
+  stitched_roi_tracking: false
+  stitched_roi_margin_scale: 2.0
+  stitched_roi_min_size_ratio: 0.35

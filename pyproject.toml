@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "single-seg"
+version = "0.1.0"
+description = "Standalone single-object RGBD point-cloud segmentation with SAM3."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "oyx" }]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+single-seg = "single_seg.single_object_segmenter:main"
+single-seg-view = "single_seg.view_ply_sequence:main"
+
+[tool.setuptools]
+packages = ["single_seg"]
