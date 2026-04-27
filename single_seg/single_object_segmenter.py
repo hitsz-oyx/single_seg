@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-object online RGBD point-cloud segmentation with positive/negative prompt boxes."""
+"""带有正/负提示框的单物体在线 RGBD 点云分割。"""
 
 from __future__ import annotations
 
@@ -26,13 +26,28 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# 默认的剧集（episode）目录
 DEFAULT_EPISODE_DIR = REPO_ROOT / "examples" / "data" / "libero_spatial" / "task_00_demo" / "episode_0001"
+# 默认的提示图像根目录
 DEFAULT_PROMPT_IMAGE_ROOT = REPO_ROOT / "assets" / "prompts" / "libero_spatial" / "semantic_split_parts"
+# 默认的提示任务信息文件
 DEFAULT_PROMPT_TASK_INFO = DEFAULT_PROMPT_IMAGE_ROOT / "task_info.json"
+# 默认的输出目录
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "tests" / "outputs" / "demo_spatial_single_object"
+DEFAULT_PROMPT_MAX_MASKS = 4
+DEFAULT_PROMPT_REF_CELL = 160
+DEFAULT_PROMPT_MAX_COLS = 10
+DEFAULT_PROMPT_CANVAS_GAP = 24
+DEFAULT_SEED_MIN_PIXELS = 200
+DEFAULT_SEED_MAX_AREA_RATIO = 0.35
+DEFAULT_SEED_BOX_MARGIN = 12
+DEFAULT_VIDEO_OBJECT_MIN_SCORE = 0.0
+DEFAULT_TRACKER_IMAGE_SIZE = 896
+DEFAULT_SYNC_TIMING = False
 
 
 def resolve_default_checkpoint() -> Path:
+    """解析并返回默认的 SAM3 模型权重路径。"""
     env_path = os.environ.get("SAM3_CHECKPOINT")
     candidates = []
     if env_path:
@@ -51,6 +66,7 @@ def resolve_default_checkpoint() -> Path:
 
 DEFAULT_CHECKPOINT = resolve_default_checkpoint()
 
+# 将 SAM3 相关的路径加入系统搜索路径
 for sam3_root in (
     Path(os.environ["SAM3_REPO_ROOT"]).expanduser() if os.environ.get("SAM3_REPO_ROOT") else None,
     REPO_ROOT / "third_party" / "sam3",
@@ -61,6 +77,7 @@ for sam3_root in (
 
 @dataclass(frozen=True)
 class PromptEntry:
+    """提示条目，包含语义名称、图像名、源路径和包围框。"""
     semantic_name: str
     image_name: str
     source_path: Path
@@ -69,6 +86,7 @@ class PromptEntry:
 
 @dataclass(frozen=True)
 class CameraFrame:
+    """相机帧数据，包含 RGB、深度、内参、位姿记录和垂直视角。"""
     camera_id: str
     rgb: np.ndarray
     depth_m: np.ndarray
@@ -78,6 +96,7 @@ class CameraFrame:
 
 
 def resolve_repo_path(path_like: str | os.PathLike[str] | Path, *, base_dir: Path = REPO_ROOT) -> Path:
+    """解析相对于仓库根目录的路径。"""
     path = Path(path_like).expanduser()
     if not path.is_absolute():
         path = base_dir / path
@@ -86,42 +105,26 @@ def resolve_repo_path(path_like: str | os.PathLike[str] | Path, *, base_dir: Pat
 
 @dataclass(frozen=True)
 class SingleSegConfig:
-    """Serializable initialization config for SingleObjectPointCloudSegmenter."""
+    """SingleObjectPointCloudSegmenter 的可序列化初始化配置。"""
 
-    target_name: str = "plate"
-    prompt_task_info: Path = DEFAULT_PROMPT_TASK_INFO
-    prompt_image_root: Path = DEFAULT_PROMPT_IMAGE_ROOT
-    checkpoint_path: Path = DEFAULT_CHECKPOINT
-    output_dir: Path = DEFAULT_OUTPUT_DIR
-    overwrite_output: bool = False
-    confidence: float = 0.25
-    mask_threshold: float = 0.6
-    prompt_keep_score_threshold: float = 0.2
-    prompt_max_masks: int = 4
-    prompt_ref_cell: int = 160
-    prompt_max_cols: int = 10
-    prompt_canvas_gap: int = 24
-    seed_min_pixels: int = 200
-    seed_max_area_ratio: float = 0.35
-    seed_box_margin: int = 12
-    video_object_min_score: float = 0.0
-    video_mask_prob_threshold: float = 0.95
-    depth_scale: float = 1000.0
-    depth_min: float = 0.1
-    depth_max: float = 3.0
-    stride: int = 2
-    frame_voxel_size: float = 0.003
-    save_ply: bool = True
-    save_debug_2d: bool = False
-    sam3_image_device: str | None = None
-    video_backend: str = "tracker_only_stitched"
-    compile_video_predictor: bool = False
-    tracker_profile: str = "default"
-    tracker_image_size: int | None = 896
-    stitched_roi_tracking: bool = False
-    stitched_roi_margin_scale: float = 2.0
-    stitched_roi_min_size_ratio: float = 0.35
-    sync_timing: bool | None = None
+    target_name: str = "plate"  # 目标物体名称
+    prompt_task_info: Path = DEFAULT_PROMPT_TASK_INFO  # 提示任务信息路径
+    prompt_image_root: Path = DEFAULT_PROMPT_IMAGE_ROOT  # 提示图像根目录
+    checkpoint_path: Path = DEFAULT_CHECKPOINT  # 模型权重路径
+    output_dir: Path = DEFAULT_OUTPUT_DIR  # 输出目录
+    overwrite_output: bool = False  # 是否覆盖输出
+    confidence: float = 0.25  # 置信度阈值
+    mask_threshold: float = 0.6  # 掩码阈值
+    prompt_keep_score_threshold: float = 0.2  # 提示保留评分阈值
+    video_mask_prob_threshold: float = 0.95  # 视频掩码概率阈值
+    depth_scale: float = 1000.0  # 深度缩放比例（将单位转换为米）
+    depth_min: float = 0.1  # 最小有效深度（米）
+    depth_max: float = 3.0  # 最大有效深度（米）
+    stride: int = 2  # 处理帧的步长
+    frame_voxel_size: float = 0.003  # 帧体素大小（用于下采样点云）
+    save_ply: bool = True  # 是否保存 .ply 点云文件
+    save_debug_2d: bool = False  # 是否保存 2D 调试图
+    tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE  # 追踪器输入图像尺寸
 
     @classmethod
     def from_mapping(
@@ -130,6 +133,7 @@ class SingleSegConfig:
         *,
         base_dir: Path = REPO_ROOT,
     ) -> "SingleSegConfig":
+        """从字典映射创建配置对象。"""
         raw = dict(payload.get("segmenter", payload))
         defaults = cls()
         path_fields = {"prompt_task_info", "prompt_image_root", "checkpoint_path", "output_dir"}
@@ -145,6 +149,7 @@ class SingleSegConfig:
 
     @classmethod
     def from_yaml(cls, config_path: Path | str) -> "SingleSegConfig":
+        """从 YAML 文件加载配置。"""
         config_path = resolve_repo_path(config_path)
         with config_path.open("r", encoding="utf-8") as handle:
             payload = yaml.safe_load(handle) or {}
@@ -152,9 +157,11 @@ class SingleSegConfig:
 
     @classmethod
     def from_file(cls, config_path: Path | str) -> "SingleSegConfig":
+        """从文件加载配置（支持 .json 和 .yaml 格式）。"""
         return cls.from_yaml(config_path)
 
     def with_overrides(self, **overrides: Any) -> "SingleSegConfig":
+        """应用覆盖选项，返回新的配置对象。"""
         merged = {field_name: getattr(self, field_name) for field_name in self.__dataclass_fields__}
         for key, value in overrides.items():
             if value is None or key not in merged:
@@ -163,18 +170,22 @@ class SingleSegConfig:
         return SingleSegConfig(**merged)
 
     def to_segmenter_kwargs(self) -> dict[str, Any]:
+        """将配置转换为传给分层器的关键字参数。"""
         return {field_name: getattr(self, field_name) for field_name in self.__dataclass_fields__}
 
 
 def load_json(path: Path) -> dict[str, Any]:
+    """读取 JSON 文件。"""
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def semantic_name_from_asset(asset_name: str) -> str:
+    """从资产名称中提取语义名称（去除末尾的数字索引）。"""
     return re.sub(r"_\d+$", "", str(asset_name))
 
 
 def collect_common_frame_names(episode_dir: Path, camera_ids: list[str]) -> list[str]:
+    """收集多个相机共有的帧名称列表。"""
     common_names: set[str] | None = None
     for camera_id in camera_ids:
         rgb_names = {path.name for path in (episode_dir / camera_id / "rgb").glob("frame_*.png")}
@@ -187,6 +198,7 @@ def collect_common_frame_names(episode_dir: Path, camera_ids: list[str]) -> list
 
 
 def load_frame_camera_extrinsics(episode_dir: Path, frame_name: str) -> dict[str, dict[str, object]]:
+    """加载特定帧的相机外参。"""
     frames_path = episode_dir / "camera_extrinsics_frames.jsonl"
     if not frames_path.exists():
         return {}
@@ -210,6 +222,7 @@ def load_frame_camera_extrinsics(episode_dir: Path, frame_name: str) -> dict[str
 
 
 def load_episode_camera_records(episode_dir: Path) -> list[dict[str, object]]:
+    """加载剧集的相机基准记录（外参及内参）。"""
     payload = load_json(episode_dir / "camera_extrinsics.json")
     cameras = payload.get("cameras", [])
     if not isinstance(cameras, list) or not cameras:
@@ -218,6 +231,7 @@ def load_episode_camera_records(episode_dir: Path) -> list[dict[str, object]]:
 
 
 def normalize_intrinsics_payload(intrinsics: object | None) -> dict[str, float] | None:
+    """标准化相机内参格式（支持字典或 3x3 矩阵）。"""
     if intrinsics is None:
         return None
     if isinstance(intrinsics, dict):
@@ -239,6 +253,7 @@ def normalize_intrinsics_payload(intrinsics: object | None) -> dict[str, float] 
 
 
 def normalize_pose_record(camera_id: str, payload: dict[str, object]) -> dict[str, object]:
+    """标准化相机位姿记录，确保包含 cam2world_4x4 和 world2cam_4x4。"""
     pose_record = payload.get("pose_record")
     if isinstance(pose_record, dict) and pose_record.get("cam2world_4x4") is not None:
         cam2world = np.asarray(pose_record["cam2world_4x4"], dtype=np.float64)
@@ -270,6 +285,7 @@ def normalize_pose_record(camera_id: str, payload: dict[str, object]) -> dict[st
 
 
 def load_rgb_depth(rgb_path: Path, depth_path: Path, depth_scale: float) -> tuple[np.ndarray, np.ndarray]:
+    """读取并处理 RGB 和深度图。"""
     rgb = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
     depth_m = np.asarray(Image.open(depth_path), dtype=np.float32) / float(depth_scale)
     return rgb, depth_m
@@ -281,6 +297,7 @@ def load_episode_frame_inputs(
     camera_records: list[dict[str, object]],
     depth_scale: float,
 ) -> dict[str, dict[str, object]]:
+    """加载指定剧集和帧名称的所有相机的输入数据。"""
     frame_extrinsics = load_frame_camera_extrinsics(episode_dir, frame_name)
     camera_inputs: dict[str, dict[str, object]] = {}
     for camera_record in camera_records:
@@ -302,6 +319,7 @@ def load_episode_frame_inputs(
 
 
 def build_prompt_grid_layout(prompt_ids: list[str], ref_cell: int, max_cols: int) -> dict[str, tuple[int, int]]:
+    """构建提示网格布局，计算每个提示在画布上的位置。"""
     cols = min(max(max_cols, 1), max(1, math.ceil(math.sqrt(len(prompt_ids)))))
     layout: dict[str, tuple[int, int]] = {}
     for idx, prompt_id in enumerate(prompt_ids):
@@ -312,6 +330,7 @@ def build_prompt_grid_layout(prompt_ids: list[str], ref_cell: int, max_cols: int
 
 
 def scale_bbox_to_layout(box_xyxy: list[int], source_size: list[int], pasted_size: list[int]) -> list[float]:
+    """将包围框从源图像坐标缩放到目标画布坐标。"""
     src_w = max(float(source_size[0]), 1.0)
     src_h = max(float(source_size[1]), 1.0)
     dst_w = float(pasted_size[0])
@@ -326,6 +345,7 @@ def scale_bbox_to_layout(box_xyxy: list[int], source_size: list[int], pasted_siz
 
 
 def xywh_to_normalized_cxcywh(box_xywh: list[float], image_size: tuple[int, int]) -> list[float]:
+    """将中心点坐标和宽高格式的包围框转换为归一化的中心坐标和宽高格式。"""
     x, y, w, h = [float(value) for value in box_xywh]
     image_w = max(float(image_size[0]), 1.0)
     image_h = max(float(image_size[1]), 1.0)
@@ -345,6 +365,7 @@ def filter_predictions_to_camera(
     keep_score_threshold: float,
     max_keep: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """根据相机视角过滤并选择预测的目标框、得分和掩码。"""
     cam_x, cam_y = camera_layout["paste_xy"]
     cam_w, cam_h = camera_layout["image_size"]
     kept: list[tuple[int, float]] = []
@@ -373,6 +394,7 @@ def filter_predictions_to_camera(
 
 
 def load_prompt_entries(task_info_path: Path, prompt_image_root: Path) -> list[PromptEntry]:
+    """加载提示条目，包含正负提示的图像路径和包围框信息。"""
     payload = load_json(task_info_path)
     assets = payload.get("assets", [])
     if not isinstance(assets, list) or not assets:
@@ -410,6 +432,7 @@ def load_prompt_entries(task_info_path: Path, prompt_image_root: Path) -> list[P
 
 
 def split_prompt_entries(entries: list[PromptEntry], target_name: str) -> tuple[list[PromptEntry], list[PromptEntry]]:
+    """将提示条目分为正例和负例。"""
     positive = [entry for entry in entries if entry.semantic_name == target_name]
     negative = [entry for entry in entries if entry.semantic_name != target_name]
     if not positive:
@@ -425,6 +448,7 @@ def build_prompt_canvas(
     max_cols: int,
     canvas_gap: int,
 ) -> tuple[Image.Image, dict[str, dict[str, object]]]:
+    """构建提示画布，将提示图像拼接到相机图像旁边。"""
     prompt_ids = [entry.image_name for entry in prompt_entries]
     ref_positions = build_prompt_grid_layout(prompt_ids, ref_cell=ref_cell, max_cols=max_cols)
     cols = min(max(max_cols, 1), max(1, int(np.ceil(np.sqrt(len(prompt_entries))))))
@@ -465,6 +489,7 @@ def build_prompt_canvas(
 
 
 def create_canvas_prompts(prompt_entries: list[PromptEntry], layout: dict[str, dict[str, object]]) -> list[dict[str, object]]:
+    """根据提示条目和布局信息创建画布提示。"""
     prompts: list[dict[str, object]] = []
     for entry in prompt_entries:
         image_layout = layout[entry.image_name]
@@ -484,18 +509,21 @@ def create_canvas_prompts(prompt_entries: list[PromptEntry], layout: dict[str, d
 
 
 def autocast_context():
+    """自动混合精度上下文管理器（根据可用的 CUDA 设备选择）。"""
     if torch.cuda.is_available():
         return torch.autocast("cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 
 def no_autocast_context(device: torch.device | None = None):
+    """禁用自动混合精度的上下文管理器。"""
     if device is not None and device.type == "cuda":
         return torch.autocast("cuda", enabled=False)
     return contextlib.nullcontext()
 
 
 def maybe_cuda_synchronize(device: torch.device | None, enabled: bool) -> None:
+    """在指定设备上执行 CUDA 同步（如果启用）。"""
     if enabled and device is not None and device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -504,16 +532,14 @@ def load_sam3_image_processor(
     checkpoint_path: Path,
     confidence: float,
     mask_threshold: float,
-    device: str | None = None,
 ):
+    """加载 SAM3 图像处理器。"""
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"SAM3 checkpoint not found: {checkpoint_path}")
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
-    resolved_device = str(device).strip() if device is not None else ""
-    if not resolved_device:
-        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+    resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_sam3_image_model(
         checkpoint_path=str(checkpoint_path),
         load_from_HF=False,
@@ -533,63 +559,21 @@ def load_sam3_image_processor(
         )
 
 
-def load_sam3_video_predictor(
+def load_video_predictor(
     checkpoint_path: Path,
     *,
-    compile_video_predictor: bool = False,
-):
-    if not torch.cuda.is_available():
-        raise RuntimeError("SAM3 video predictor requires CUDA")
-    from sam3.model_builder import build_sam3_video_predictor
-
-    predictor = build_sam3_video_predictor(
-        checkpoint_path=str(checkpoint_path),
-        gpus_to_use=[torch.cuda.current_device()],
-        async_loading_frames=True,
-        compile=bool(compile_video_predictor),
-    )
-    return predictor
-
-
-def load_video_backend_predictor(
-    checkpoint_path: Path,
-    *,
-    video_backend: str,
-    compile_video_predictor: bool = False,
-    tracker_profile: str = "default",
     tracker_image_size: int | None = None,
 ):
-    backend = str(video_backend).strip().lower()
-    if backend == "video_model":
-        return load_sam3_video_predictor(
-            checkpoint_path=checkpoint_path,
-            compile_video_predictor=bool(compile_video_predictor),
-        )
-    if backend == "tracker_only":
-        try:
-            from single_seg.tracker_only_backend import TrackerOnlyVideoPredictor
-        except ImportError:
-            from tracker_only_backend import TrackerOnlyVideoPredictor
+    """加载固定的 stitched tracker 视频预测器。"""
+    try:
+        from single_seg.tracker_only_backend import TrackerOnlyVideoPredictor
+    except ImportError:
+        from tracker_only_backend import TrackerOnlyVideoPredictor
 
-        return TrackerOnlyVideoPredictor(
-            checkpoint_path=checkpoint_path,
-            compile_model=bool(compile_video_predictor),
-            tracker_profile=str(tracker_profile),
-            tracker_image_size=tracker_image_size,
-        )
-    if backend == "tracker_only_stitched":
-        try:
-            from single_seg.tracker_only_backend import TrackerOnlyVideoPredictor
-        except ImportError:
-            from tracker_only_backend import TrackerOnlyVideoPredictor
-
-        return TrackerOnlyVideoPredictor(
-            checkpoint_path=checkpoint_path,
-            compile_model=bool(compile_video_predictor),
-            tracker_profile=str(tracker_profile),
-            tracker_image_size=tracker_image_size,
-        )
-    raise ValueError(f"Unsupported video_backend: {video_backend}")
+    return TrackerOnlyVideoPredictor(
+        checkpoint_path=checkpoint_path,
+        tracker_image_size=tracker_image_size,
+    )
 
 
 def run_single_object_prompt_query(
@@ -607,6 +591,7 @@ def run_single_object_prompt_query(
     debug_canvas_path: Path | None = None,
     debug_prompt_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """运行单次对象提示查询，返回过滤后的目标框、得分和掩码。"""
     selected_entries = list(positive_entries) + list(negative_entries)
     canvas, layout = build_prompt_canvas(
         camera_image=image,
@@ -672,6 +657,7 @@ def select_best_seed_mask(
     masks: np.ndarray,
     min_pixels: int,
 ) -> tuple[np.ndarray, float, list[int]] | None:
+    """从多个种子掩码中选择最佳者，依据是掩码的像素数和得分。"""
     if boxes.shape[0] == 0:
         return None
     order = sorted(
@@ -688,6 +674,7 @@ def select_best_seed_mask(
 
 
 def largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    """提取掩码的最大连通组件。"""
     mask_bool = np.asarray(mask, dtype=bool)
     if not np.any(mask_bool):
         return mask_bool
@@ -714,6 +701,7 @@ def refine_seed_mask(
     box_margin: int,
     min_pixels: int,
 ) -> tuple[np.ndarray, str]:
+    """精炼种子掩码，确保其在包围框内并符合面积要求。"""
     mask_bool = largest_connected_component(np.asarray(mask, dtype=bool))
     image_area = int(image_shape[0] * image_shape[1])
     mask_area = int(np.count_nonzero(mask_bool))
@@ -742,6 +730,7 @@ def refine_seed_mask(
 
 
 def as_numpy(array_like) -> np.ndarray:
+    """将数组类对象转换为 NumPy 数组。"""
     if isinstance(array_like, np.ndarray):
         return array_like
     if torch.is_tensor(array_like):
@@ -755,6 +744,7 @@ def as_torch(
     device: torch.device,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    """将数组类对象转换为 PyTorch 张量。"""
     if torch.is_tensor(array_like):
         tensor = array_like.to(device=device, non_blocking=True)
         if dtype is not None and tensor.dtype != dtype:
@@ -764,6 +754,7 @@ def as_torch(
 
 
 def stable_sigmoid(x: np.ndarray) -> np.ndarray:
+    """数值稳定的 sigmoid 函数实现。"""
     x = np.asarray(x, dtype=np.float32)
     positive = x >= 0
     out = np.empty_like(x, dtype=np.float32)
@@ -774,6 +765,7 @@ def stable_sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def prob_threshold_to_logit(threshold: float) -> float:
+    """将概率阈值转换为对数几率（logit）值。"""
     threshold = float(threshold)
     if threshold <= 0.0:
         return float("-inf")
@@ -792,6 +784,7 @@ def build_score_label_map(
     out_mask_logits: np.ndarray | None = None,
     mask_prob_threshold: float = 0.5,
 ) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
+    """根据模型输出构建分数-标签映射，供后续处理使用。"""
     height, width = image_shape
     label_map = np.full((height, width), -1, dtype=np.int32)
     score_map = np.full((height, width), -np.inf, dtype=np.float32)
@@ -841,6 +834,7 @@ def _score_label_map_from_output(
     min_object_score: float,
     mask_prob_threshold: float,
 ) -> dict[str, object]:
+    """从模型输出中提取分数-标签映射，供后续处理使用。"""
     out_obj_ids = as_numpy(output["out_obj_ids"])
     out_masks = as_numpy(output["out_binary_masks"])
     out_probs = as_numpy(output["out_probs"])
@@ -870,6 +864,7 @@ def _extract_target_mask_from_output_torch(
     target_obj_id: int = 1,
     device: torch.device,
 ) -> dict[str, object]:
+    """从模型输出中提取目标掩码，供后续处理使用（PyTorch 实现）。"""
     height, width = (int(image_shape[0]), int(image_shape[1]))
     empty_mask = torch.zeros((height, width), dtype=torch.bool, device=device)
     out_obj_ids = as_torch(output["out_obj_ids"], device=device, dtype=torch.int64).reshape(-1)
@@ -924,6 +919,7 @@ def extract_frame_output(
     min_object_score: float = 0.0,
     mask_prob_threshold: float = 0.5,
 ) -> dict[str, object] | None:
+    """提取单帧的目标掩码输出，供后续处理使用。"""
     if hasattr(video_predictor, "infer_frame"):
         payload = video_predictor.infer_frame(session_id=session_id, frame_idx=int(frame_idx), reverse=False)
         if int(payload["frame_index"]) == int(frame_idx) and payload["outputs"] is not None:
@@ -966,6 +962,7 @@ def extract_target_mask_output(
     target_obj_id: int = 1,
     device: torch.device,
 ) -> dict[str, object] | None:
+    """提取单帧的目标掩码输出，供后续处理使用（PyTorch 实现）。"""
     if hasattr(video_predictor, "infer_frame"):
         payload = video_predictor.infer_frame(session_id=session_id, frame_idx=int(frame_idx), reverse=False)
         if int(payload["frame_index"]) == int(frame_idx) and payload["outputs"] is not None:
@@ -1007,6 +1004,7 @@ def extract_frame_outputs_batch(
     min_object_score: float = 0.0,
     mask_prob_threshold: float = 0.5,
 ) -> dict[str, dict[str, object] | None]:
+    """批量提取帧的目标掩码输出，供后续处理使用。"""
     results: dict[str, dict[str, object] | None] = {}
     if hasattr(video_predictor, "infer_frames_batch"):
         payloads = video_predictor.infer_frames_batch(
@@ -1055,6 +1053,7 @@ def extract_target_mask_outputs_batch(
     target_obj_id: int = 1,
     device: torch.device,
 ) -> dict[str, dict[str, object] | None]:
+    """批量提取帧的目标掩码输出，供后续处理使用（PyTorch 实现）。"""
     results: dict[str, dict[str, object] | None] = {}
     if hasattr(video_predictor, "infer_frames_batch"):
         payloads = video_predictor.infer_frames_batch(
@@ -1109,6 +1108,7 @@ def backproject_scene_points_with_labels(
     depth_max: float,
     stride: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """根据 RGB 图像、深度图和掩码反投影场景点，并返回 3D 坐标和颜色。"""
     height, width = depth_m.shape
     if intrinsics is not None:
         fx = float(intrinsics["fx"])
@@ -1159,6 +1159,7 @@ def backproject_scene_points_with_labels_torch(
     *,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """根据 RGB 图像、深度图和掩码反投影场景点（PyTorch 实现）。"""
     with no_autocast_context(device):
         if torch.is_tensor(sampled_depth_m):
             depth = sampled_depth_m.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -1205,6 +1206,7 @@ def fuse_scene_geometry(
     label_chunks: list[np.ndarray],
     voxel_size: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """融合场景几何信息，生成下采样后的点云、颜色和标签。"""
     points = np.concatenate(point_chunks, axis=0)
     colors = np.concatenate(color_chunks, axis=0)
     labels = np.concatenate(label_chunks, axis=0).astype(np.int32, copy=False)
@@ -1256,6 +1258,7 @@ def fuse_scene_geometry_torch(
     *,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """融合场景几何信息（PyTorch 实现），生成下采样后的点云、颜色和标签。"""
     points = torch.cat(point_chunks, dim=0)
     colors = torch.cat(color_chunks, dim=0)
     labels = torch.cat(label_chunks, dim=0).to(torch.int32)
@@ -1287,6 +1290,7 @@ def fuse_scene_geometry_torch(
 
 
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
+    """将点云数据写入 .ply 文件。"""
     if points.shape[0] != colors.shape[0]:
         raise ValueError("points and colors must have the same length")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1309,6 +1313,7 @@ def write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 
 def write_label_ply(path: Path, points: np.ndarray, labels: np.ndarray) -> None:
+    """将带标签的点云数据写入 .ply 文件。"""
     if points.shape[0] != labels.shape[0]:
         raise ValueError("points and labels must have the same length")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +1340,7 @@ def save_binary_mask_debug(
     mask: np.ndarray,
     score: float | None,
 ) -> None:
+    """保存二进制掩码调试信息，包括 RGB 图像、掩码叠加图和掩码本身。"""
     frame_stem = frame_name.replace(".png", "")
     camera_dir = output_dir / "masks_2d" / frame_stem / camera_id
     camera_dir.mkdir(parents=True, exist_ok=True)
@@ -1360,7 +1366,7 @@ def save_binary_mask_debug(
 
 
 class SingleObjectPointCloudSegmenter:
-    """Fast single-object online segmenter using one positive class and negative boxes for all others."""
+    """快速单物体在线分割器，使用一个正类提示和所有其他类的负框。"""
 
     @classmethod
     def from_config(cls, config: SingleSegConfig, **overrides: Any) -> "SingleObjectPointCloudSegmenter":
@@ -1387,14 +1393,6 @@ class SingleObjectPointCloudSegmenter:
         confidence: float = 0.25,
         mask_threshold: float = 0.6,
         prompt_keep_score_threshold: float = 0.2,
-        prompt_max_masks: int = 4,
-        prompt_ref_cell: int = 160,
-        prompt_max_cols: int = 10,
-        prompt_canvas_gap: int = 24,
-        seed_min_pixels: int = 200,
-        seed_max_area_ratio: float = 0.35,
-        seed_box_margin: int = 12,
-        video_object_min_score: float = 0.0,
         video_mask_prob_threshold: float = 0.95,
         depth_scale: float = 1000.0,
         depth_min: float = 0.1,
@@ -1403,15 +1401,7 @@ class SingleObjectPointCloudSegmenter:
         frame_voxel_size: float = 0.003,
         save_ply: bool = True,
         save_debug_2d: bool = False,
-        sam3_image_device: str | None = None,
-        video_backend: str = "tracker_only_stitched",
-        compile_video_predictor: bool = False,
-        tracker_profile: str = "default",
-        tracker_image_size: int | None = 896,
-        stitched_roi_tracking: bool = False,
-        stitched_roi_margin_scale: float = 2.0,
-        stitched_roi_min_size_ratio: float = 0.35,
-        sync_timing: bool | None = None,
+        tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE,
     ) -> None:
         self.target_name = str(target_name)
         self.prompt_task_info = Path(prompt_task_info).resolve()
@@ -1421,14 +1411,6 @@ class SingleObjectPointCloudSegmenter:
         self.confidence = float(confidence)
         self.mask_threshold = float(mask_threshold)
         self.prompt_keep_score_threshold = float(prompt_keep_score_threshold)
-        self.prompt_max_masks = int(prompt_max_masks)
-        self.prompt_ref_cell = int(prompt_ref_cell)
-        self.prompt_max_cols = int(prompt_max_cols)
-        self.prompt_canvas_gap = int(prompt_canvas_gap)
-        self.seed_min_pixels = int(seed_min_pixels)
-        self.seed_max_area_ratio = float(seed_max_area_ratio)
-        self.seed_box_margin = int(seed_box_margin)
-        self.video_object_min_score = float(video_object_min_score)
         self.video_mask_prob_threshold = float(video_mask_prob_threshold)
         self.depth_scale = float(depth_scale)
         self.depth_min = float(depth_min)
@@ -1437,17 +1419,16 @@ class SingleObjectPointCloudSegmenter:
         self.frame_voxel_size = float(frame_voxel_size)
         self.save_ply = bool(save_ply)
         self.save_debug_2d = bool(save_debug_2d)
-        self.sam3_image_device = sam3_image_device
-        self.video_backend = str(video_backend).strip().lower()
-        self.compile_video_predictor = bool(compile_video_predictor)
-        self.tracker_profile = str(tracker_profile).strip().lower()
         self.tracker_image_size = None if tracker_image_size is None else int(tracker_image_size)
-        self.stitched_roi_tracking = bool(stitched_roi_tracking)
-        self.stitched_roi_margin_scale = float(stitched_roi_margin_scale)
-        self.stitched_roi_min_size_ratio = float(stitched_roi_min_size_ratio)
-        if sync_timing is None:
-            sync_timing = os.environ.get("SINGLE_SEG_SYNC_TIMING", "0") not in {"", "0", "false", "False"}
-        self.sync_timing = bool(sync_timing)
+        self.prompt_max_masks = DEFAULT_PROMPT_MAX_MASKS
+        self.prompt_ref_cell = DEFAULT_PROMPT_REF_CELL
+        self.prompt_max_cols = DEFAULT_PROMPT_MAX_COLS
+        self.prompt_canvas_gap = DEFAULT_PROMPT_CANVAS_GAP
+        self.seed_min_pixels = DEFAULT_SEED_MIN_PIXELS
+        self.seed_max_area_ratio = DEFAULT_SEED_MAX_AREA_RATIO
+        self.seed_box_margin = DEFAULT_SEED_BOX_MARGIN
+        self.video_object_min_score = DEFAULT_VIDEO_OBJECT_MIN_SCORE
+        self.sync_timing = DEFAULT_SYNC_TIMING
 
         if overwrite_output and self.output_dir.exists():
             shutil.rmtree(self.output_dir)
@@ -1468,22 +1449,17 @@ class SingleObjectPointCloudSegmenter:
             checkpoint_path=self.checkpoint_path,
             confidence=self.confidence,
             mask_threshold=self.mask_threshold,
-            device=self.sam3_image_device,
         )
         self.image_processor_load_time_sec = time.perf_counter() - image_processor_t0
         video_predictor_t0 = time.perf_counter()
-        self.video_predictor = load_video_backend_predictor(
+        self.video_predictor = load_video_predictor(
             checkpoint_path=self.checkpoint_path,
-            video_backend=self.video_backend,
-            compile_video_predictor=self.compile_video_predictor,
-            tracker_profile=self.tracker_profile,
             tracker_image_size=self.tracker_image_size,
         )
         self.video_predictor_load_time_sec = time.perf_counter() - video_predictor_t0
 
         self.session_ids: dict[str, str] = {}
         self.stitched_layout: Any | None = None
-        self.stitched_crop_windows: dict[str, object] = {}
         self.active_camera_ids: list[str] = []
         self.seed_info_by_camera: dict[str, dict[str, object]] = {}
         self.tensor_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1510,6 +1486,7 @@ class SingleObjectPointCloudSegmenter:
         intrinsics: dict[str, float] | None,
         fovy_deg: float | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """获取 PyTorch 中的反投影缩放因子（X 和 Y 方向）。"""
         if intrinsics is not None:
             fx = float(intrinsics["fx"])
             fy = float(intrinsics["fy"])
@@ -1548,119 +1525,13 @@ class SingleObjectPointCloudSegmenter:
         self._torch_backproject_scale_cache[key] = cached
         return cached
 
-    def _uses_stitched_tracking(self) -> bool:
-        return self.video_backend == "tracker_only_stitched"
-
-    def _uses_stitched_roi_tracking(self) -> bool:
-        return self._uses_stitched_tracking() and bool(self.stitched_roi_tracking)
-
-    def _derive_stitched_crop_windows(
-        self,
-        frame_resources: dict[str, list[Image.Image]],
-        masks_by_camera: dict[str, np.ndarray],
-        previous_windows: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        try:
-            from single_seg.tracker_only_backend import crop_window_from_mask, full_frame_crop_window
-        except ImportError:
-            from tracker_only_backend import crop_window_from_mask, full_frame_crop_window
-
-        windows: dict[str, object] = {}
-        previous_windows = previous_windows or {}
-        for camera_id in self.active_camera_ids:
-            image = frame_resources[camera_id][0]
-            image_size = (int(image.width), int(image.height))
-            mask = np.asarray(masks_by_camera.get(camera_id), dtype=bool) if camera_id in masks_by_camera else None
-            if mask is not None and mask.shape == (image.height, image.width) and np.any(mask):
-                windows[camera_id] = crop_window_from_mask(
-                    mask,
-                    image_size=image_size,
-                    margin_scale=self.stitched_roi_margin_scale,
-                    min_size_ratio=self.stitched_roi_min_size_ratio,
-                )
-            elif camera_id in previous_windows:
-                windows[camera_id] = previous_windows[camera_id]
-            else:
-                windows[camera_id] = full_frame_crop_window(image_size)
-        return windows
-
-    def _build_roi_frame_resources(
-        self,
-        frame_resources: dict[str, list[Image.Image]],
-        crop_windows: dict[str, object],
-    ) -> dict[str, list[Image.Image]]:
-        try:
-            from single_seg.tracker_only_backend import crop_and_resize_frame
-        except ImportError:
-            from tracker_only_backend import crop_and_resize_frame
-
-        roi_resources: dict[str, list[Image.Image]] = {}
-        for camera_id in self.active_camera_ids:
-            image = frame_resources[camera_id][0]
-            crop_window = crop_windows[camera_id]
-            roi_resources[camera_id] = [
-                crop_and_resize_frame(
-                    image,
-                    crop_window,
-                    output_size=(int(image.width), int(image.height)),
-                )
-            ]
-        return roi_resources
-
-    def _crop_masks_to_roi_view(
-        self,
-        masks_by_camera: dict[str, np.ndarray],
-        frame_resources: dict[str, list[Image.Image]],
-        crop_windows: dict[str, object],
-    ) -> dict[str, np.ndarray]:
-        try:
-            from single_seg.tracker_only_backend import crop_mask_to_tracker_view
-        except ImportError:
-            from tracker_only_backend import crop_mask_to_tracker_view
-
-        roi_masks: dict[str, np.ndarray] = {}
-        for camera_id in self.active_camera_ids:
-            if camera_id not in masks_by_camera:
-                continue
-            image = frame_resources[camera_id][0]
-            roi_masks[camera_id] = crop_mask_to_tracker_view(
-                np.asarray(masks_by_camera[camera_id], dtype=bool),
-                crop_windows[camera_id],
-                output_size=(int(image.width), int(image.height)),
-            )
-        return roi_masks
-
-    def _project_roi_masks_to_full(
-        self,
-        roi_masks_by_camera: dict[str, np.ndarray],
-        frame_resources: dict[str, list[Image.Image]],
-        crop_windows: dict[str, object],
-    ) -> dict[str, np.ndarray]:
-        try:
-            from single_seg.tracker_only_backend import project_tracker_mask_to_full_image
-        except ImportError:
-            from tracker_only_backend import project_tracker_mask_to_full_image
-
-        full_masks: dict[str, np.ndarray] = {}
-        for camera_id in self.active_camera_ids:
-            image = frame_resources[camera_id][0]
-            roi_mask = np.asarray(
-                roi_masks_by_camera.get(camera_id, np.zeros((image.height, image.width), dtype=bool)),
-                dtype=bool,
-            )
-            full_masks[camera_id] = project_tracker_mask_to_full_image(
-                roi_mask,
-                crop_windows[camera_id],
-                full_size=(int(image.width), int(image.height)),
-            )
-        return full_masks
-
     def _initialize_sessions(
         self,
         frame_name: str,
         camera_inputs: dict[str, dict[str, object]],
-        frame_resources: dict[str, list[Image.Image]] | None,
+        frame_resources: dict[str, list[Image.Image]],
     ) -> None:
+        """初始化每个相机的追踪会话，并根据正负提示框设置种子掩码。"""
         seed_masks_by_camera: dict[str, np.ndarray] = {}
         active_camera_ids: list[str] = []
         for camera_id, payload in camera_inputs.items():
@@ -1738,77 +1609,31 @@ class SingleObjectPointCloudSegmenter:
                     mask=np.asarray(seed_mask, dtype=bool),
                     score=seed_score,
                 )
-            if self._uses_stitched_tracking():
-                continue
-            if frame_resources is None:
-                raise RuntimeError("frame_resources are required for per-camera tracking initialization")
-            with autocast_context():
-                session_id = self.video_predictor.start_session(frame_resources[camera_id])["session_id"]
-                self.video_predictor.add_prompt(
-                    session_id=session_id,
-                    frame_idx=0,
-                    mask=np.asarray(seed_mask, dtype=np.uint8),
-                    obj_id=1,
-                )
-                self.session_ids[camera_id] = session_id
         self.active_camera_ids = active_camera_ids
         if not self.active_camera_ids:
             raise RuntimeError(f"No camera produced a usable seed for target {self.target_name!r}")
-        if self._uses_stitched_tracking():
-            try:
-                from single_seg.tracker_only_backend import (
-                    compose_camera_frame_resources,
-                    compose_camera_rgb_frame_resources,
-                    stitch_camera_binary_masks,
-                )
-            except ImportError:
-                from tracker_only_backend import (
-                    compose_camera_frame_resources,
-                    compose_camera_rgb_frame_resources,
-                    stitch_camera_binary_masks,
-                )
+        try:
+            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, stitch_camera_binary_masks
+        except ImportError:
+            from tracker_only_backend import compose_camera_rgb_frame_resources, stitch_camera_binary_masks
 
-            stitched_frame_resources = frame_resources
-            stitched_seed_masks = seed_masks_by_camera
-            self.stitched_crop_windows = {}
-            if self._uses_stitched_roi_tracking():
-                if frame_resources is None:
-                    raise RuntimeError("frame_resources are required for stitched ROI tracking")
-                self.stitched_crop_windows = self._derive_stitched_crop_windows(
-                    frame_resources=frame_resources,
-                    masks_by_camera=seed_masks_by_camera,
-                )
-                stitched_frame_resources = self._build_roi_frame_resources(
-                    frame_resources=frame_resources,
-                    crop_windows=self.stitched_crop_windows,
-                )
-                stitched_seed_masks = self._crop_masks_to_roi_view(
-                    masks_by_camera=seed_masks_by_camera,
-                    frame_resources=frame_resources,
-                    crop_windows=self.stitched_crop_windows,
-                )
-                composite_resources, self.stitched_layout = compose_camera_frame_resources(
-                    frame_resources=stitched_frame_resources,
-                    camera_order=self.active_camera_ids,
-                )
-            else:
-                composite_resources, self.stitched_layout = compose_camera_rgb_frame_resources(
-                    rgb_by_camera={
-                        camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
-                        for camera_id in self.active_camera_ids
-                    },
-                    camera_order=self.active_camera_ids,
-                )
-            composite_mask = stitch_camera_binary_masks(stitched_seed_masks, self.stitched_layout)
-            with autocast_context():
-                session_id = self.video_predictor.start_session(composite_resources)["session_id"]
-                self.video_predictor.add_prompt(
-                    session_id=session_id,
-                    frame_idx=0,
-                    mask=np.asarray(composite_mask, dtype=np.uint8),
-                    obj_id=1,
-                )
-                self.session_ids["__stitched__"] = session_id
+        composite_resources, self.stitched_layout = compose_camera_rgb_frame_resources(
+            rgb_by_camera={
+                camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
+                for camera_id in self.active_camera_ids
+            },
+            camera_order=self.active_camera_ids,
+        )
+        composite_mask = stitch_camera_binary_masks(seed_masks_by_camera, self.stitched_layout)
+        with autocast_context():
+            session_id = self.video_predictor.start_session(composite_resources)["session_id"]
+            self.video_predictor.add_prompt(
+                session_id=session_id,
+                frame_idx=0,
+                mask=np.asarray(composite_mask, dtype=np.uint8),
+                obj_id=1,
+            )
+            self.session_ids["__stitched__"] = session_id
         self.startup_time_before_streaming = time.perf_counter() - self.pipeline_t0
         self.initialized = True
 
@@ -1817,23 +1642,17 @@ class SingleObjectPointCloudSegmenter:
         *,
         frame_name: str,
         camera_inputs: dict[str, dict[str, object]],
-        output_format: str = "numpy",
     ) -> dict[str, object]:
-        """Process one timestep of multi-camera RGBD inputs and return a labeled point cloud."""
+        """处理一帧多相机 RGBD 输入，并返回标记的点云。"""
         if self.closed:
             raise RuntimeError("segmenter is already closed")
         if not camera_inputs:
             raise ValueError("camera_inputs must not be empty")
-        output_format = str(output_format).strip().lower()
-        if output_format not in {"numpy", "torch"}:
-            raise ValueError(f"Unsupported output_format: {output_format!r}")
         frame_t0 = time.perf_counter()
-        frame_resources: dict[str, list[Image.Image]] | None = None
         frame_resource_build_time = 0.0
-        if (not self._uses_stitched_tracking()) or self._uses_stitched_roi_tracking():
-            frame_resource_t0 = time.perf_counter()
-            frame_resources = self._build_frame_resources(camera_inputs)
-            frame_resource_build_time = time.perf_counter() - frame_resource_t0
+        frame_resource_t0 = time.perf_counter()
+        frame_resources = self._build_frame_resources(camera_inputs)
+        frame_resource_build_time = time.perf_counter() - frame_resource_t0
         if not self.initialized:
             self._initialize_sessions(frame_name, camera_inputs, frame_resources)
 
@@ -1842,174 +1661,71 @@ class SingleObjectPointCloudSegmenter:
         fuse_time = 0.0
         compose_inputs_time = 0.0
         mask_postprocess_time = 0.0
-        roi_project_time = 0.0
-        roi_update_time = 0.0
         camera_prepare_time = 0.0
         camera_bookkeeping_time = 0.0
         cpu_transfer_time = 0.0
         colorize_time = 0.0
-        masks_by_camera: dict[str, np.ndarray | torch.Tensor] = {}
+        masks_by_camera: dict[str, torch.Tensor] = {}
         scores_by_camera: dict[str, float | None] = {}
-        requests: list[dict[str, object]] = []
+        try:
+            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, split_stitched_binary_mask_torch
+        except ImportError:
+            from tracker_only_backend import compose_camera_rgb_frame_resources, split_stitched_binary_mask_torch
 
-        if self._uses_stitched_tracking():
-            try:
-                from single_seg.tracker_only_backend import (
-                    compose_camera_frame_resources,
-                    compose_camera_rgb_frame_resources,
-                    split_stitched_binary_mask,
-                    split_stitched_binary_mask_torch,
-                )
-            except ImportError:
-                from tracker_only_backend import (
-                    compose_camera_frame_resources,
-                    compose_camera_rgb_frame_resources,
-                    split_stitched_binary_mask,
-                    split_stitched_binary_mask_torch,
-                )
-
-            stitched_frame_resources = frame_resources
-            current_crop_windows = dict(self.stitched_crop_windows)
-            if self._uses_stitched_roi_tracking():
-                if frame_resources is None:
-                    raise RuntimeError("frame_resources are required for stitched ROI tracking")
-                stitched_frame_resources = self._build_roi_frame_resources(
-                    frame_resources=frame_resources,
-                    crop_windows=current_crop_windows,
-                )
-                compose_t0 = time.perf_counter()
-                composite_resources, current_layout = compose_camera_frame_resources(
-                    frame_resources=stitched_frame_resources,
-                    camera_order=self.active_camera_ids,
-                    layout=self.stitched_layout,
-                )
-                compose_inputs_time += time.perf_counter() - compose_t0
-            else:
-                compose_t0 = time.perf_counter()
-                composite_resources, current_layout = compose_camera_rgb_frame_resources(
-                    rgb_by_camera={
-                        camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
-                        for camera_id in self.active_camera_ids
-                    },
-                    camera_order=self.active_camera_ids,
-                    layout=self.stitched_layout,
-                )
-                compose_inputs_time += time.perf_counter() - compose_t0
-            if self.frame_index > 0:
-                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-                append_t0 = time.perf_counter()
-                self.video_predictor.append_frame(
-                    session_id=self.session_ids["__stitched__"],
-                    resource_path=composite_resources,
-                )
-                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-                append_frame_time += time.perf_counter() - append_t0
+        compose_t0 = time.perf_counter()
+        composite_resources, current_layout = compose_camera_rgb_frame_resources(
+            rgb_by_camera={
+                camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
+                for camera_id in self.active_camera_ids
+            },
+            camera_order=self.active_camera_ids,
+            layout=self.stitched_layout,
+        )
+        compose_inputs_time += time.perf_counter() - compose_t0
+        if self.frame_index > 0:
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            propagate_t0 = time.perf_counter()
-            stitched_payload = self.video_predictor.infer_frame(
+            append_t0 = time.perf_counter()
+            self.video_predictor.append_frame(
                 session_id=self.session_ids["__stitched__"],
-                frame_idx=int(self.frame_index),
-                reverse=False,
+                resource_path=composite_resources,
             )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            propagate_time = time.perf_counter() - propagate_t0
-            stitched_score: float | None = None
-            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            mask_post_t0 = time.perf_counter()
-            if self._uses_stitched_roi_tracking():
-                stitched_mask: np.ndarray | torch.Tensor = np.zeros(
-                    (int(current_layout.canvas_height), int(current_layout.canvas_width)),
-                    dtype=bool,
-                )
-                if stitched_payload.get("outputs") is not None:
-                    stitched_output = _score_label_map_from_output(
-                        stitched_payload["outputs"],
-                        image_shape=(int(current_layout.canvas_height), int(current_layout.canvas_width)),
-                        min_object_score=self.video_object_min_score,
-                        mask_prob_threshold=self.video_mask_prob_threshold,
-                    )
-                    stitched_mask = np.asarray(stitched_output["label_map"] == 1, dtype=bool)
-                    if isinstance(stitched_output.get("object_stats"), dict) and 1 in stitched_output["object_stats"]:
-                        stitched_score = float(stitched_output["object_stats"][1]["score"])
-                roi_masks_by_camera = split_stitched_binary_mask(stitched_mask, current_layout)
-            else:
-                stitched_output_t = {"mask": torch.zeros((int(current_layout.canvas_height), int(current_layout.canvas_width)), dtype=torch.bool, device=self.tensor_device), "score": None, "object_stats": {}}
-                if stitched_payload.get("outputs") is not None:
-                    stitched_output_t = _extract_target_mask_from_output_torch(
-                        stitched_payload["outputs"],
-                        image_shape=(int(current_layout.canvas_height), int(current_layout.canvas_width)),
-                        min_object_score=self.video_object_min_score,
-                        mask_prob_threshold=self.video_mask_prob_threshold,
-                        target_obj_id=1,
-                        device=self.tensor_device,
-                    )
-                stitched_score = None if stitched_output_t["score"] is None else float(stitched_output_t["score"])
-                roi_masks_by_camera = split_stitched_binary_mask_torch(stitched_output_t["mask"], current_layout)
-            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            mask_postprocess_time += time.perf_counter() - mask_post_t0
-            if self._uses_stitched_roi_tracking():
-                roi_project_t0 = time.perf_counter()
-                masks_by_camera = self._project_roi_masks_to_full(
-                    roi_masks_by_camera=roi_masks_by_camera,
-                    frame_resources=frame_resources,
-                    crop_windows=current_crop_windows,
-                )
-                roi_project_time += time.perf_counter() - roi_project_t0
-            else:
-                masks_by_camera = roi_masks_by_camera
-            scores_by_camera = {camera_id: stitched_score for camera_id in self.active_camera_ids}
-        else:
-            if frame_resources is None:
-                raise RuntimeError("frame_resources are required for per-camera tracking")
-            for camera_id in self.active_camera_ids:
-                payload = camera_inputs[camera_id]
-                if self.frame_index > 0:
-                    maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-                    append_t0 = time.perf_counter()
-                    self.video_predictor.append_frame(
-                        session_id=self.session_ids[camera_id],
-                        resource_path=frame_resources[camera_id],
-                    )
-                    maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-                    append_frame_time += time.perf_counter() - append_t0
-                rgb = np.asarray(payload["rgb"], dtype=np.uint8)
-                requests.append(
-                    {
-                        "camera_id": camera_id,
-                        "session_id": self.session_ids[camera_id],
-                        "frame_idx": int(self.frame_index),
-                        "image_shape": (rgb.shape[0], rgb.shape[1]),
-                    }
-                )
-
-            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            propagate_t0 = time.perf_counter()
-            batch_outputs = extract_target_mask_outputs_batch(
-                video_predictor=self.video_predictor,
-                requests=requests,
+            append_frame_time += time.perf_counter() - append_t0
+        maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+        propagate_t0 = time.perf_counter()
+        stitched_payload = self.video_predictor.infer_frame(
+            session_id=self.session_ids["__stitched__"],
+            frame_idx=int(self.frame_index),
+            reverse=False,
+        )
+        maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+        propagate_time = time.perf_counter() - propagate_t0
+        stitched_score: float | None = None
+        maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+        mask_post_t0 = time.perf_counter()
+        stitched_output_t = {
+            "mask": torch.zeros(
+                (int(current_layout.canvas_height), int(current_layout.canvas_width)),
+                dtype=torch.bool,
+                device=self.tensor_device,
+            ),
+            "score": None,
+            "object_stats": {},
+        }
+        if stitched_payload.get("outputs") is not None:
+            stitched_output_t = _extract_target_mask_from_output_torch(
+                stitched_payload["outputs"],
+                image_shape=(int(current_layout.canvas_height), int(current_layout.canvas_width)),
                 min_object_score=self.video_object_min_score,
                 mask_prob_threshold=self.video_mask_prob_threshold,
                 target_obj_id=1,
                 device=self.tensor_device,
             )
-            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
-            propagate_time = time.perf_counter() - propagate_t0
-            for request in requests:
-                camera_id = str(request["camera_id"])
-                frame_output = batch_outputs.get(camera_id)
-                if frame_output is None:
-                    continue
-                masks_by_camera[camera_id] = frame_output["mask"]
-                scores_by_camera[camera_id] = None if frame_output.get("score") is None else float(frame_output["score"])
-
-        if self._uses_stitched_roi_tracking():
-            roi_update_t0 = time.perf_counter()
-            self.stitched_crop_windows = self._derive_stitched_crop_windows(
-                frame_resources=frame_resources,
-                masks_by_camera=masks_by_camera,
-                previous_windows=current_crop_windows,
-            )
-            roi_update_time += time.perf_counter() - roi_update_t0
+        stitched_score = None if stitched_output_t["score"] is None else float(stitched_output_t["score"])
+        masks_by_camera = split_stitched_binary_mask_torch(stitched_output_t["mask"], current_layout)
+        maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+        mask_postprocess_time += time.perf_counter() - mask_post_t0
+        scores_by_camera = {camera_id: stitched_score for camera_id in self.active_camera_ids}
 
         point_chunks: list[torch.Tensor] = []
         color_chunks: list[torch.Tensor] = []
@@ -2100,7 +1816,7 @@ class SingleObjectPointCloudSegmenter:
             labels_t = torch.empty((0,), dtype=torch.int32, device=self.tensor_device)
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_time = time.perf_counter() - fuse_t0
-        need_cpu_output = self.save_ply or output_format == "numpy"
+        need_cpu_output = self.save_ply
         points_xyz: np.ndarray | None = None
         raw_colors: np.ndarray | None = None
         labels: np.ndarray | None = None
@@ -2117,12 +1833,11 @@ class SingleObjectPointCloudSegmenter:
             if vis_colors.shape[0] > 0:
                 vis_colors[labels > 0] = np.array([255, 70, 70], dtype=np.uint8)
             colorize_time += time.perf_counter() - colorize_t0
-        else:
-            colorize_t0 = time.perf_counter()
-            vis_colors_t = raw_colors_t.clone()
-            if vis_colors_t.shape[0] > 0:
-                vis_colors_t[labels_t > 0] = torch.tensor([255, 70, 70], dtype=torch.uint8, device=self.tensor_device)
-            colorize_time += time.perf_counter() - colorize_t0
+        colorize_t0 = time.perf_counter()
+        vis_colors_t = raw_colors_t.clone()
+        if vis_colors_t.shape[0] > 0:
+            vis_colors_t[labels_t > 0] = torch.tensor([255, 70, 70], dtype=torch.uint8, device=self.tensor_device)
+        colorize_time += time.perf_counter() - colorize_t0
 
         save_t0 = time.perf_counter()
         if self.save_ply:
@@ -2164,8 +1879,6 @@ class SingleObjectPointCloudSegmenter:
                     "frame_resource_build_time_sec": frame_resource_build_time,
                     "compose_inputs_time_sec": compose_inputs_time,
                     "mask_postprocess_time_sec": mask_postprocess_time,
-                    "roi_project_time_sec": roi_project_time,
-                    "roi_update_time_sec": roi_update_time,
                     "camera_prepare_time_sec": camera_prepare_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "cpu_transfer_time_sec": cpu_transfer_time,
@@ -2173,57 +1886,33 @@ class SingleObjectPointCloudSegmenter:
                 },
             }
         )
-        if output_format == "torch":
-            result = {
-                "frame_index": int(self.frame_index),
+        result = {
+            "frame_index": int(self.frame_index),
+            "frame_name": frame_name,
+            "points_xyz": points_xyz_t,
+            "instance_labels": labels_t,
+            "instance_colors": vis_colors_t,
+            "raw_colors": raw_colors_t,
+            "semantic_labels": labels_t,
+            "semantic_colors": vis_colors_t,
+            "label_names": [self.target_name],
+            "label_values": [0, 1],
+            "palette": torch.tensor([[255, 70, 70]], dtype=torch.uint8, device=self.tensor_device),
+            "camera_summaries": camera_summaries,
+            "meta": {
                 "frame_name": frame_name,
-                "points_xyz": points_xyz_t,
-                "instance_labels": labels_t,
-                "instance_colors": vis_colors_t,
-                "raw_colors": raw_colors_t,
-                "semantic_labels": labels_t,
-                "semantic_colors": vis_colors_t,
-                "label_names": [self.target_name],
-                "label_values": [0, 1],
-                "palette": torch.tensor([[255, 70, 70]], dtype=torch.uint8, device=self.tensor_device),
+                "target_name": self.target_name,
+                "num_points": int(points_xyz_t.shape[0]),
+                "num_labeled_points": int(torch.count_nonzero(labels_t).item()),
                 "camera_summaries": camera_summaries,
-                "meta": {
-                    "frame_name": frame_name,
-                    "target_name": self.target_name,
-                    "num_points": int(points_xyz_t.shape[0]),
-                    "num_labeled_points": int(torch.count_nonzero(labels_t).item()),
-                    "camera_summaries": camera_summaries,
-                    "output_format": "torch",
-                },
-            }
-        else:
-            assert points_xyz is not None and raw_colors is not None and labels is not None and vis_colors is not None
-            result = {
-                "frame_index": int(self.frame_index),
-                "frame_name": frame_name,
-                "points_xyz": points_xyz,
-                "instance_labels": labels,
-                "instance_colors": vis_colors,
-                "raw_colors": raw_colors,
-                "semantic_labels": labels.copy(),
-                "semantic_colors": vis_colors,
-                "label_names": [self.target_name],
-                "label_values": [0, 1],
-                "palette": np.asarray([[255, 70, 70]], dtype=np.uint8),
-                "camera_summaries": camera_summaries,
-                "meta": {
-                    "frame_name": frame_name,
-                    "target_name": self.target_name,
-                    "num_points": int(points_xyz.shape[0]),
-                    "num_labeled_points": int(np.count_nonzero(labels)),
-                    "camera_summaries": camera_summaries,
-                    "output_format": "numpy",
-                },
-            }
+                "output_format": "torch",
+            },
+        }
         self.frame_index += 1
         return result
 
     def write_summary(self) -> None:
+        """将处理摘要信息写入文件。"""
         later = self.timeline[1:] if len(self.timeline) > 1 else []
         later_mean = (
             float(sum(item["frame_runtime_sec"] for item in later) / len(later))
@@ -2235,16 +1924,9 @@ class SingleObjectPointCloudSegmenter:
             "prompt_task_info": str(self.prompt_task_info),
             "prompt_image_root": str(self.prompt_image_root),
             "checkpoint_path": str(self.checkpoint_path),
-            "video_backend": self.video_backend,
-            "tracker_profile": self.tracker_profile,
             "tracker_image_size": self.tracker_image_size,
-            "stitched_roi_tracking": bool(self.stitched_roi_tracking),
-            "stitched_roi_margin_scale": float(self.stitched_roi_margin_scale),
-            "stitched_roi_min_size_ratio": float(self.stitched_roi_min_size_ratio),
-            "compile_video_predictor": bool(self.compile_video_predictor),
             "confidence": float(self.confidence),
             "mask_threshold": float(self.mask_threshold),
-            "video_object_min_score": float(self.video_object_min_score),
             "video_mask_prob_threshold": float(self.video_mask_prob_threshold),
             "image_processor_load_time_sec": self.image_processor_load_time_sec,
             "video_predictor_load_time_sec": self.video_predictor_load_time_sec,
@@ -2259,6 +1941,7 @@ class SingleObjectPointCloudSegmenter:
         (self.output_dir / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     def close(self) -> None:
+        """关闭分割器，释放资源并保存摘要信息。"""
         if self.closed:
             return
         if hasattr(self.video_predictor, "close_session"):
@@ -2276,47 +1959,33 @@ class SingleObjectPointCloudSegmenter:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run fast single-object online segmentation for LIBERO spatial RGBD episodes.")
-    parser.add_argument("--target-name", default="akita_black_bowl")
-    parser.add_argument("--episode-dir", type=Path, default=DEFAULT_EPISODE_DIR)
-    parser.add_argument("--prompt-task-info", type=Path, default=DEFAULT_PROMPT_TASK_INFO)
-    parser.add_argument("--prompt-image-root", type=Path, default=DEFAULT_PROMPT_IMAGE_ROOT)
-    parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--max-frames", type=int, default=5)
-    parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument("--frame-voxel-size", type=float, default=0.003)
-    parser.add_argument("--prompt-ref-cell", type=int, default=160)
-    parser.add_argument("--prompt-max-cols", type=int, default=10)
-    parser.add_argument("--prompt-canvas-gap", type=int, default=24)
-    parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2)
-    parser.add_argument("--prompt-max-masks", type=int, default=4)
-    parser.add_argument("--seed-min-pixels", type=int, default=200)
-    parser.add_argument("--seed-max-area-ratio", type=float, default=0.35)
-    parser.add_argument("--seed-box-margin", type=int, default=12)
-    parser.add_argument("--depth-scale", type=float, default=1000.0)
-    parser.add_argument("--depth-min", type=float, default=0.1)
-    parser.add_argument("--depth-max", type=float, default=3.0)
-    parser.add_argument("--confidence", type=float, default=0.25)
-    parser.add_argument("--mask-threshold", type=float, default=0.6)
-    parser.add_argument("--video-object-min-score", type=float, default=0.0)
-    parser.add_argument("--video-mask-prob-threshold", type=float, default=0.95)
-    parser.add_argument("--sam3-image-device", default=None)
-    parser.add_argument("--video-backend", choices=("video_model", "tracker_only", "tracker_only_stitched"), default="tracker_only_stitched")
-    parser.add_argument("--tracker-profile", choices=("default", "lite"), default="default")
-    parser.add_argument("--tracker-image-size", type=int, default=896)
-    parser.add_argument("--stitched-roi-tracking", action="store_true")
-    parser.add_argument("--stitched-roi-margin-scale", type=float, default=2.0)
-    parser.add_argument("--stitched-roi-min-size-ratio", type=float, default=0.35)
-    parser.add_argument("--compile-video-predictor", action="store_true")
-    parser.add_argument("--output-format", choices=("numpy", "torch"), default="numpy")
-    parser.add_argument("--save-ply", action="store_true", default=False)
-    parser.add_argument("--save-debug-2d", action="store_true", default=False)
-    parser.add_argument("--overwrite-output", action="store_true")
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="为 LIBERO 空间任务的 RGBD 剧集运行快速单物体在线分割。")
+    parser.add_argument("--target-name", default="akita_black_bowl", help="目标物体名称")
+    parser.add_argument("--episode-dir", type=Path, default=DEFAULT_EPISODE_DIR, help="剧集数据目录")
+    parser.add_argument("--prompt-task-info", type=Path, default=DEFAULT_PROMPT_TASK_INFO, help="提示任务信息路径")
+    parser.add_argument("--prompt-image-root", type=Path, default=DEFAULT_PROMPT_IMAGE_ROOT, help="提示图像根目录")
+    parser.add_argument("--checkpoint-path", type=Path, default=DEFAULT_CHECKPOINT, help="模型权重路径")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="结果输出目录")
+    parser.add_argument("--max-frames", type=int, default=5, help="最大处理帧数")
+    parser.add_argument("--stride", type=int, default=2, help="帧采样步长")
+    parser.add_argument("--frame-voxel-size", type=float, default=0.003, help="点云下采样的体素大小")
+    parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2, help="保留提示掩码的评分阈值")
+    parser.add_argument("--depth-scale", type=float, default=1000.0, help="深度图缩放比例")
+    parser.add_argument("--depth-min", type=float, default=0.1, help="最小有效深度")
+    parser.add_argument("--depth-max", type=float, default=3.0, help="最大有效深度")
+    parser.add_argument("--confidence", type=float, default=0.25, help="检测置信度")
+    parser.add_argument("--mask-threshold", type=float, default=0.6, help="分割掩码阈值")
+    parser.add_argument("--video-mask-prob-threshold", type=float, default=0.95, help="视频掩码概率阈值")
+    parser.add_argument("--tracker-image-size", type=int, default=DEFAULT_TRACKER_IMAGE_SIZE, help="追踪器图像尺寸")
+    parser.add_argument("--save-ply", action="store_true", default=False, help="是否保存 PLY 点云文件")
+    parser.add_argument("--save-debug-2d", action="store_true", default=False, help="是否保存 2D 调试图")
+    parser.add_argument("--overwrite-output", action="store_true", help="是否覆盖已有的输出目录")
     return parser.parse_args()
 
 
 def run_demo(args: argparse.Namespace) -> None:
+    """运行演示程序。"""
     episode_dir = Path(args.episode_dir).resolve()
     camera_records = load_episode_camera_records(episode_dir)
     camera_ids = [str(record["camera_id"]) for record in camera_records]
@@ -2333,14 +2002,6 @@ def run_demo(args: argparse.Namespace) -> None:
         confidence=float(args.confidence),
         mask_threshold=float(args.mask_threshold),
         prompt_keep_score_threshold=float(args.prompt_keep_score_threshold),
-        prompt_max_masks=int(args.prompt_max_masks),
-        prompt_ref_cell=int(args.prompt_ref_cell),
-        prompt_max_cols=int(args.prompt_max_cols),
-        prompt_canvas_gap=int(args.prompt_canvas_gap),
-        seed_min_pixels=int(args.seed_min_pixels),
-        seed_max_area_ratio=float(args.seed_max_area_ratio),
-        seed_box_margin=int(args.seed_box_margin),
-        video_object_min_score=float(args.video_object_min_score),
         video_mask_prob_threshold=float(args.video_mask_prob_threshold),
         depth_scale=float(args.depth_scale),
         depth_min=float(args.depth_min),
@@ -2349,14 +2010,7 @@ def run_demo(args: argparse.Namespace) -> None:
         frame_voxel_size=float(args.frame_voxel_size),
         save_ply=bool(args.save_ply),
         save_debug_2d=bool(args.save_debug_2d),
-        sam3_image_device=args.sam3_image_device,
-        video_backend=str(args.video_backend),
-        compile_video_predictor=bool(args.compile_video_predictor),
-        tracker_profile=str(args.tracker_profile),
         tracker_image_size=args.tracker_image_size,
-        stitched_roi_tracking=bool(args.stitched_roi_tracking),
-        stitched_roi_margin_scale=float(args.stitched_roi_margin_scale),
-        stitched_roi_min_size_ratio=float(args.stitched_roi_min_size_ratio),
     ) as segmenter:
         t0 = time.perf_counter()
         for frame_name in frame_names:
@@ -2369,7 +2023,6 @@ def run_demo(args: argparse.Namespace) -> None:
             result = segmenter.process_frame(
                 frame_name=frame_name,
                 camera_inputs=camera_inputs,
-                output_format=str(args.output_format),
             )
             print(
                 f"[frame {result['frame_index']:03d}] {frame_name} points={result['points_xyz'].shape[0]} "

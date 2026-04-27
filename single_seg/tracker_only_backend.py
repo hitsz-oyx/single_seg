@@ -11,44 +11,31 @@ import torch
 import torch.nn.functional as F
 
 
+# 图像预处理的标准均值和标准差
 IMG_MEAN = (0.5, 0.5, 0.5)
 IMG_STD = (0.5, 0.5, 0.5)
 
 
 @dataclass(frozen=True)
 class TrackerBuildConfig:
-    profile_name: str
-    image_size: int = 1008
-    num_maskmem: int = 7
-    max_cond_frames_in_attn: int = 4
-    max_obj_ptrs_in_encoder: int = 16
-    multimask_output_in_sam: bool = True
-    multimask_output_for_tracking: bool = True
-    trim_past_non_cond_mem_for_eval: bool = False
-    use_memory_selection: bool = False
+    """追踪器构建配置，定义模型结构和内存参数。"""
+    profile_name: str = "default"  # 配置方案名称
+    image_size: int = 1008  # 输入图像尺寸
+    num_maskmem: int = 7  # 掩码内存大小
+    max_cond_frames_in_attn: int = 4  # 注意力机制中最大条件帧数
+    max_obj_ptrs_in_encoder: int = 16  # 编码器中最大物体指针数
+    multimask_output_in_sam: bool = True  # SAM 是否输出多掩码
+    multimask_output_for_tracking: bool = True  # 追踪是否使用多掩码输出
+    trim_past_non_cond_mem_for_eval: bool = False  # 评估时是否修剪过去的非条件内存
+    use_memory_selection: bool = False  # 是否使用内存选择机制
 
 
 def resolve_tracker_build_config(
-    profile: str,
     *,
     image_size_override: int | None = None,
 ) -> TrackerBuildConfig:
-    normalized = str(profile).strip().lower()
-    if normalized in {"", "default"}:
-        config = TrackerBuildConfig(profile_name="default")
-    elif normalized == "lite":
-        config = TrackerBuildConfig(
-            profile_name="lite",
-            num_maskmem=4,
-            max_cond_frames_in_attn=1,
-            max_obj_ptrs_in_encoder=4,
-            multimask_output_in_sam=False,
-            multimask_output_for_tracking=False,
-            trim_past_non_cond_mem_for_eval=True,
-            use_memory_selection=False,
-        )
-    else:
-        raise ValueError(f"Unsupported tracker profile: {profile}")
+    """解析追踪器构建配置。"""
+    config = TrackerBuildConfig()
     if image_size_override is not None:
         image_size_override = int(image_size_override)
         if image_size_override <= 0 or image_size_override % 14 != 0:
@@ -62,16 +49,20 @@ def _load_tracker_state_dict(
     *,
     build_config: TrackerBuildConfig,
 ) -> dict[str, Any]:
+    """从权重文件中加载追踪器的状态字典并进行适配。"""
     ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
     state_dict: dict[str, Any] = {}
     for key, value in ckpt.items():
         key_str = str(key)
+        # 提取追踪器和主干网络相关的权重
         if key_str.startswith("tracker."):
             state_dict[key_str.replace("tracker.", "")] = value
         elif key_str.startswith("detector.backbone."):
             state_dict[key_str.replace("detector.backbone.", "backbone.")] = value
+    
+    # 根据构建配置调整权重形状
     state_dict = adapt_tracker_state_dict_for_config(state_dict, build_config=build_config)
     return state_dict
 
@@ -81,6 +72,7 @@ def adapt_tracker_state_dict_for_config(
     *,
     build_config: TrackerBuildConfig,
 ) -> dict[str, Any]:
+    """根据追踪器配置调整状态字典中的权重（例如内存时间位置编码）。"""
     adapted = dict(state_dict)
     tpos_key = "maskmem_tpos_enc"
     if tpos_key in adapted:
@@ -94,6 +86,7 @@ def filter_incompatible_state_dict_for_model(
     model: torch.nn.Module,
     state_dict: dict[str, Any],
 ) -> dict[str, Any]:
+    """过滤掉与模型当前结构不兼容的状态字典条目。"""
     model_state = model.state_dict()
     compatible: dict[str, Any] = {}
     for key, value in state_dict.items():
@@ -110,7 +103,6 @@ def filter_incompatible_state_dict_for_model(
 def build_local_single_object_tracker(
     *,
     build_config: TrackerBuildConfig,
-    compile_mode: str | None = None,
 ):
     from sam3.model.decoder import TransformerDecoderLayerv2, TransformerEncoderCrossAttention
     from sam3.model.memory import CXBlock, SimpleFuser, SimpleMaskDownSampler, SimpleMaskEncoder
@@ -149,7 +141,7 @@ def build_local_single_object_tracker(
         ln_post=False,
         return_interm_layers=False,
         bias_patch_embed=False,
-        compile_mode=compile_mode,
+        compile_mode=None,
     )
     vision_backbone = Sam3DualViTDetNeck(
         position_encoding=PositionEmbeddingSine(
@@ -273,18 +265,13 @@ def build_single_object_tracker_model(
     checkpoint_path: Path,
     *,
     device: str = "cuda",
-    compile_model: bool = False,
-    tracker_profile: str = "default",
     image_size_override: int | None = None,
 ):
     build_config = resolve_tracker_build_config(
-        tracker_profile,
         image_size_override=image_size_override,
     )
-    compile_mode = "default" if bool(compile_model) else None
     model = build_local_single_object_tracker(
         build_config=build_config,
-        compile_mode=compile_mode,
     )
     state_dict = _load_tracker_state_dict(
         Path(checkpoint_path),
@@ -297,7 +284,6 @@ def build_single_object_tracker_model(
     model.eval()
     model._single_seg_missing_keys = tuple(missing_keys)
     model._single_seg_unexpected_keys = tuple(unexpected_keys)
-    model._single_seg_tracker_profile = str(build_config.profile_name)
     return model, missing_keys
 
 
@@ -612,8 +598,6 @@ class TrackerOnlyVideoPredictor:
         self,
         checkpoint_path: Path,
         *,
-        compile_model: bool = False,
-        tracker_profile: str = "default",
         tracker_image_size: int | None = None,
     ) -> None:
         if not torch.cuda.is_available():
@@ -622,12 +606,9 @@ class TrackerOnlyVideoPredictor:
         self.model, self.missing_keys = build_single_object_tracker_model(
             checkpoint_path=Path(checkpoint_path),
             device="cuda",
-            compile_model=bool(compile_model),
-            tracker_profile=str(tracker_profile),
             image_size_override=tracker_image_size,
         )
         self.image_size = int(self.model.image_size)
-        self.tracker_profile = str(getattr(self.model, "_single_seg_tracker_profile", tracker_profile))
         self.sessions: dict[str, TrackerOnlySession] = {}
         self.img_mean = torch.tensor(IMG_MEAN, dtype=torch.float32, device=self.device)[:, None, None]
         self.img_std = torch.tensor(IMG_STD, dtype=torch.float32, device=self.device)[:, None, None]

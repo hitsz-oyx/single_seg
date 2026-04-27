@@ -20,19 +20,7 @@ segmenter:
   confidence: 0.25
   mask_threshold: 0.6
   prompt_keep_score_threshold: 0.2
-  prompt_max_masks: 4
-  video_object_min_score: 0.0
   video_mask_prob_threshold: 0.95
-
-  # Prompt canvas layout.
-  prompt_ref_cell: 160
-  prompt_max_cols: 10
-  prompt_canvas_gap: 24
-
-  # First-frame seed cleanup.
-  seed_min_pixels: 200
-  seed_max_area_ratio: 0.35
-  seed_box_margin: 12
 
   # RGBD backprojection and scene fusion.
   depth_scale: 1000.0
@@ -46,11 +34,4 @@ segmenter:
   save_debug_2d: false
 
   # Runtime options.
-  sam3_image_device: cuda
-  video_backend: tracker_only_stitched
-  compile_video_predictor: false
-  tracker_profile: default
   tracker_image_size: 896
-  stitched_roi_tracking: false
-  stitched_roi_margin_scale: 2.0
-  stitched_roi_min_size_ratio: 0.35

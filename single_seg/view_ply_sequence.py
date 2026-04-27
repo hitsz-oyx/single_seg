@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive Open3D viewer for PLY frame sequences."""
+"""PLY 帧序列的交互式 Open3D 查看器。"""
 
 from __future__ import annotations
 
@@ -11,37 +11,41 @@ import open3d as o3d
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Open an interactive Open3D window for PLY frame outputs.")
-    parser.add_argument("--input-dir", type=Path, required=True)
-    parser.add_argument("--pattern", default="frame_*_instance_rgb.ply")
-    parser.add_argument("--max-frames", type=int, default=0)
-    parser.add_argument("--start-index", type=int, default=0)
-    parser.add_argument("--point-size", type=float, default=2.0)
-    parser.add_argument("--bg", choices=["black", "white"], default="black")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=800)
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="为 PLY 帧输出开启一个交互式 Open3D 窗口。")
+    parser.add_argument("--input-dir", type=Path, required=True, help="输入目录路径")
+    parser.add_argument("--pattern", default="frame_*_instance_rgb.ply", help="匹配 PLY 文件的模式")
+    parser.add_argument("--max-frames", type=int, default=0, help="处理的最大帧数（0 表示不限制）")
+    parser.add_argument("--start-index", type=int, default=0, help="开始帧索引")
+    parser.add_argument("--point-size", type=float, default=2.0, help="点的大小")
+    parser.add_argument("--bg", choices=["black", "white"], default="black", help="背景颜色")
+    parser.add_argument("--width", type=int, default=1280, help="窗口宽度")
+    parser.add_argument("--height", type=int, default=800, help="窗口高度")
     return parser.parse_args()
 
 
 def collect_ply_paths(input_dir: Path, pattern: str, max_frames: int) -> list[Path]:
+    """收集输入目录下所有匹配模式的 PLY 文件路径。"""
     paths = sorted(input_dir.glob(pattern))
     if int(max_frames) > 0:
         paths = paths[: int(max_frames)]
     if not paths:
-        raise FileNotFoundError(f"No PLY files matched {pattern!r} under {input_dir}")
+        raise FileNotFoundError(f"在 {input_dir} 下没有找到匹配 {pattern!r} 的 PLY 文件")
     return paths
 
 
 def load_cloud(path: Path) -> o3d.geometry.PointCloud:
+    """加载点云文件，如果缺色则涂上默认颜色。"""
     cloud = o3d.io.read_point_cloud(str(path))
     if cloud.is_empty():
-        raise RuntimeError(f"Open3D loaded an empty point cloud: {path}")
+        raise RuntimeError(f"Open3D 加载了一个空点云: {path}")
     if not cloud.has_colors():
         cloud.paint_uniform_color([0.86, 0.86, 0.86])
     return cloud
 
 
 def cleanup_open3d_camera_artifacts(search_root: Path) -> None:
+    """清理 Open3D 自动生成的相机参数等临时文件。"""
     for pattern in ("DepthCamera_*.json", "DepthCamera_*.png", "ScreenCamera_*.json", "ScreenCamera_*.png"):
         for artifact_path in search_root.glob(pattern):
             if artifact_path.is_file():
@@ -49,6 +53,7 @@ def cleanup_open3d_camera_artifacts(search_root: Path) -> None:
 
 
 def copy_cloud(dst: o3d.geometry.PointCloud, src: o3d.geometry.PointCloud) -> None:
+    """将源点云的数据复制到目标点云对象中。"""
     dst.points = src.points
     dst.colors = src.colors
     if src.has_normals():
@@ -56,6 +61,7 @@ def copy_cloud(dst: o3d.geometry.PointCloud, src: o3d.geometry.PointCloud) -> No
 
 
 def configure_view(vis: o3d.visualization.VisualizerWithKeyCallback, cloud: o3d.geometry.PointCloud, bg: str) -> None:
+    """配置 Open3D 可视化窗口的视角和渲染选项。"""
     render_opt = vis.get_render_option()
     render_opt.background_color = np.array([1.0, 1.0, 1.0]) if bg == "white" else np.array([0.0, 0.0, 0.0])
     bbox = cloud.get_axis_aligned_bounding_box()
@@ -67,6 +73,7 @@ def configure_view(vis: o3d.visualization.VisualizerWithKeyCallback, cloud: o3d.
 
 
 class PlySequenceViewer:
+    """PLY 序列查看器类，负责管理帧切换和缓存。"""
     def __init__(self, paths: list[Path], bg: str) -> None:
         self.paths = paths
         self.bg = bg
@@ -75,13 +82,16 @@ class PlySequenceViewer:
         self.pcd = o3d.geometry.PointCloud()
 
     def load(self, idx: int) -> o3d.geometry.PointCloud:
+        """带缓存加载指定索引的点云帧。"""
         if idx not in self.cache:
             self.cache[idx] = load_cloud(self.paths[idx])
         return self.cache[idx]
 
     def set_frame(self, idx: int, vis: o3d.visualization.VisualizerWithKeyCallback, reset_view: bool = False) -> None:
+        """将当前显示帧切换为指定索引的帧。"""
         idx = max(0, min(int(idx), len(self.paths) - 1))
         self.current_idx = idx
+        # 先保存当前视角，以免切换帧后视角重置
         camera_params = vis.get_view_control().convert_to_pinhole_camera_parameters()
         copy_cloud(self.pcd, self.load(idx))
         vis.update_geometry(self.pcd)
@@ -93,11 +103,13 @@ class PlySequenceViewer:
         print(f"[{self.current_idx + 1}/{len(self.paths)}] {self.paths[self.current_idx].name}")
 
     def next_frame(self, vis: o3d.visualization.VisualizerWithKeyCallback) -> bool:
+        """切换到下一帧。"""
         if self.current_idx + 1 < len(self.paths):
             self.set_frame(self.current_idx + 1, vis)
         return False
 
     def previous_frame(self, vis: o3d.visualization.VisualizerWithKeyCallback) -> bool:
+        """切换到前一帧。"""
         if self.current_idx > 0:
             self.set_frame(self.current_idx - 1, vis)
         return False

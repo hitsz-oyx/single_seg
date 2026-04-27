@@ -55,7 +55,7 @@ def test_repo_default_resources_exist() -> None:
 def test_single_seg_config_from_yaml() -> None:
     config = SingleSegConfig.from_yaml(REPO_ROOT / "configs" / "fast_plate_demo.yaml")
     assert config.target_name == "plate"
-    assert config.video_backend == "tracker_only_stitched"
+    assert config.tracker_image_size == 896
     assert config.prompt_task_info.exists()
     assert config.prompt_image_root.exists()
 
@@ -255,24 +255,15 @@ def test_extract_target_mask_from_output_torch_uses_logit_threshold() -> None:
     assert mask[2:4, 2:4].all()
 
 
-def test_resolve_tracker_build_config_lite() -> None:
-    config = resolve_tracker_build_config("lite")
-    assert config.profile_name == "lite"
-    assert config.num_maskmem == 4
-    assert config.max_cond_frames_in_attn == 1
-    assert config.max_obj_ptrs_in_encoder == 4
-    assert config.multimask_output_in_sam is False
-
-
 def test_resolve_tracker_build_config_with_image_size_override() -> None:
-    config = resolve_tracker_build_config("default", image_size_override=840)
+    config = resolve_tracker_build_config(image_size_override=840)
     assert config.profile_name == "default"
     assert config.image_size == 840
 
 
 def test_resolve_tracker_build_config_rejects_non_multiple_of_14() -> None:
     with pytest.raises(ValueError):
-        resolve_tracker_build_config("default", image_size_override=768)
+        resolve_tracker_build_config(image_size_override=768)
 
 
 def test_adapt_tracker_state_dict_for_smaller_maskmem() -> None:
@@ -280,7 +271,7 @@ def test_adapt_tracker_state_dict_for_smaller_maskmem() -> None:
         "maskmem_tpos_enc": torch.zeros((7, 1, 1, 256), dtype=torch.float32),
         "other_key": torch.ones((2, 2), dtype=torch.float32),
     }
-    config = TrackerBuildConfig(profile_name="lite", num_maskmem=4)
+    config = TrackerBuildConfig(num_maskmem=4)
     adapted = adapt_tracker_state_dict_for_config(state_dict, build_config=config)
     assert adapted["maskmem_tpos_enc"].shape[0] == 4
     assert adapted["other_key"].shape == (2, 2)

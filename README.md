@@ -106,9 +106,7 @@ tests/outputs/demo_spatial_single_object
 - `--prompt-task-info`: prompt 标注 json
 - `--prompt-image-root`: prompt 图片目录
 - `--checkpoint-path`: SAM3 权重
-- `--video-backend tracker_only_stitched`: 当前默认推荐的快速路径
 - `--tracker-image-size 896`: 当前默认输入尺寸
-- `--output-format torch`: 返回 GPU tensor，仅在需要落盘时回 CPU
 - `--save-ply`: 保存完整场景带标签点云
 - `--save-debug-2d`: 保存逐帧 2D overlay
 
@@ -147,7 +145,6 @@ with SingleObjectPointCloudSegmenter.from_config(
         result = segmenter.process_frame(
             frame_name=frame_name,
             camera_inputs=camera_inputs,
-            output_format="torch",
         )
         print(result["points_xyz"].shape, result["points_xyz"].device)
 ```
