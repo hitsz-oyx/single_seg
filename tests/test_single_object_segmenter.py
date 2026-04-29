@@ -42,6 +42,11 @@ from single_seg.single_object_segmenter import (
     semantic_name_from_asset,
     split_prompt_entries,
 )
+from single_seg.realsense_rgbd_segmenter import (
+    align_rectified_depth_to_color,
+    load_live_arg_defaults,
+    project_points_to_depth_image,
+)
 
 
 def test_repo_default_resources_exist() -> None:
@@ -58,6 +63,46 @@ def test_single_seg_config_from_yaml() -> None:
     assert config.tracker_image_size == 896
     assert config.prompt_task_info.exists()
     assert config.prompt_image_root.exists()
+
+
+def test_realsense_live_config_defaults_from_yaml() -> None:
+    defaults = load_live_arg_defaults(REPO_ROOT / "configs" / "realsense_d435_live.yaml")
+    assert defaults["target_name"] == "plate"
+    assert defaults["camera_count"] == 1
+    assert defaults["low_bandwidth_mode"] == 1
+    assert defaults["save_live_debug"] == 1
+    assert defaults["prompt_task_info"].exists()
+    assert defaults["fast_model_path"] == (
+        REPO_ROOT / "third_party" / "fastfoundationstereo" / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
+    )
+
+
+def test_realsense_live_config_normalizes_serial_lists(tmp_path: Path) -> None:
+    config_path = tmp_path / "realsense.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "segmenter:",
+                "  target_name: plate",
+                "  prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json",
+                "  prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts",
+                "realsense:",
+                "  camera_count: 2",
+                "  camera_serials:",
+                "    - 123",
+                "    - 456",
+                "  camera_poses_json: tests/outputs/camera_poses.json",
+                "fast_stereo:",
+                "  model_path: third_party/fastfoundationstereo/weights/23-36-37/model_best_bp2_serialize.pth",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    defaults = load_live_arg_defaults(config_path)
+    assert defaults["camera_count"] == 2
+    assert defaults["camera_serials"] == "123,456"
+    assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses.json"
 
 
 def test_segmenter_from_config_uses_paths() -> None:
@@ -409,3 +454,42 @@ def test_fuse_scene_geometry_torch_matches_numpy() -> None:
     assert np.allclose(np_points, t_points.numpy(), atol=1e-6)
     assert np.array_equal(np_colors, t_colors.numpy())
     assert np.array_equal(np_labels, t_labels.numpy())
+
+
+def test_project_points_to_depth_image_keeps_nearest_depth() -> None:
+    points_src = np.array(
+        [
+            [0.0, 0.0, 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    transform = np.eye(4, dtype=np.float32)
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}
+    depth = project_points_to_depth_image(
+        points_src,
+        transform,
+        intrinsics,
+        (1, 1),
+    )
+    assert depth.shape == (1, 1)
+    assert abs(float(depth[0, 0]) - 1.0) < 1e-6
+
+
+def test_align_rectified_depth_to_color_identity_projection() -> None:
+    depth_rect = np.array(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}
+    aligned = align_rectified_depth_to_color(
+        depth_rect,
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=np.eye(4, dtype=np.float32),
+        color_intrinsics=intrinsics,
+        color_shape=(2, 2),
+    )
+    assert np.allclose(aligned, depth_rect, atol=1e-6)

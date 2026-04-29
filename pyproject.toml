@@ -17,6 +17,7 @@ test = ["pytest"]
 [project.scripts]
 single-seg = "single_seg.single_object_segmenter:main"
 single-seg-view = "single_seg.view_ply_sequence:main"
+single-seg-realsense = "single_seg.realsense_rgbd_segmenter:main"
 
 [tool.setuptools]
 packages = ["single_seg"]

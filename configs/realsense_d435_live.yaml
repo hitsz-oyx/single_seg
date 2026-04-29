@@ -1,0 +1,48 @@
+# RealSense D435/D435i live configuration with Fast-FoundationStereo true RGBD.
+# Relative paths are resolved from the repo root.
+
+segmenter:
+  target_name: plate
+  prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json
+  prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts
+  checkpoint_path: checkpoints/sam3.pt
+  output_dir: tests/outputs/realsense_live
+  overwrite_output: true
+
+  confidence: 0.25
+  mask_threshold: 0.6
+  prompt_keep_score_threshold: 0.2
+  video_mask_prob_threshold: 0.95
+
+  depth_min: 0.1
+  depth_max: 3.0
+  stride: 2
+  frame_voxel_size: 0.003
+
+  save_ply: false
+  save_debug_2d: false
+  tracker_image_size: 896
+
+realsense:
+  camera_count: 1
+  camera_serials: null
+  camera_poses_json: null
+  max_frames: 1
+  camera_warmup_frames: 5
+  wait_timeout_ms: 6000
+  fps: 6
+  color_width: 640
+  color_height: 480
+  stereo_width: 480
+  stereo_height: 270
+  stereo_alpha: 0.0
+  low_bandwidth_mode: true
+  save_live_debug: true
+
+fast_stereo:
+  model_path: third_party/fastfoundationstereo/weights/23-36-37/model_best_bp2_serialize.pth
+  valid_iters: 8
+  max_disp: 192
+  scale: 1.0
+  remove_invisible: true
+  hiera: false
