@@ -36,6 +36,8 @@ realsense:
   stereo_width: 1280
   stereo_height: 720
   stereo_alpha: 0.0
+  # fast: IR1/IR2 + Fast-FoundationStereo; native: D435 depth aligned to color.
+  depth_source: fast
   low_bandwidth_mode: true
   save_live_debug: true
 

@@ -443,7 +443,7 @@ Annotated images dir: assets/prompts/my_task/annotated
 single_seg/realsense_rgbd_segmenter.py
 ```
 
-这条链路不是直接用相机原生深度，而是：
+默认 `--depth-source fast` 时，这条链路不是直接用相机原生深度，而是：
 
 1. 每个 D435 采集 `color + IR1 + IR2`
 2. 用 `IR1/IR2` 经过 `Fast-FoundationStereo` 估计深度
@@ -452,6 +452,8 @@ single_seg/realsense_rgbd_segmenter.py
 5. 多个 D435 的点云最后再做融合
 
 也就是说，这里输出的是“真 RGBD”，不是把 IR 灰度图简单伪装成 RGB。
+
+如果要和 D435 原生深度对比，可以改成 `--depth-source native`。这个模式只开 `color + depth`，用 RealSense SDK 把原生 depth 对齐到 color，不加载 `Fast-FoundationStereo` 模型。
 
 ### 单相机最小运行
 
@@ -491,6 +493,15 @@ single-seg-realsense \
 single-seg-realsense --config configs/realsense_d435_live.yaml
 ```
 
+对比原生 D435 depth：
+
+```bash
+single-seg-realsense \
+  --config configs/realsense_d435_live.yaml \
+  --depth-source native \
+  --overwrite-output
+```
+
 输出目录默认写到：
 
 ```text
@@ -506,16 +517,18 @@ tests/outputs/realsense_live/live_rgbd_debug/
 单相机调试图包括：
 
 - `rgb.png`
-- `ir_left_rect.png`
-- `ir_right_rect.png`
+- `ir_left_rect.png`：仅 `--depth-source fast` 时保存
+- `ir_right_rect.png`：仅 `--depth-source fast` 时保存
 - `depth_aligned_m.npy`
 - `depth_aligned_vis.png`
+- `depth_source.txt`
 
 ### 多相机参数
 
 - `--camera-count`: 使用多少个 D435 逻辑相机
 - `--camera-serials`: 指定串号列表，逗号分隔；不传时默认按枚举顺序取前 `N` 台
 - `--camera-poses-json`: 多相机融合时提供每台 D435 的 `cam2world_4x4`
+- `--depth-source`: `fast` 使用 `IR1/IR2 + Fast-FoundationStereo`；`native` 使用 D435 原生 depth
 - `--fast-model-path`: 覆盖 `Fast-FoundationStereo` 权重路径
 - `--save-ply`: 保存融合后的点云输出
 

@@ -44,6 +44,7 @@ from single_seg.single_object_segmenter import (
 )
 from single_seg.realsense_rgbd_segmenter import (
     align_rectified_depth_to_color,
+    build_camera_inputs_from_live_frames,
     load_live_arg_defaults,
     project_points_to_depth_image,
 )
@@ -69,6 +70,7 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     defaults = load_live_arg_defaults(REPO_ROOT / "configs" / "realsense_d435_live.yaml")
     assert defaults["target_name"] == "plate"
     assert defaults["camera_count"] == 1
+    assert defaults["depth_source"] == "fast"
     assert defaults["low_bandwidth_mode"] == 1
     assert defaults["save_live_debug"] == 1
     assert defaults["prompt_task_info"].exists()
@@ -493,3 +495,42 @@ def test_align_rectified_depth_to_color_identity_projection() -> None:
         color_shape=(2, 2),
     )
     assert np.allclose(aligned, depth_rect, atol=1e-6)
+
+
+def test_build_camera_inputs_can_use_native_realsense_depth_without_fast(tmp_path: Path) -> None:
+    rgb = np.array(
+        [
+            [[255, 0, 0], [0, 255, 0]],
+            [[0, 0, 255], [255, 255, 255]],
+        ],
+        dtype=np.uint8,
+    )
+    depth_m = np.array(
+        [
+            [0.05, 0.2],
+            [4.0, np.inf],
+        ],
+        dtype=np.float32,
+    )
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0, "width": 2, "height": 2}
+    camera_inputs = build_camera_inputs_from_live_frames(
+        captured_frames=[
+            {
+                "camera_id": "cam_00",
+                "depth_source": "native",
+                "rgb": rgb,
+                "depth_m": depth_m,
+                "color_intrinsics": intrinsics,
+                "pose_record": {"camera_id": "cam_00"},
+            }
+        ],
+        stereo_runner=None,
+        depth_min=0.1,
+        depth_max=3.0,
+        output_dir=tmp_path,
+        frame_index=0,
+        write_debug_images=False,
+    )
+    depth_out = camera_inputs["cam_00"]["depth_m"]
+    assert np.array_equal(camera_inputs["cam_00"]["rgb"], rgb)
+    assert np.allclose(depth_out, np.array([[0.0, 0.2], [0.0, 0.0]], dtype=np.float32))

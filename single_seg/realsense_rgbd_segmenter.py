@@ -32,12 +32,23 @@ FAST_STEREO_ROOT = REPO_ROOT / "third_party" / "fastfoundationstereo"
 FAST_STEREO_DEFAULT_MODEL = (
     FAST_STEREO_ROOT / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
 )
+DEPTH_SOURCE_CHOICES = ("fast", "native")
 
 if str(FAST_STEREO_ROOT) not in sys.path:
     sys.path.insert(0, str(FAST_STEREO_ROOT))
 
-from Utils import AMP_DTYPE, set_logging_format, set_seed  # noqa: E402
-from core.utils.utils import InputPadder  # noqa: E402
+try:  # noqa: E402
+    from Utils import set_logging_format, set_seed
+except ImportError:  # pragma: no cover - only used when Fast-FoundationStereo deps are absent
+
+    def set_logging_format() -> None:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    def set_seed(seed: int) -> None:
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
 
 try:  # pragma: no cover - import availability depends on host env
     import pyrealsense2 as rs
@@ -107,6 +118,13 @@ def ensure_three_channels(image: np.ndarray) -> np.ndarray:
     if image.ndim == 3 and image.shape[2] >= 3:
         return np.ascontiguousarray(image[..., :3])
     raise ValueError(f"unsupported image shape: {image.shape}")
+
+
+def normalize_depth_source(depth_source: object) -> str:
+    source = str(depth_source).strip().lower()
+    if source not in DEPTH_SOURCE_CHOICES:
+        raise ValueError(f"depth_source must be one of {DEPTH_SOURCE_CHOICES}, got {depth_source!r}")
+    return source
 
 
 def build_rectification(
@@ -350,6 +368,9 @@ class FastFoundationStereoRunner:
         rectified_k: np.ndarray,
         baseline_m: float,
     ) -> dict[str, np.ndarray]:
+        from Utils import AMP_DTYPE  # noqa: PLC0415
+        from core.utils.utils import InputPadder  # noqa: PLC0415
+
         left_rgb = ensure_three_channels(left_image)
         right_rgb = ensure_three_channels(right_image)
         scale = float(self.args.scale)
@@ -422,6 +443,7 @@ class RealSenseRgbdCamera:
         fps: int,
         alpha: float,
         wait_timeout_ms: int,
+        depth_source: str,
     ) -> None:
         self.camera_id = str(camera_id)
         self.serial_number = str(serial_number)
@@ -433,24 +455,40 @@ class RealSenseRgbdCamera:
         self.fps = int(fps)
         self.alpha = float(alpha)
         self.wait_timeout_ms = int(wait_timeout_ms)
+        self.depth_source = normalize_depth_source(depth_source)
         self.pipeline = rs.pipeline()
         self.profile: rs.pipeline_profile | None = None
         self.color_intrinsics: dict[str, float] | None = None
+        self.color_map1: np.ndarray | None = None
+        self.color_map2: np.ndarray | None = None
+        self.rectification: dict[str, np.ndarray] | None = None
+        self.rectified_to_color: np.ndarray | None = None
+        self.align_to_color: object | None = None
+        self.depth_scale = 0.001
         self.pose_record: dict[str, object] = pose_record_from_cam2world(self.camera_id, self.cam2world_4x4)
 
     def start(self) -> None:
         config = rs.config()
         config.enable_device(self.serial_number)
         config.enable_stream(rs.stream.color, self.color_width, self.color_height, rs.format.bgr8, self.fps)
-        config.enable_stream(rs.stream.infrared, 1, self.stereo_width, self.stereo_height, rs.format.y8, self.fps)
-        config.enable_stream(rs.stream.infrared, 2, self.stereo_width, self.stereo_height, rs.format.y8, self.fps)
+        if self.depth_source == "fast":
+            config.enable_stream(rs.stream.infrared, 1, self.stereo_width, self.stereo_height, rs.format.y8, self.fps)
+            config.enable_stream(rs.stream.infrared, 2, self.stereo_width, self.stereo_height, rs.format.y8, self.fps)
+        else:
+            config.enable_stream(rs.stream.depth, self.stereo_width, self.stereo_height, rs.format.z16, self.fps)
         self.profile = self.pipeline.start(config)
+        color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+        color_intr = color_profile.get_intrinsics()
+        self.color_intrinsics = intrinsics_to_payload(color_intr)
+        if self.depth_source == "native":
+            self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
+            self.align_to_color = rs.align(rs.stream.color)
+            return
+
         left_profile = self.profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
         right_profile = self.profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
-        color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         left_intr = left_profile.get_intrinsics()
         right_intr = right_profile.get_intrinsics()
-        color_intr = color_profile.get_intrinsics()
         left_to_right = extrinsics_to_matrix(left_profile.get_extrinsics_to(right_profile))
         left_to_color = extrinsics_to_matrix(left_profile.get_extrinsics_to(color_profile))
         self.rectification = build_rectification(
@@ -464,7 +502,6 @@ class RealSenseRgbdCamera:
             color_intr,
             image_size=(self.color_width, self.color_height),
         )
-        self.color_intrinsics = intrinsics_to_payload(color_intr)
         rectified_to_left = self.rectification["rectified_to_left"]
         self.rectified_to_color = left_to_color @ rectified_to_left
 
@@ -474,6 +511,33 @@ class RealSenseRgbdCamera:
 
     def capture(self) -> dict[str, object]:
         frames = latest_frames(self.pipeline, timeout_ms=self.wait_timeout_ms)
+        if self.depth_source == "native":
+            if self.align_to_color is None:
+                raise RuntimeError("RealSense native depth alignment was not initialized")
+            aligned_frames = self.align_to_color.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+            if not color_frame or not depth_frame:
+                raise RuntimeError(f"missing color/depth frame from RealSense camera {self.camera_id}")
+            color_raw_bgr = np.asanyarray(color_frame.get_data())
+            depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * float(self.depth_scale)
+            return {
+                "camera_id": self.camera_id,
+                "serial_number": self.serial_number,
+                "depth_source": self.depth_source,
+                "rgb": cv2.cvtColor(color_raw_bgr, cv2.COLOR_BGR2RGB),
+                "depth_m": depth_m,
+                "color_intrinsics": self.color_intrinsics,
+                "pose_record": self.pose_record,
+            }
+
+        if (
+            self.rectification is None
+            or self.rectified_to_color is None
+            or self.color_map1 is None
+            or self.color_map2 is None
+        ):
+            raise RuntimeError("Fast stereo rectification was not initialized")
         color_raw_bgr = np.asanyarray(frames.get_color_frame().get_data())
         left_raw = np.asanyarray(frames.get_infrared_frame(1).get_data())
         right_raw = np.asanyarray(frames.get_infrared_frame(2).get_data())
@@ -498,6 +562,7 @@ class RealSenseRgbdCamera:
         return {
             "camera_id": self.camera_id,
             "serial_number": self.serial_number,
+            "depth_source": self.depth_source,
             "rgb": cv2.cvtColor(color_undistorted_bgr, cv2.COLOR_BGR2RGB),
             "ir_left_rect": left_rect,
             "ir_right_rect": right_rect,
@@ -518,16 +583,20 @@ def write_live_debug(
     output_dir: Path,
     frame_index: int,
     camera_id: str,
+    depth_source: str,
     rgb: np.ndarray,
-    ir_left: np.ndarray,
-    ir_right: np.ndarray,
+    ir_left: np.ndarray | None,
+    ir_right: np.ndarray | None,
     depth_aligned_m: np.ndarray,
 ) -> None:
     frame_dir = output_dir / "live_rgbd_debug" / f"frame_{frame_index:05d}" / camera_id
     frame_dir.mkdir(parents=True, exist_ok=True)
+    (frame_dir / "depth_source.txt").write_text(depth_source + "\n", encoding="utf-8")
     cv2.imwrite(str(frame_dir / "rgb.png"), rgb[..., ::-1])
-    cv2.imwrite(str(frame_dir / "ir_left_rect.png"), ir_left)
-    cv2.imwrite(str(frame_dir / "ir_right_rect.png"), ir_right)
+    if ir_left is not None:
+        cv2.imwrite(str(frame_dir / "ir_left_rect.png"), ir_left)
+    if ir_right is not None:
+        cv2.imwrite(str(frame_dir / "ir_right_rect.png"), ir_right)
     np.save(frame_dir / "depth_aligned_m.npy", depth_aligned_m)
     valid = depth_aligned_m > 0
     depth_vis = np.zeros((*depth_aligned_m.shape, 3), dtype=np.uint8)
@@ -622,6 +691,7 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
         "stereo_width": realsense_cfg.get("stereo_width"),
         "stereo_height": realsense_cfg.get("stereo_height"),
         "stereo_alpha": realsense_cfg.get("stereo_alpha"),
+        "depth_source": realsense_cfg.get("depth_source"),
         "low_bandwidth_mode": realsense_cfg.get("low_bandwidth_mode"),
         "max_frames": realsense_cfg.get("max_frames"),
         "save_live_debug": realsense_cfg.get("save_live_debug"),
@@ -631,6 +701,8 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             continue
         if key == "camera_poses_json":
             defaults[key] = resolve_repo_path(value)
+        elif key == "depth_source":
+            defaults[key] = normalize_depth_source(value)
         elif key in {"low_bandwidth_mode", "save_live_debug"}:
             defaults[key] = int(bool(value))
         else:
@@ -660,7 +732,9 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
 
 
 def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run single-seg on live D435 cameras with Fast-FoundationStereo true RGBD preprocessing.")
+    parser = argparse.ArgumentParser(
+        description="Run single-seg on live D435 cameras with Fast-FoundationStereo or native RealSense depth."
+    )
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--target-name", default="plate")
     parser.add_argument("--prompt-task-info", type=Path, default=DEFAULT_PROMPT_TASK_INFO)
@@ -691,6 +765,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--stereo-width", type=int, default=480)
     parser.add_argument("--stereo-height", type=int, default=270)
     parser.add_argument("--stereo-alpha", type=float, default=0.0)
+    parser.add_argument("--depth-source", choices=DEPTH_SOURCE_CHOICES, default="fast")
     parser.add_argument("--low-bandwidth-mode", type=int, default=1)
     parser.add_argument("--fast-model-path", type=Path, default=FAST_STEREO_DEFAULT_MODEL)
     parser.add_argument("--fast-valid-iters", type=int, default=8)
@@ -715,7 +790,7 @@ def parse_args() -> argparse.Namespace:
 def build_camera_inputs_from_live_frames(
     *,
     captured_frames: list[dict[str, object]],
-    stereo_runner: FastFoundationStereoRunner,
+    stereo_runner: FastFoundationStereoRunner | None,
     depth_min: float,
     depth_max: float,
     output_dir: Path,
@@ -725,24 +800,32 @@ def build_camera_inputs_from_live_frames(
     camera_inputs: dict[str, dict[str, object]] = {}
     for payload in captured_frames:
         camera_id = str(payload["camera_id"])
-        logging.info(f"Building RGBD for {camera_id}")
+        depth_source = normalize_depth_source(payload.get("depth_source", "fast"))
+        logging.info(f"Building RGBD for {camera_id} using depth_source={depth_source}")
         rgb = np.asarray(payload["rgb"], dtype=np.uint8)
-        ir_left_rect = np.asarray(payload["ir_left_rect"], dtype=np.uint8)
-        ir_right_rect = np.asarray(payload["ir_right_rect"], dtype=np.uint8)
-        stereo_output = stereo_runner.infer_depth(
-            left_image=ir_left_rect,
-            right_image=ir_right_rect,
-            rectified_k=np.asarray(payload["rectified_k"], dtype=np.float32),
-            baseline_m=float(payload["baseline_m"]),
-        )
-        depth_aligned_m = align_rectified_depth_to_color(
-            stereo_output["depth_m"],
-            rectified_intrinsics=stereo_output["rectified_intrinsics"],
-            rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
-            color_intrinsics=dict(payload["color_intrinsics"]),
-            color_shape=rgb.shape[:2],
-        )
-        depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32)
+        ir_left_rect: np.ndarray | None = None
+        ir_right_rect: np.ndarray | None = None
+        if depth_source == "native":
+            depth_aligned_m = np.asarray(payload["depth_m"], dtype=np.float32)
+        else:
+            if stereo_runner is None:
+                raise RuntimeError("depth_source='fast' requires a Fast-FoundationStereo runner")
+            ir_left_rect = np.asarray(payload["ir_left_rect"], dtype=np.uint8)
+            ir_right_rect = np.asarray(payload["ir_right_rect"], dtype=np.uint8)
+            stereo_output = stereo_runner.infer_depth(
+                left_image=ir_left_rect,
+                right_image=ir_right_rect,
+                rectified_k=np.asarray(payload["rectified_k"], dtype=np.float32),
+                baseline_m=float(payload["baseline_m"]),
+            )
+            depth_aligned_m = align_rectified_depth_to_color(
+                stereo_output["depth_m"],
+                rectified_intrinsics=stereo_output["rectified_intrinsics"],
+                rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                color_intrinsics=dict(payload["color_intrinsics"]),
+                color_shape=rgb.shape[:2],
+            )
+        depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32).copy()
         depth_aligned_m[~np.isfinite(depth_aligned_m)] = 0.0
         depth_aligned_m[(depth_aligned_m < float(depth_min)) | (depth_aligned_m > float(depth_max))] = 0.0
         camera_inputs[camera_id] = {
@@ -757,13 +840,15 @@ def build_camera_inputs_from_live_frames(
                 output_dir=output_dir,
                 frame_index=frame_index,
                 camera_id=camera_id,
+                depth_source=depth_source,
                 rgb=rgb,
                 ir_left=ir_left_rect,
                 ir_right=ir_right_rect,
                 depth_aligned_m=depth_aligned_m,
             )
         logging.info(
-            f"Built RGBD for {camera_id}: rgb={rgb.shape} depth_valid_ratio={(depth_aligned_m > 0).mean():.3f}"
+            f"Built RGBD for {camera_id}: source={depth_source} rgb={rgb.shape} "
+            f"depth_valid_ratio={(depth_aligned_m > 0).mean():.3f}"
         )
     return camera_inputs
 
@@ -775,6 +860,7 @@ def run_live(args: argparse.Namespace) -> None:
     set_seed(0)
     torch.autograd.set_grad_enabled(False)
 
+    depth_source = normalize_depth_source(args.depth_source)
     requested_serials = parse_serials(args.camera_serials)
     serials = select_serials(requested_serials=requested_serials, camera_count=int(args.camera_count))
     pose_map = load_live_camera_pose_map(args.camera_poses_json)
@@ -798,21 +884,26 @@ def run_live(args: argparse.Namespace) -> None:
                 fps=int(args.fps),
                 alpha=float(args.stereo_alpha),
                 wait_timeout_ms=int(args.wait_timeout_ms),
+                depth_source=depth_source,
             )
             camera.start()
             camera.warmup(int(args.camera_warmup_frames))
             cameras.append(camera)
-            logging.info(f"Started camera {camera.camera_id} serial={serial}")
+            logging.info(f"Started camera {camera.camera_id} serial={serial} depth_source={depth_source}")
 
-        stereo_runner = FastFoundationStereoRunner(
-            model_path=Path(args.fast_model_path),
-            valid_iters=int(args.fast_valid_iters),
-            max_disp=int(args.fast_max_disp),
-            scale=float(args.fast_scale),
-            remove_invisible=bool(args.fast_remove_invisible),
-            hiera=bool(args.fast_hiera),
-        )
-        logging.info("Fast-FoundationStereo runner loaded")
+        stereo_runner: FastFoundationStereoRunner | None = None
+        if depth_source == "fast":
+            stereo_runner = FastFoundationStereoRunner(
+                model_path=Path(args.fast_model_path),
+                valid_iters=int(args.fast_valid_iters),
+                max_disp=int(args.fast_max_disp),
+                scale=float(args.fast_scale),
+                remove_invisible=bool(args.fast_remove_invisible),
+                hiera=bool(args.fast_hiera),
+            )
+            logging.info("Fast-FoundationStereo runner loaded")
+        else:
+            logging.info("Using RealSense native depth aligned to color; Fast-FoundationStereo runner not loaded")
         with SingleObjectPointCloudSegmenter(
             target_name=str(args.target_name),
             prompt_task_info=Path(args.prompt_task_info).resolve(),
