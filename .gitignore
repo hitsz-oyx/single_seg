@@ -6,6 +6,7 @@ __pycache__/
 checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.ckpt
+checkpoints/*.msc
 
 tests/outputs/
 DepthCamera_*.json

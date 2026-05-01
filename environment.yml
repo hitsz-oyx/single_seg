@@ -10,7 +10,7 @@ dependencies:
   - pytorch=2.7.0
   - torchvision=0.22.0
   - torchaudio=2.7.0
-  - pytorch-cuda=12.6
+  - pytorch-cuda
   - pip:
       - PyYAML==6.0.3
       - numpy==1.26.4

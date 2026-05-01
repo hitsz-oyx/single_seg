@@ -31,10 +31,10 @@ realsense:
   camera_warmup_frames: 5
   wait_timeout_ms: 6000
   fps: 6
-  color_width: 640
-  color_height: 480
-  stereo_width: 480
-  stereo_height: 270
+  color_width: 1280
+  color_height: 720
+  stereo_width: 1280
+  stereo_height: 720
   stereo_alpha: 0.0
   low_bandwidth_mode: true
   save_live_debug: true
