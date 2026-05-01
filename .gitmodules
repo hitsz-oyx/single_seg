@@ -1,6 +1,8 @@
 [submodule "third_party/sam3"]
 	path = third_party/sam3
 	url = https://github.com/hitsz-oyx/sam3.git
+	branch = branch_for_single_seg
 [submodule "third_party/fastfoundationstereo"]
 	path = third_party/fastfoundationstereo
 	url = https://github.com/hitsz-oyx/Fast-FoundationStereo.git
+	branch = branch_for_single_seg
