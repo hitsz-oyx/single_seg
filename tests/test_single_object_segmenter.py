@@ -44,6 +44,7 @@ from single_seg.single_object_segmenter import (
 )
 from single_seg.realsense_rgbd_segmenter import (
     align_rectified_depth_to_color,
+    align_rectified_depth_to_color_torch,
     build_camera_inputs_from_live_frames,
     load_live_arg_defaults,
     project_points_to_depth_image,
@@ -497,6 +498,25 @@ def test_align_rectified_depth_to_color_identity_projection() -> None:
     assert np.allclose(aligned, depth_rect, atol=1e-6)
 
 
+def test_align_rectified_depth_to_color_torch_matches_identity_projection() -> None:
+    depth_rect = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}
+    aligned = align_rectified_depth_to_color_torch(
+        depth_rect,
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=torch.eye(4, dtype=torch.float32),
+        color_intrinsics=intrinsics,
+        color_shape=(2, 2),
+    )
+    assert torch.allclose(aligned, depth_rect, atol=1e-6)
+
+
 def test_build_camera_inputs_can_use_native_realsense_depth_without_fast(tmp_path: Path) -> None:
     rgb = np.array(
         [
@@ -534,3 +554,49 @@ def test_build_camera_inputs_can_use_native_realsense_depth_without_fast(tmp_pat
     depth_out = camera_inputs["cam_00"]["depth_m"]
     assert np.array_equal(camera_inputs["cam_00"]["rgb"], rgb)
     assert np.allclose(depth_out, np.array([[0.0, 0.2], [0.0, 0.0]], dtype=np.float32))
+
+
+def test_build_camera_inputs_keeps_fast_depth_on_torch_path(tmp_path: Path) -> None:
+    class FakeStereoRunner:
+        def infer_depth(self, **kwargs):
+            assert kwargs["return_torch"] is True
+            return {
+                "depth_m": torch.tensor([[0.05, 0.2], [4.0, 0.3]], dtype=torch.float32),
+                "rectified_intrinsics": {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+            }
+
+    rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0, "width": 2, "height": 2}
+    camera_inputs = build_camera_inputs_from_live_frames(
+        captured_frames=[
+            {
+                "camera_id": "cam_00",
+                "depth_source": "fast",
+                "rgb": rgb,
+                "ir_left_rect": np.zeros((2, 2), dtype=np.uint8),
+                "ir_right_rect": np.zeros((2, 2), dtype=np.uint8),
+                "rectified_k": np.eye(3, dtype=np.float32),
+                "rectified_to_color": np.eye(4, dtype=np.float32),
+                "baseline_m": 0.05,
+                "color_intrinsics": intrinsics,
+                "pose_record": {"camera_id": "cam_00"},
+            }
+        ],
+        stereo_runner=FakeStereoRunner(),
+        depth_min=0.1,
+        depth_max=3.0,
+        output_dir=tmp_path,
+        frame_index=0,
+        write_debug_images=True,
+    )
+    depth_out = camera_inputs["cam_00"]["depth_m"]
+    payload_path = tmp_path / "live_rgbd_debug" / "frame_00000" / "cam_00" / "camera_payload.json"
+    debug_payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    assert torch.is_tensor(depth_out)
+    assert torch.allclose(depth_out.cpu(), torch.tensor([[0.0, 0.2], [0.0, 0.3]], dtype=torch.float32))
+    assert debug_payload["depth_source"] == "fast"
+    assert debug_payload["ir_left_rect_file"] == "ir_left_rect.png"
+    assert debug_payload["ir_right_rect_file"] == "ir_right_rect.png"
+    assert debug_payload["baseline_m"] == 0.05
+    assert debug_payload["rectified_k"] == np.eye(3, dtype=np.float32).tolist()
+    assert debug_payload["rectified_to_color"] == np.eye(4, dtype=np.float32).tolist()

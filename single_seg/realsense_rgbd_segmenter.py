@@ -263,6 +263,118 @@ def align_rectified_depth_to_color(
     )
 
 
+def project_points_to_depth_image_torch(
+    points_src: torch.Tensor,
+    src_to_dst: np.ndarray | torch.Tensor,
+    dst_intrinsics: dict[str, float],
+    dst_shape: tuple[int, int],
+) -> torch.Tensor:
+    height, width = (int(dst_shape[0]), int(dst_shape[1]))
+    device = points_src.device
+    depth_out = torch.full((height * width,), float("inf"), dtype=torch.float32, device=device)
+    if points_src.numel() == 0:
+        return torch.zeros((height, width), dtype=torch.float32, device=device)
+
+    transform = torch.as_tensor(src_to_dst, dtype=torch.float32, device=device)
+    rot = transform[:3, :3]
+    trans = transform[:3, 3]
+    points_dst = (points_src.to(torch.float32) @ rot.T) + trans
+    z = points_dst[:, 2]
+    valid = torch.isfinite(z) & (z > 0)
+    points_dst = points_dst[valid]
+    z = z[valid]
+    fx = float(dst_intrinsics["fx"])
+    fy = float(dst_intrinsics["fy"])
+    cx = float(dst_intrinsics["cx"])
+    cy = float(dst_intrinsics["cy"])
+    u = torch.round((points_dst[:, 0] * fx / z) + cx).to(torch.int64)
+    v = torch.round((points_dst[:, 1] * fy / z) + cy).to(torch.int64)
+    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    linear = (v[in_bounds] * width) + u[in_bounds]
+    depth_out.scatter_reduce_(0, linear, z[in_bounds].to(torch.float32), reduce="amin", include_self=True)
+    depth_out[~torch.isfinite(depth_out)] = 0.0
+    return depth_out.reshape(height, width)
+
+
+def align_rectified_depth_to_color_torch(
+    depth_rect_m: torch.Tensor,
+    *,
+    rectified_intrinsics: dict[str, float],
+    rectified_to_color: np.ndarray | torch.Tensor,
+    color_intrinsics: dict[str, float],
+    color_shape: tuple[int, int],
+) -> torch.Tensor:
+    depth = depth_rect_m.to(dtype=torch.float32)
+    height, width = depth.shape
+    device = depth.device
+    valid = torch.isfinite(depth) & (depth > 0)
+
+    fx = float(rectified_intrinsics["fx"])
+    fy = float(rectified_intrinsics["fy"])
+    cx = float(rectified_intrinsics["cx"])
+    cy = float(rectified_intrinsics["cy"])
+    vv, uu = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32, device=device),
+        torch.arange(width, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    depth_valid = depth[valid]
+    x = ((uu[valid] - cx) / fx) * depth_valid
+    y = ((vv[valid] - cy) / fy) * depth_valid
+    points_rect = torch.stack([x, y, depth_valid], dim=1)
+    return project_points_to_depth_image_torch(
+        points_rect,
+        rectified_to_color,
+        color_intrinsics,
+        color_shape,
+    )
+
+
+def to_jsonable(value: object) -> object:
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    return value
+
+
+def build_live_debug_camera_payload(
+    *,
+    payload: dict[str, object],
+    depth_source: str,
+    depth_min: float,
+    depth_max: float,
+) -> dict[str, object]:
+    debug_payload: dict[str, object] = {
+        "camera_id": str(payload["camera_id"]),
+        "serial_number": str(payload.get("serial_number", "")),
+        "depth_source": str(depth_source),
+        "rgb_file": "rgb.png",
+        "depth_aligned_file": "depth_aligned_m.npy",
+        "color_intrinsics": to_jsonable(payload.get("color_intrinsics")),
+        "pose_record": to_jsonable(payload.get("pose_record")),
+        "depth_min": float(depth_min),
+        "depth_max": float(depth_max),
+    }
+    if depth_source == "fast":
+        debug_payload.update(
+            {
+                "ir_left_rect_file": "ir_left_rect.png",
+                "ir_right_rect_file": "ir_right_rect.png",
+                "rectified_k": to_jsonable(payload["rectified_k"]),
+                "rectified_to_color": to_jsonable(payload["rectified_to_color"]),
+                "baseline_m": float(payload["baseline_m"]),
+            }
+        )
+    return debug_payload
+
+
 @dataclass(frozen=True)
 class LiveCameraPose:
     camera_id: str
@@ -367,7 +479,8 @@ class FastFoundationStereoRunner:
         right_image: np.ndarray,
         rectified_k: np.ndarray,
         baseline_m: float,
-    ) -> dict[str, np.ndarray]:
+        return_torch: bool = False,
+    ) -> dict[str, object]:
         from Utils import AMP_DTYPE  # noqa: PLC0415
         from core.utils.utils import InputPadder  # noqa: PLC0415
 
@@ -405,19 +518,14 @@ class FastFoundationStereoRunner:
                     test_mode=True,
                     small_ratio=0.5,
                 )
-        disp = padder.unpad(disp.float()).detach().cpu().numpy().reshape(height, width).clip(0, None)
+        disp = padder.unpad(disp.float()).detach().reshape(height, width).clamp_min_(0)
         if int(self.args.remove_invisible):
-            yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+            xx = torch.arange(width, dtype=disp.dtype, device=disp.device)[None, :].expand(height, width)
             invalid = (xx - disp) < 0
-            disp = disp.copy()
-            disp[invalid] = np.inf
-        with np.errstate(divide="ignore", invalid="ignore"):
-            depth_m = k_model[0, 0] * float(baseline_m) / disp
-        return {
-            "left_rgb": left_rgb,
-            "right_rgb": right_rgb,
-            "disparity": disp.astype(np.float32, copy=False),
-            "depth_m": depth_m.astype(np.float32, copy=False),
+            disp = disp.clone()
+            disp[invalid] = float("inf")
+        depth_m = float(k_model[0, 0]) * float(baseline_m) / disp
+        output: dict[str, object] = {
             "rectified_intrinsics": {
                 "fx": float(k_model[0, 0]),
                 "fy": float(k_model[1, 1]),
@@ -425,8 +533,29 @@ class FastFoundationStereoRunner:
                 "cy": float(k_model[1, 2]),
                 "width": int(width),
                 "height": int(height),
-            },
+            }
         }
+        if return_torch:
+            output.update(
+                {
+                    "left_rgb": left_rgb,
+                    "right_rgb": right_rgb,
+                    "disparity": disp,
+                    "depth_m": depth_m,
+                }
+            )
+            return output
+        disp_np = disp.detach().cpu().numpy()
+        depth_np = depth_m.detach().cpu().numpy()
+        output.update(
+            {
+                "left_rgb": left_rgb,
+                "right_rgb": right_rgb,
+                "disparity": disp_np.astype(np.float32, copy=False),
+                "depth_m": depth_np.astype(np.float32, copy=False),
+            }
+        )
+        return output
 
 
 class RealSenseRgbdCamera:
@@ -587,16 +716,24 @@ def write_live_debug(
     rgb: np.ndarray,
     ir_left: np.ndarray | None,
     ir_right: np.ndarray | None,
-    depth_aligned_m: np.ndarray,
+    depth_aligned_m: np.ndarray | torch.Tensor,
+    camera_payload: dict[str, object] | None = None,
 ) -> None:
     frame_dir = output_dir / "live_rgbd_debug" / f"frame_{frame_index:05d}" / camera_id
     frame_dir.mkdir(parents=True, exist_ok=True)
     (frame_dir / "depth_source.txt").write_text(depth_source + "\n", encoding="utf-8")
+    if camera_payload is not None:
+        (frame_dir / "camera_payload.json").write_text(
+            json.dumps(to_jsonable(camera_payload), indent=2),
+            encoding="utf-8",
+        )
     cv2.imwrite(str(frame_dir / "rgb.png"), rgb[..., ::-1])
     if ir_left is not None:
         cv2.imwrite(str(frame_dir / "ir_left_rect.png"), ir_left)
     if ir_right is not None:
         cv2.imwrite(str(frame_dir / "ir_right_rect.png"), ir_right)
+    if torch.is_tensor(depth_aligned_m):
+        depth_aligned_m = depth_aligned_m.detach().cpu().numpy()
     np.save(frame_dir / "depth_aligned_m.npy", depth_aligned_m)
     valid = depth_aligned_m > 0
     depth_vis = np.zeros((*depth_aligned_m.shape, 3), dtype=np.uint8)
@@ -817,17 +954,30 @@ def build_camera_inputs_from_live_frames(
                 right_image=ir_right_rect,
                 rectified_k=np.asarray(payload["rectified_k"], dtype=np.float32),
                 baseline_m=float(payload["baseline_m"]),
+                return_torch=True,
             )
-            depth_aligned_m = align_rectified_depth_to_color(
+            depth_aligned_m = align_rectified_depth_to_color_torch(
                 stereo_output["depth_m"],
                 rectified_intrinsics=stereo_output["rectified_intrinsics"],
                 rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
                 color_intrinsics=dict(payload["color_intrinsics"]),
                 color_shape=rgb.shape[:2],
             )
-        depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32).copy()
-        depth_aligned_m[~np.isfinite(depth_aligned_m)] = 0.0
-        depth_aligned_m[(depth_aligned_m < float(depth_min)) | (depth_aligned_m > float(depth_max))] = 0.0
+        if torch.is_tensor(depth_aligned_m):
+            depth_aligned_m = depth_aligned_m.to(dtype=torch.float32)
+            depth_aligned_m = torch.where(
+                torch.isfinite(depth_aligned_m)
+                & (depth_aligned_m >= float(depth_min))
+                & (depth_aligned_m <= float(depth_max)),
+                depth_aligned_m,
+                torch.zeros((), dtype=torch.float32, device=depth_aligned_m.device),
+            )
+            depth_valid_ratio = float((depth_aligned_m > 0).float().mean().item())
+        else:
+            depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32).copy()
+            depth_aligned_m[~np.isfinite(depth_aligned_m)] = 0.0
+            depth_aligned_m[(depth_aligned_m < float(depth_min)) | (depth_aligned_m > float(depth_max))] = 0.0
+            depth_valid_ratio = float((depth_aligned_m > 0).mean())
         camera_inputs[camera_id] = {
             "rgb": rgb,
             "depth_m": depth_aligned_m,
@@ -845,10 +995,16 @@ def build_camera_inputs_from_live_frames(
                 ir_left=ir_left_rect,
                 ir_right=ir_right_rect,
                 depth_aligned_m=depth_aligned_m,
+                camera_payload=build_live_debug_camera_payload(
+                    payload=payload,
+                    depth_source=depth_source,
+                    depth_min=float(depth_min),
+                    depth_max=float(depth_max),
+                ),
             )
         logging.info(
             f"Built RGBD for {camera_id}: source={depth_source} rgb={rgb.shape} "
-            f"depth_valid_ratio={(depth_aligned_m > 0).mean():.3f}"
+            f"depth_valid_ratio={depth_valid_ratio:.3f}"
         )
     return camera_inputs
 

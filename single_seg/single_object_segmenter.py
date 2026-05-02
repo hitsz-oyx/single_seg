@@ -89,7 +89,7 @@ class CameraFrame:
     """相机帧数据，包含 RGB、深度、内参、位姿记录和垂直视角。"""
     camera_id: str
     rgb: np.ndarray
-    depth_m: np.ndarray
+    depth_m: np.ndarray | torch.Tensor
     intrinsics: dict[str, float] | None
     pose_record: dict[str, object]
     fovy_deg: float | None
@@ -1759,7 +1759,11 @@ class SingleObjectPointCloudSegmenter:
                 )
             intrinsics = normalize_intrinsics_payload(payload.get("intrinsics"))
             pose_record = normalize_pose_record(camera_id, payload)
-            depth_m = np.asarray(payload["depth_m"], dtype=np.float32)
+            depth_value = payload["depth_m"]
+            if torch.is_tensor(depth_value):
+                depth_m = depth_value.to(device=self.tensor_device, dtype=torch.float32, non_blocking=True)
+            else:
+                depth_m = np.asarray(depth_value, dtype=np.float32)
             fovy_deg = float(payload["fovy_deg"]) if payload.get("fovy_deg") is not None else None
             x_scale, y_scale = self._get_torch_backproject_scales(
                 height=rgb.shape[0],
@@ -1770,9 +1774,14 @@ class SingleObjectPointCloudSegmenter:
             camera_prepare_time += time.perf_counter() - camera_prepare_t0
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             camera_backproject_t0 = time.perf_counter()
+            sampled_depth = (
+                depth_m[:: self.stride, :: self.stride]
+                if torch.is_tensor(depth_m)
+                else np.ascontiguousarray(depth_m[:: self.stride, :: self.stride])
+            )
             points, colors, point_labels = backproject_scene_points_with_labels_torch(
                 sampled_rgb=np.ascontiguousarray(rgb[:: self.stride, :: self.stride]),
-                sampled_depth_m=np.ascontiguousarray(depth_m[:: self.stride, :: self.stride]),
+                sampled_depth_m=sampled_depth,
                 sampled_mask=mask_t[:: self.stride, :: self.stride],
                 cam2world_gl=np.asarray(pose_record["cam2world_4x4"], dtype=np.float64),
                 x_scale=x_scale,

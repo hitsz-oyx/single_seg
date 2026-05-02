@@ -522,6 +522,23 @@ tests/outputs/realsense_live/live_rgbd_debug/
 - `depth_aligned_m.npy`
 - `depth_aligned_vis.png`
 - `depth_source.txt`
+- `camera_payload.json`：保存离线重跑所需的相机内外参；`fast` 模式还包含 `rectified_k`、`baseline_m`、`rectified_to_color`
+
+如果需要用 debug dump 离线 profile，不输出 `debug2d/ply`：
+
+```bash
+/home/oyx/miniconda3/envs/sam3/bin/python utils/profile_realsense_debug_dump.py \
+  --input-dir tests/outputs/realsense_live/live_rgbd_debug \
+  --depth-source saved
+```
+
+新 dump 有 `camera_payload.json` 后，也可以重新从 IR 图跑 Fast 前处理：
+
+```bash
+/home/oyx/miniconda3/envs/sam3/bin/python utils/profile_realsense_debug_dump.py \
+  --input-dir tests/outputs/realsense_live/live_rgbd_debug \
+  --depth-source fast
+```
 
 ### 多相机参数
 

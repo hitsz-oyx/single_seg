@@ -681,7 +681,7 @@ class TrackerOnlyVideoPredictor:
         **_: Any,
     ) -> dict[str, Any]:
         session = self._get_session(session_id)
-        mask_tensor = torch.as_tensor(mask, dtype=torch.float32)
+        mask_tensor = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
         frame_idx_out, obj_ids, low_res_masks, video_res_masks = self.model.add_new_mask(
             inference_state=session.state,
             frame_idx=int(frame_idx),
@@ -709,14 +709,17 @@ class TrackerOnlyVideoPredictor:
         return {"frame_index": int(session.state["num_frames"] - 1), "num_frames": int(session.state["num_frames"])}
 
     def _pack_outputs(self, obj_ids, video_res_masks, object_scores) -> dict[str, Any]:
-        obj_ids_np = np.asarray(list(obj_ids), dtype=np.int32)
+        if torch.is_tensor(obj_ids):
+            obj_ids_t = obj_ids.to(device=self.device, dtype=torch.int64).reshape(-1)
+        else:
+            obj_ids_t = torch.as_tensor(list(obj_ids), dtype=torch.int64, device=self.device)
         if video_res_masks is None:
             return {
-                "out_obj_ids": obj_ids_np,
-                "out_binary_masks": np.zeros((0, 0, 0), dtype=bool),
-                "out_mask_logits": np.zeros((0, 0, 0), dtype=np.float32),
-                "out_probs": np.zeros((0,), dtype=np.float32),
-                "out_tracker_probs": np.zeros((0,), dtype=np.float32),
+                "out_obj_ids": obj_ids_t,
+                "out_binary_masks": torch.zeros((0, 0, 0), dtype=torch.bool, device=self.device),
+                "out_mask_logits": torch.zeros((0, 0, 0), dtype=torch.float32, device=self.device),
+                "out_probs": torch.zeros((0,), dtype=torch.float32, device=self.device),
+                "out_tracker_probs": torch.zeros((0,), dtype=torch.float32, device=self.device),
             }
         mask_logits = video_res_masks.squeeze(1)
         binary_masks = mask_logits > 0
@@ -725,7 +728,7 @@ class TrackerOnlyVideoPredictor:
         else:
             probs = torch.sigmoid(object_scores.squeeze(-1).to(torch.float32))
         return {
-            "out_obj_ids": obj_ids_np,
+            "out_obj_ids": obj_ids_t,
             "out_binary_masks": binary_masks,
             "out_mask_logits": mask_logits,
             "out_probs": probs,
