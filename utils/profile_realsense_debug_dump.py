@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-scale", type=float, default=1.0)
     parser.add_argument("--fast-remove-invisible", type=int, default=1)
     parser.add_argument("--fast-hiera", type=int, default=0)
+    parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     return parser.parse_args()
 
 
@@ -163,6 +164,7 @@ def build_fast_depth_from_payload(
         rectified_k=np.asarray(camera_payload["rectified_k"], dtype=np.float32),
         baseline_m=float(camera_payload["baseline_m"]),
         return_torch=True,
+        include_input_images=False,
     )
     depth = align_rectified_depth_to_color_torch(
         stereo_output["depth_m"],
@@ -203,6 +205,7 @@ def main() -> None:
             scale=float(args.fast_scale),
             remove_invisible=bool(args.fast_remove_invisible),
             hiera=bool(args.fast_hiera),
+            optimize_build_volume=str(args.fast_optimize_build_volume),
         )
 
     print(f"input={input_dir}")

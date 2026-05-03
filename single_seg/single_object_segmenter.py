@@ -1535,7 +1535,7 @@ class SingleObjectPointCloudSegmenter:
         seed_masks_by_camera: dict[str, np.ndarray] = {}
         active_camera_ids: list[str] = []
         for camera_id, payload in camera_inputs.items():
-            image = Image.fromarray(np.asarray(payload["rgb"], dtype=np.uint8))
+            image = frame_resources[camera_id][0]
             debug_dir = self.output_dir / "prompt_debug" / camera_id if self.save_debug_2d else None
             boxes, scores, masks = run_single_object_prompt_query(
                 image=image,

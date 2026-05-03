@@ -540,6 +540,41 @@ tests/outputs/realsense_live/live_rgbd_debug/
   --depth-source fast
 ```
 
+### Fast 深度速度调参
+
+当前 D435 低带宽数据的 rectified IR 是 `480x270`，`rectified_fx * baseline ~= 12.1`。如果 `depth_min=0.1m`，最大视差约 `121px`，所以 `max_disp=192` 已经够用；`max_disp=256` 在这组数据上几乎没有收益，只会更慢。
+
+离线 benchmark 使用 `tests/outputs/realsense_live_fast_tuned/live_rgbd_debug` 的 30 帧，以 `valid_iters=12,max_disp=256,scale=1.0` 作为参考，后 29 帧平均结果：
+
+| Fast 参数 | depth 总耗时 | 推理耗时 | 相对参考 MAE | P90 误差 | 有效像素覆盖 |
+|---|---:|---:|---:|---:|---:|
+| `iters=12,max_disp=256` | `67.6 ms` | `66.0 ms` | `0.00 cm` | `0.00 cm` | `1.000` |
+| `iters=12,max_disp=192` | `64.6 ms` | `63.1 ms` | `0.01 cm` | `0.02 cm` | `1.000` |
+| `iters=8,max_disp=192` | `53.7 ms` | `52.2 ms` | `0.02 cm` | `0.04 cm` | `1.000` |
+| `iters=6,max_disp=192` | `46.3 ms` | `44.8 ms` | `0.03 cm` | `0.06 cm` | `1.000` |
+| `iters=4,max_disp=192` | `39.9 ms` | `38.3 ms` | `0.05 cm` | `0.10 cm` | `1.000` |
+
+当前配置文件默认使用平衡档：
+
+```yaml
+fast_stereo:
+  valid_iters: 6
+  max_disp: 192
+  scale: 1.0
+  optimize_build_volume: pytorch1
+```
+
+如果只追求速度，可以临时覆盖：
+
+```bash
+single-seg-realsense \
+  --config configs/realsense_d435_live.yaml \
+  --fast-valid-iters 4 \
+  --fast-max-disp 192
+```
+
+不建议在当前 `480x270` IR 输入上直接降 `scale`。`scale=0.75/0.5` 在这组数据中没有明显加速，反而让投影到 RGB 后的有效深度覆盖下降明显。
+
 ### 多相机参数
 
 - `--camera-count`: 使用多少个 D435 逻辑相机
@@ -547,6 +582,9 @@ tests/outputs/realsense_live/live_rgbd_debug/
 - `--camera-poses-json`: 多相机融合时提供每台 D435 的 `cam2world_4x4`
 - `--depth-source`: `fast` 使用 `IR1/IR2 + Fast-FoundationStereo`；`native` 使用 D435 原生 depth
 - `--fast-model-path`: 覆盖 `Fast-FoundationStereo` 权重路径
+- `--fast-valid-iters`: Fast refine 迭代次数；越小越快
+- `--fast-max-disp`: Fast 最大视差；当前低带宽 D435 数据默认 `192`
+- `--fast-optimize-build-volume`: Fast cost-volume 后端，支持 `pytorch1` 或 `triton`
 - `--save-ply`: 保存融合后的点云输出
 
 当前代码内部的相机数量已经是动态的，不再假设固定 3 相机。  

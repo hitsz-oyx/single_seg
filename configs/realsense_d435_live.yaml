@@ -1,50 +1,187 @@
-# RealSense D435/D435i live configuration with Fast-FoundationStereo true RGBD.
-# Relative paths are resolved from the repo root.
+# RealSense D435/D435i 实时分割配置文件
+# 使用 Fast-FoundationStereo 进行真 RGBD 深度估计
+# 相对路径基于仓库根目录解析
 
+# =============================================================================
+# 分割器配置
+# =============================================================================
 segmenter:
+  # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
+  # 例如: plate, bowl, cup 等
   target_name: plate
+
+  # Prompt 标注文件路径，包含目标物体的参考图片和边界框
   prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json
+
+  # Prompt 图片目录，存放参考图片
   prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts
+
+  # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
+
+  # 输出目录
   output_dir: tests/outputs/realsense_live
+
+  # 是否覆盖已有输出
   overwrite_output: true
 
+  # ---------------------------------------------------------------------------
+  # SAM3 分割阈值参数
+  # ---------------------------------------------------------------------------
+
+  # 置信度阈值，用于过滤低置信度的分割结果
+  # 范围: 0.0-1.0，值越高越严格
   confidence: 0.25
+
+  # 掩码二值化阈值，用于将概率图转换为二值掩码
+  # 范围: 0.0-1.0，值越高越严格
   mask_threshold: 0.6
+
+  # Prompt 匹配分数阈值，低于此值的 prompt 会被丢弃
+  # 范围: 0.0-1.0
   prompt_keep_score_threshold: 0.2
+
+  # 视频掩码概率阈值，用于判断像素是否属于目标物体
+  # 范围: 0.0-1.0，值越高越严格
   video_mask_prob_threshold: 0.95
 
+  # ---------------------------------------------------------------------------
+  # 深度和点云参数
+  # ---------------------------------------------------------------------------
+
+  # 深度有效范围 (米)
+  # 小于此值或大于此值的深度会被过滤
   depth_min: 0.1
   depth_max: 3.0
+
+  # 点云采样步长，每隔 stride 个像素采样一个点
+  # 值越大点云越稀疏，但处理更快
   stride: 2
+
+  # 帧内点云体素大小 (米)，用于降采样
+  # 值越小点云越精细，但点数更多
   frame_voxel_size: 0.003
 
+  # ---------------------------------------------------------------------------
+  # 输出选项
+  # ---------------------------------------------------------------------------
+
+  # 是否保存点云文件 (PLY 格式)
   save_ply: false
+
+  # 是否保存 2D 调试图 (分割 overlay)
   save_debug_2d: false
+
+  # SAM3 tracker 输入图像尺寸
+  # 值越大精度越高，但速度越慢
+  # 推荐: 640, 896, 1024
   tracker_image_size: 896
 
+# =============================================================================
+# RealSense 相机配置
+# =============================================================================
 realsense:
+  # 相机数量
   camera_count: 1
+
+  # 相机序列号列表 (逗号分隔)
+  # 为 null 时自动选择前 N 台相机
   camera_serials: null
+
+  # 多相机位姿文件路径 (JSON 格式)
+  # 包含每台相机的 cam2world_4x4 变换矩阵
   camera_poses_json: null
-  max_frames: 1
+
+  # 最大处理帧数，0 表示无限制
+  max_frames: 30
+
+  # 相机预热帧数，启动后等待 N 帧稳定
   camera_warmup_frames: 5
+
+  # 帧等待超时时间 (毫秒)
   wait_timeout_ms: 6000
-  fps: 6
+
+  # ---------------------------------------------------------------------------
+  # 分辨率和帧率
+  # ---------------------------------------------------------------------------
+
+  # 帧率 (FPS)
+  # 低带宽模式推荐: 6
+  # 正常模式推荐: 15-30
+  fps: 30
+
+  # RGB 彩色图像分辨率
   color_width: 1280
   color_height: 720
+
+  # IR 红外立体图像分辨率 (用于 Fast-FoundationStereo 深度估计)
+  # 分辨率越高深度精度越好，但带宽需求更大
+  # 推荐值: 1280x720, 848x480, 640x360
   stereo_width: 1280
   stereo_height: 720
+
+  # 立体校正 alpha 参数
+  # 0: 裁剪到最大有效区域
+  # 1: 保留所有原始像素 (可能有黑边)
   stereo_alpha: 0.0
-  # fast: IR1/IR2 + Fast-FoundationStereo; native: D435 depth aligned to color.
+
+  # ---------------------------------------------------------------------------
+  # 深度源选择
+  # ---------------------------------------------------------------------------
+
+  # 深度来源:
+  # - fast: 使用 IR1/IR2 + Fast-FoundationStereo 估计深度 (真 RGBD)
+  # - native: 使用相机原生深度，对齐到 RGB
   depth_source: fast
-  low_bandwidth_mode: true
+
+  # 低带宽模式开关
+  # true: 强制使用低分辨率 (color: 640x480, stereo: 480x270, fps: 6)
+  # false: 使用配置文件中的分辨率
+  # 注意: 低带宽模式下 IR 分辨率太低会导致 Fast 深度质量下降
+  low_bandwidth_mode: false
+
+  # 是否保存实时调试图片
+  # 包括: RGB, IR 左/右, 深度可视化
   save_live_debug: true
 
+# =============================================================================
+# Fast-FoundationStereo 深度估计配置
+# 仅当 depth_source=fast 时生效
+# =============================================================================
 fast_stereo:
+  # 模型权重路径
   model_path: third_party/fastfoundationstereo/weights/23-36-37/model_best_bp2_serialize.pth
-  valid_iters: 8
-  max_disp: 192
-  scale: 1.0
+
+  # ---------------------------------------------------------------------------
+  # 立体匹配参数
+  # ---------------------------------------------------------------------------
+
+  # 迭代优化次数
+  # 值越大精度越高，但速度越慢
+  # 推荐值:
+  # - 4: 速度优先
+  # - 6: 当前 D435 低带宽数据上的平衡档
+  # - 8/12: 质量优先
+  valid_iters: 4
+
+  # 最大视差范围 (像素)
+  # 物体越近需要越大的视差范围
+  # 当前 480x270 rectified IR 下，depth_min=0.1m 时 192 已覆盖近距离视差
+  # 只有需要小于约 0.1m 的深度时再考虑 256+
+  max_disp: 128
+
+  # cost volume 构建后端
+  # pytorch1: 当前数据上稳定且和 triton 速度接近
+  # triton: 也可用，但首次运行会有编译开销
+  optimize_build_volume: triton
+
+  # 输入图像缩放比例
+  # 1.0: 原始分辨率
+  # <1.0: 缩小图像以加速
+  scale: 0.75
+
+  # 是否移除不可见点 (遮挡区域)
   remove_invisible: true
+
+  # 是否使用分层推理 (更精细但更慢)
   hiera: false

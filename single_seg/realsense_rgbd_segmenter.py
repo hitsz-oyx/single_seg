@@ -120,6 +120,34 @@ def ensure_three_channels(image: np.ndarray) -> np.ndarray:
     raise ValueError(f"unsupported image shape: {image.shape}")
 
 
+def image_to_cuda_chw(image: np.ndarray) -> torch.Tensor:
+    """Convert a 2D/3D image array to a CUDA NCHW float tensor."""
+    image = np.asarray(image)
+    if not image.flags.c_contiguous or not image.flags.writeable:
+        image = np.array(image, copy=True, order="C")
+    if image.ndim == 2:
+        image_t = torch.as_tensor(image, dtype=torch.float32, device="cuda")
+        return image_t[None, None].expand(1, 3, image.shape[0], image.shape[1]).contiguous()
+    if image.ndim == 3 and image.shape[2] >= 3:
+        image_t = torch.as_tensor(np.ascontiguousarray(image[..., :3]), dtype=torch.float32, device="cuda")
+        return image_t[None].permute(0, 3, 1, 2).contiguous()
+    raise ValueError(f"unsupported image shape: {image.shape}")
+
+
+def resize_model_image(
+    image: np.ndarray,
+    *,
+    scale: float,
+    target_size: tuple[int, int] | None = None,
+) -> np.ndarray:
+    image = np.asarray(image)
+    if target_size is not None:
+        return cv2.resize(image, dsize=target_size, interpolation=cv2.INTER_AREA)
+    if float(scale) != 1.0:
+        return cv2.resize(image, fx=float(scale), fy=float(scale), dsize=None, interpolation=cv2.INTER_AREA)
+    return image
+
+
 def normalize_depth_source(depth_source: object) -> str:
     source = str(depth_source).strip().lower()
     if source not in DEPTH_SOURCE_CHOICES:
@@ -450,7 +478,10 @@ class FastFoundationStereoRunner:
         scale: float,
         remove_invisible: bool,
         hiera: bool,
+        optimize_build_volume: str = "pytorch1",
     ) -> None:
+        if optimize_build_volume not in {"pytorch1", "triton"}:
+            raise ValueError("optimize_build_volume must be 'pytorch1' or 'triton'")
         self.model_path = Path(model_path).resolve()
         if not self.model_path.is_file():
             raise FileNotFoundError(f"Fast-FoundationStereo checkpoint not found: {self.model_path}")
@@ -464,12 +495,14 @@ class FastFoundationStereoRunner:
                 "scale": float(scale),
                 "remove_invisible": int(remove_invisible),
                 "hiera": int(hiera),
+                "optimize_build_volume": optimize_build_volume,
             }
         )
         self.args = OmegaConf.create(cfg)
         self.model = torch.load(str(self.model_path), map_location="cpu", weights_only=False)
         self.model.args.valid_iters = int(valid_iters)
         self.model.args.max_disp = int(max_disp)
+        self.model.requires_grad_(False)
         self.model.cuda().eval()
 
     def infer_depth(
@@ -480,35 +513,33 @@ class FastFoundationStereoRunner:
         rectified_k: np.ndarray,
         baseline_m: float,
         return_torch: bool = False,
+        include_input_images: bool = True,
     ) -> dict[str, object]:
         from Utils import AMP_DTYPE  # noqa: PLC0415
         from core.utils.utils import InputPadder  # noqa: PLC0415
 
-        left_rgb = ensure_three_channels(left_image)
-        right_rgb = ensure_three_channels(right_image)
         scale = float(self.args.scale)
-        if scale != 1.0:
-            left_rgb = cv2.resize(left_rgb, fx=scale, fy=scale, dsize=None, interpolation=cv2.INTER_AREA)
-            right_rgb = cv2.resize(
-                right_rgb,
-                dsize=(left_rgb.shape[1], left_rgb.shape[0]),
-                interpolation=cv2.INTER_AREA,
-            )
+        left_model = resize_model_image(left_image, scale=scale)
+        right_model = resize_model_image(
+            right_image,
+            scale=scale,
+            target_size=(int(left_model.shape[1]), int(left_model.shape[0])) if scale != 1.0 else None,
+        )
         k_model = rectified_k.astype(np.float32, copy=True)
         k_model[:2] *= scale
-        height, width = left_rgb.shape[:2]
-        img0 = torch.as_tensor(left_rgb, dtype=torch.float32, device="cuda")[None].permute(0, 3, 1, 2)
-        img1 = torch.as_tensor(right_rgb, dtype=torch.float32, device="cuda")[None].permute(0, 3, 1, 2)
+        height, width = left_model.shape[:2]
+        img0 = image_to_cuda_chw(left_model)
+        img1 = image_to_cuda_chw(right_model)
         padder = InputPadder(img0.shape, divis_by=32, force_square=False)
         img0, img1 = padder.pad(img0, img1)
-        with torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
+        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
             if not int(self.args.hiera):
                 disp = self.model.forward(
                     img0,
                     img1,
                     iters=int(self.args.valid_iters),
                     test_mode=True,
-                    optimize_build_volume="pytorch1",
+                    optimize_build_volume=str(self.args.optimize_build_volume),
                 )
             else:
                 disp = self.model.run_hierachical(
@@ -518,7 +549,7 @@ class FastFoundationStereoRunner:
                     test_mode=True,
                     small_ratio=0.5,
                 )
-        disp = padder.unpad(disp.float()).detach().reshape(height, width).clamp_min_(0)
+        disp = padder.unpad(disp.float()).detach().reshape(height, width).clamp_min(0)
         if int(self.args.remove_invisible):
             xx = torch.arange(width, dtype=disp.dtype, device=disp.device)[None, :].expand(height, width)
             invalid = (xx - disp) < 0
@@ -535,11 +566,16 @@ class FastFoundationStereoRunner:
                 "height": int(height),
             }
         }
+        if include_input_images:
+            output.update(
+                {
+                    "left_rgb": ensure_three_channels(left_model),
+                    "right_rgb": ensure_three_channels(right_model),
+                }
+            )
         if return_torch:
             output.update(
                 {
-                    "left_rgb": left_rgb,
-                    "right_rgb": right_rgb,
                     "disparity": disp,
                     "depth_m": depth_m,
                 }
@@ -549,8 +585,6 @@ class FastFoundationStereoRunner:
         depth_np = depth_m.detach().cpu().numpy()
         output.update(
             {
-                "left_rgb": left_rgb,
-                "right_rgb": right_rgb,
                 "disparity": disp_np.astype(np.float32, copy=False),
                 "depth_m": depth_np.astype(np.float32, copy=False),
             }
@@ -855,6 +889,10 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             fast_cfg.get("fast_remove_invisible"),
         ),
         "fast_hiera": fast_cfg.get("hiera", fast_cfg.get("fast_hiera")),
+        "fast_optimize_build_volume": fast_cfg.get(
+            "optimize_build_volume",
+            fast_cfg.get("fast_optimize_build_volume"),
+        ),
     }
     for key, value in fast_values.items():
         if value is None:
@@ -910,6 +948,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--fast-scale", type=float, default=1.0)
     parser.add_argument("--fast-remove-invisible", type=int, default=1)
     parser.add_argument("--fast-hiera", type=int, default=0)
+    parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     parser.add_argument("--save-live-debug", type=int, default=1)
     if defaults:
         parser.set_defaults(**defaults)
@@ -955,6 +994,7 @@ def build_camera_inputs_from_live_frames(
                 rectified_k=np.asarray(payload["rectified_k"], dtype=np.float32),
                 baseline_m=float(payload["baseline_m"]),
                 return_torch=True,
+                include_input_images=False,
             )
             depth_aligned_m = align_rectified_depth_to_color_torch(
                 stereo_output["depth_m"],
@@ -1056,6 +1096,7 @@ def run_live(args: argparse.Namespace) -> None:
                 scale=float(args.fast_scale),
                 remove_invisible=bool(args.fast_remove_invisible),
                 hiera=bool(args.fast_hiera),
+                optimize_build_volume=str(args.fast_optimize_build_volume),
             )
             logging.info("Fast-FoundationStereo runner loaded")
         else:
