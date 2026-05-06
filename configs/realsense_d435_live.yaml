@@ -173,7 +173,7 @@ fast_stereo:
   # cost volume 构建后端
   # pytorch1: 当前数据上稳定且和 triton 速度接近
   # triton: 也可用，但首次运行会有编译开销
-  optimize_build_volume: triton
+  optimize_build_volume: pytorch1
 
   # 输入图像缩放比例
   # 1.0: 原始分辨率

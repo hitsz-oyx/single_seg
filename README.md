@@ -558,11 +558,13 @@ tests/outputs/realsense_live/live_rgbd_debug/
 
 ```yaml
 fast_stereo:
-  valid_iters: 6
-  max_disp: 192
-  scale: 1.0
-  optimize_build_volume: pytorch1
+  valid_iters: 4
+  max_disp: 128
+  scale: 0.75
+  optimize_build_volume: triton
 ```
+
+在当前 `1280x720` rectified IR live dump 上，这组配置的 Fast 推理约在 `70 ms` 附近。`triton` 后端首次运行会有编译/自调优开销，live 前几帧或离线 profile 首帧会明显慢一些；看稳定速度时应跳过首帧。
 
 如果只追求速度，可以临时覆盖：
 
@@ -629,6 +631,25 @@ single-seg-realsense \
 /home/oyx/miniconda3/envs/sam3/bin/python -m single_seg.view_ply_sequence \
   --input-dir tests/outputs/demo_spatial_single_object/frame_outputs
 ```
+
+默认读取 `frame_*_instance_rgb.ply`。常用 PLY 模式：
+
+- `frame_*_scene_rgb.ply`：原始 RGB 场景点云
+- `frame_*_instance_rgb.ply`：目标实例高亮点云，目标点默认染成红色
+- `frame_*_instance_label.ply`：包含实例标签字段，Open3D 不会自动把 label 映射成颜色
+
+如果要查看目标实例随高度的颜色渐变，用 `--color-mode target-height`：
+
+```bash
+DISPLAY=localhost:10.0 /home/oyx/miniconda3/envs/sam3/bin/python \
+  /home/oyx/wm_ws/single_seg/single_seg/view_ply_sequence.py \
+  --input-dir tests/outputs/realsense_live_saved_depth_ply/frame_outputs \
+  --pattern 'frame_*_instance_rgb.ply' \
+  --color-mode target-height \
+  --point-size 3
+```
+
+`target-height` 只会重着色 `instance_rgb.ply` 中的目标点；默认目标颜色是 `255,70,70`，可以用 `--target-color` 和 `--target-color-tolerance` 覆盖。
 
 键位：
 
