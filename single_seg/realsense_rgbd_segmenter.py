@@ -922,6 +922,10 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--max-frames", type=int, default=1)
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--frame-voxel-size", type=float, default=0.003)
+    parser.add_argument("--target-cluster-filter-enabled", type=int, default=0)
+    parser.add_argument("--target-cluster-radius-m", type=float, default=0.03)
+    parser.add_argument("--target-cluster-min-points", type=int, default=30)
+    parser.add_argument("--target-cluster-keep-largest", type=int, default=1)
     parser.add_argument("--depth-min", type=float, default=0.1)
     parser.add_argument("--depth-max", type=float, default=3.0)
     parser.add_argument("--confidence", type=float, default=0.25)
@@ -1117,6 +1121,10 @@ def run_live(args: argparse.Namespace) -> None:
             depth_max=float(args.depth_max),
             stride=int(args.stride),
             frame_voxel_size=float(args.frame_voxel_size),
+            target_cluster_filter_enabled=bool(args.target_cluster_filter_enabled),
+            target_cluster_radius_m=float(args.target_cluster_radius_m),
+            target_cluster_min_points=int(args.target_cluster_min_points),
+            target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
             save_ply=bool(args.save_ply),
             save_debug_2d=bool(args.save_debug_2d),
             tracker_image_size=int(args.tracker_image_size),

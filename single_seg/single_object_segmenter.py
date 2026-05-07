@@ -122,6 +122,10 @@ class SingleSegConfig:
     depth_max: float = 3.0  # 最大有效深度（米）
     stride: int = 2  # 处理帧的步长
     frame_voxel_size: float = 0.003  # 帧体素大小（用于下采样点云）
+    target_cluster_filter_enabled: bool = False  # 是否启用目标点 3D 聚类去散点
+    target_cluster_radius_m: float = 0.03  # 目标点聚类邻域半径（米）
+    target_cluster_min_points: int = 30  # 形成有效目标簇所需的最少点数
+    target_cluster_keep_largest: bool = True  # 是否只保留最大目标簇
     save_ply: bool = True  # 是否保存 .ply 点云文件
     save_debug_2d: bool = False  # 是否保存 2D 调试图
     tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE  # 追踪器输入图像尺寸
@@ -1289,6 +1293,135 @@ def fuse_scene_geometry_torch(
         return down_points, down_colors, label_max
 
 
+def dbscan_labels_from_points(points: np.ndarray, radius_m: float, min_points: int) -> np.ndarray:
+    """用网格邻域查询对 3D 点执行轻量 DBSCAN，返回每个点的簇 ID，噪声为 -1。"""
+    points = np.asarray(points, dtype=np.float32)
+    num_points = int(points.shape[0])
+    labels = np.full((num_points,), -2, dtype=np.int32)
+    if num_points == 0:
+        return labels
+    radius = float(radius_m)
+    if radius <= 0.0:
+        return np.full((num_points,), -1, dtype=np.int32)
+    min_points = max(int(min_points), 1)
+    radius_sq = radius * radius
+    voxel_keys = np.floor(points / radius).astype(np.int64, copy=False)
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    for index, key in enumerate(voxel_keys):
+        buckets.setdefault((int(key[0]), int(key[1]), int(key[2])), []).append(index)
+
+    neighbor_offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+    ]
+
+    def region_query(point_index: int) -> np.ndarray:
+        key = voxel_keys[point_index]
+        candidates: list[int] = []
+        for dx, dy, dz in neighbor_offsets:
+            candidates.extend(
+                buckets.get(
+                    (int(key[0]) + dx, int(key[1]) + dy, int(key[2]) + dz),
+                    [],
+                )
+            )
+        candidate_ids = np.asarray(candidates, dtype=np.int64)
+        if candidate_ids.size == 0:
+            return candidate_ids
+        delta = points[candidate_ids] - points[point_index]
+        return candidate_ids[np.einsum("ij,ij->i", delta, delta) <= radius_sq]
+
+    cluster_id = 0
+    for point_index in range(num_points):
+        if labels[point_index] != -2:
+            continue
+        neighbors = region_query(point_index)
+        if int(neighbors.size) < min_points:
+            labels[point_index] = -1
+            continue
+        labels[point_index] = cluster_id
+        queued = np.zeros((num_points,), dtype=bool)
+        seeds = []
+        for value in neighbors:
+            seed_value = int(value)
+            if seed_value == point_index:
+                continue
+            seeds.append(seed_value)
+            queued[seed_value] = True
+        seed_cursor = 0
+        while seed_cursor < len(seeds):
+            seed_index = seeds[seed_cursor]
+            seed_cursor += 1
+            if labels[seed_index] == -1:
+                labels[seed_index] = cluster_id
+            if labels[seed_index] != -2:
+                continue
+            labels[seed_index] = cluster_id
+            seed_neighbors = region_query(seed_index)
+            if int(seed_neighbors.size) >= min_points:
+                for neighbor_index in seed_neighbors:
+                    neighbor_int = int(neighbor_index)
+                    if labels[neighbor_int] in {-2, -1} and not bool(queued[neighbor_int]):
+                        seeds.append(neighbor_int)
+                        queued[neighbor_int] = True
+        cluster_id += 1
+    labels[labels == -2] = -1
+    return labels
+
+
+def filter_target_labels_by_3d_clusters(
+    points_xyz: np.ndarray,
+    labels: np.ndarray,
+    *,
+    enabled: bool,
+    radius_m: float,
+    min_points: int,
+    keep_largest: bool,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """按 3D 聚类过滤目标标签，散点会被改为背景标签 0。"""
+    labels_out = np.asarray(labels, dtype=np.int32).copy()
+    target_mask = labels_out > 0
+    target_count = int(np.count_nonzero(target_mask))
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "radius_m": float(radius_m),
+        "min_points": int(min_points),
+        "keep_largest": bool(keep_largest),
+        "target_points_before": target_count,
+        "target_points_after": target_count,
+        "removed_target_points": 0,
+        "num_clusters": 0,
+        "cluster_sizes": [],
+    }
+    if not enabled or target_count == 0:
+        return labels_out, summary
+
+    target_points = np.asarray(points_xyz, dtype=np.float32)[target_mask]
+    cluster_labels = dbscan_labels_from_points(
+        target_points,
+        radius_m=float(radius_m),
+        min_points=int(min_points),
+    )
+    valid_cluster_ids, cluster_sizes = np.unique(cluster_labels[cluster_labels >= 0], return_counts=True)
+    summary["num_clusters"] = int(valid_cluster_ids.shape[0])
+    summary["cluster_sizes"] = [int(value) for value in cluster_sizes.tolist()]
+    keep_target = np.zeros((target_count,), dtype=bool)
+    if valid_cluster_ids.size > 0:
+        if keep_largest:
+            largest_cluster_id = int(valid_cluster_ids[int(np.argmax(cluster_sizes))])
+            keep_target = cluster_labels == largest_cluster_id
+        else:
+            keep_target = cluster_labels >= 0
+    target_indices = np.flatnonzero(target_mask)
+    labels_out[target_indices[~keep_target]] = 0
+    target_after = int(np.count_nonzero(labels_out > 0))
+    summary["target_points_after"] = target_after
+    summary["removed_target_points"] = target_count - target_after
+    return labels_out, summary
+
+
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
     """将点云数据写入 .ply 文件。"""
     if points.shape[0] != colors.shape[0]:
@@ -1399,6 +1532,10 @@ class SingleObjectPointCloudSegmenter:
         depth_max: float = 3.0,
         stride: int = 2,
         frame_voxel_size: float = 0.003,
+        target_cluster_filter_enabled: bool = False,
+        target_cluster_radius_m: float = 0.03,
+        target_cluster_min_points: int = 30,
+        target_cluster_keep_largest: bool = True,
         save_ply: bool = True,
         save_debug_2d: bool = False,
         tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE,
@@ -1417,6 +1554,10 @@ class SingleObjectPointCloudSegmenter:
         self.depth_max = float(depth_max)
         self.stride = int(stride)
         self.frame_voxel_size = float(frame_voxel_size)
+        self.target_cluster_filter_enabled = bool(target_cluster_filter_enabled)
+        self.target_cluster_radius_m = float(target_cluster_radius_m)
+        self.target_cluster_min_points = int(target_cluster_min_points)
+        self.target_cluster_keep_largest = bool(target_cluster_keep_largest)
         self.save_ply = bool(save_ply)
         self.save_debug_2d = bool(save_debug_2d)
         self.tracker_image_size = None if tracker_image_size is None else int(tracker_image_size)
@@ -1663,6 +1804,7 @@ class SingleObjectPointCloudSegmenter:
         mask_postprocess_time = 0.0
         camera_prepare_time = 0.0
         camera_bookkeeping_time = 0.0
+        target_cluster_filter_time = 0.0
         cpu_transfer_time = 0.0
         colorize_time = 0.0
         masks_by_camera: dict[str, torch.Tensor] = {}
@@ -1825,6 +1967,42 @@ class SingleObjectPointCloudSegmenter:
             labels_t = torch.empty((0,), dtype=torch.int32, device=self.tensor_device)
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_time = time.perf_counter() - fuse_t0
+        target_cluster_summary: dict[str, object] = {
+            "enabled": bool(self.target_cluster_filter_enabled),
+            "radius_m": float(self.target_cluster_radius_m),
+            "min_points": int(self.target_cluster_min_points),
+            "keep_largest": bool(self.target_cluster_keep_largest),
+            "target_points_before": 0,
+            "target_points_after": 0,
+            "removed_target_points": 0,
+            "num_clusters": 0,
+            "cluster_sizes": [],
+        }
+        cluster_filtered_labels_np: np.ndarray | None = None
+        if self.target_cluster_filter_enabled and int(labels_t.numel()) > 0:
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            target_cluster_t0 = time.perf_counter()
+            target_mask_t = labels_t > 0
+            target_count = int(torch.count_nonzero(target_mask_t).item())
+            if target_count > 0:
+                labels_for_cluster = labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
+                target_mask_np = labels_for_cluster > 0
+                target_points_for_cluster = (
+                    points_xyz_t[target_mask_t].detach().cpu().numpy().astype(np.float32, copy=False)
+                )
+                filtered_target_labels_np, target_cluster_summary = filter_target_labels_by_3d_clusters(
+                    target_points_for_cluster,
+                    labels_for_cluster[target_mask_np],
+                    enabled=True,
+                    radius_m=self.target_cluster_radius_m,
+                    min_points=self.target_cluster_min_points,
+                    keep_largest=self.target_cluster_keep_largest,
+                )
+                labels_for_cluster[target_mask_np] = filtered_target_labels_np
+                cluster_filtered_labels_np = labels_for_cluster
+                labels_t = torch.as_tensor(cluster_filtered_labels_np, dtype=torch.int32, device=self.tensor_device)
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            target_cluster_filter_time += time.perf_counter() - target_cluster_t0
         need_cpu_output = self.save_ply
         points_xyz: np.ndarray | None = None
         raw_colors: np.ndarray | None = None
@@ -1835,7 +2013,11 @@ class SingleObjectPointCloudSegmenter:
             cpu_transfer_t0 = time.perf_counter()
             points_xyz = points_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
             raw_colors = raw_colors_t.detach().cpu().numpy().astype(np.uint8, copy=False)
-            labels = labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
+            labels = (
+                cluster_filtered_labels_np.astype(np.int32, copy=False)
+                if cluster_filtered_labels_np is not None
+                else labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
+            )
             cpu_transfer_time += time.perf_counter() - cpu_transfer_t0
             colorize_t0 = time.perf_counter()
             vis_colors = raw_colors.copy()
@@ -1860,6 +2042,7 @@ class SingleObjectPointCloudSegmenter:
                 "target_name": self.target_name,
                 "num_points": int(points_xyz.shape[0]),
                 "num_labeled_points": int(np.count_nonzero(labels)),
+                "target_cluster_filter": target_cluster_summary,
                 "camera_summaries": camera_summaries,
                 "seed_info_by_camera": self.seed_info_by_camera,
             }
@@ -1877,6 +2060,8 @@ class SingleObjectPointCloudSegmenter:
                 "frame_index": int(self.frame_index),
                 "frame_name": frame_name,
                 "num_points": int(points_xyz_t.shape[0]),
+                "num_labeled_points": int(torch.count_nonzero(labels_t > 0).item()),
+                "target_cluster_filter": target_cluster_summary,
                 "camera_summaries": camera_summaries,
                 "append_frame_time_sec": append_frame_time,
                 "propagate_time_sec": propagate_time,
@@ -1890,6 +2075,7 @@ class SingleObjectPointCloudSegmenter:
                     "mask_postprocess_time_sec": mask_postprocess_time,
                     "camera_prepare_time_sec": camera_prepare_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
+                    "target_cluster_filter_time_sec": target_cluster_filter_time,
                     "cpu_transfer_time_sec": cpu_transfer_time,
                     "colorize_time_sec": colorize_time,
                 },
@@ -1908,12 +2094,14 @@ class SingleObjectPointCloudSegmenter:
             "label_values": [0, 1],
             "palette": torch.tensor([[255, 70, 70]], dtype=torch.uint8, device=self.tensor_device),
             "camera_summaries": camera_summaries,
+            "target_cluster_filter": target_cluster_summary,
             "meta": {
                 "frame_name": frame_name,
                 "target_name": self.target_name,
                 "num_points": int(points_xyz_t.shape[0]),
                 "num_labeled_points": int(torch.count_nonzero(labels_t).item()),
                 "camera_summaries": camera_summaries,
+                "target_cluster_filter": target_cluster_summary,
                 "output_format": "torch",
             },
         }
@@ -1937,6 +2125,10 @@ class SingleObjectPointCloudSegmenter:
             "confidence": float(self.confidence),
             "mask_threshold": float(self.mask_threshold),
             "video_mask_prob_threshold": float(self.video_mask_prob_threshold),
+            "target_cluster_filter_enabled": bool(self.target_cluster_filter_enabled),
+            "target_cluster_radius_m": float(self.target_cluster_radius_m),
+            "target_cluster_min_points": int(self.target_cluster_min_points),
+            "target_cluster_keep_largest": bool(self.target_cluster_keep_largest),
             "image_processor_load_time_sec": self.image_processor_load_time_sec,
             "video_predictor_load_time_sec": self.video_predictor_load_time_sec,
             "active_camera_ids": list(self.active_camera_ids),
@@ -1979,6 +2171,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=5, help="最大处理帧数")
     parser.add_argument("--stride", type=int, default=2, help="帧采样步长")
     parser.add_argument("--frame-voxel-size", type=float, default=0.003, help="点云下采样的体素大小")
+    parser.add_argument("--target-cluster-filter-enabled", type=int, default=0, help="是否启用目标点 3D 聚类去散点")
+    parser.add_argument("--target-cluster-radius-m", type=float, default=0.03, help="目标点 3D 聚类邻域半径（米）")
+    parser.add_argument("--target-cluster-min-points", type=int, default=30, help="形成有效目标簇所需的最少点数")
+    parser.add_argument("--target-cluster-keep-largest", type=int, default=1, help="是否只保留最大目标簇")
     parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2, help="保留提示掩码的评分阈值")
     parser.add_argument("--depth-scale", type=float, default=1000.0, help="深度图缩放比例")
     parser.add_argument("--depth-min", type=float, default=0.1, help="最小有效深度")
@@ -2017,6 +2213,10 @@ def run_demo(args: argparse.Namespace) -> None:
         depth_max=float(args.depth_max),
         stride=int(args.stride),
         frame_voxel_size=float(args.frame_voxel_size),
+        target_cluster_filter_enabled=bool(args.target_cluster_filter_enabled),
+        target_cluster_radius_m=float(args.target_cluster_radius_m),
+        target_cluster_min_points=int(args.target_cluster_min_points),
+        target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
         save_ply=bool(args.save_ply),
         save_debug_2d=bool(args.save_debug_2d),
         tracker_image_size=args.tracker_image_size,

@@ -33,6 +33,7 @@ from single_seg.single_object_segmenter import (
     backproject_scene_points_with_labels_torch,
     build_score_label_map,
     collect_common_frame_names,
+    filter_target_labels_by_3d_clusters,
     fuse_scene_geometry,
     fuse_scene_geometry_torch,
     largest_connected_component,
@@ -72,8 +73,12 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     assert defaults["target_name"] == "plate"
     assert defaults["camera_count"] == 1
     assert defaults["depth_source"] == "fast"
-    assert defaults["low_bandwidth_mode"] == 1
+    assert defaults["low_bandwidth_mode"] == 0
     assert defaults["save_live_debug"] == 1
+    assert defaults["target_cluster_filter_enabled"] is True
+    assert defaults["target_cluster_radius_m"] == 0.013
+    assert defaults["target_cluster_min_points"] == 45
+    assert defaults["target_cluster_keep_largest"] is True
     assert defaults["prompt_task_info"].exists()
     assert defaults["fast_model_path"] == (
         REPO_ROOT / "third_party" / "fastfoundationstereo" / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
@@ -202,6 +207,51 @@ def test_largest_connected_component_keeps_biggest_blob() -> None:
     assert kept.sum() == 9
     assert kept[1:4, 1:4].all()
     assert not kept[6:8, 6:8].any()
+
+
+def test_filter_target_labels_by_3d_clusters_removes_outliers() -> None:
+    points = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [0.00, 0.00, 0.00],
+            [0.01, 0.00, 0.00],
+            [0.00, 0.01, 0.00],
+            [0.00, 0.00, 0.01],
+            [0.50, 0.50, 0.50],
+            [0.54, 0.50, 0.50],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.asarray([0, 1, 1, 1, 1, 1, 1], dtype=np.int32)
+
+    filtered, summary = filter_target_labels_by_3d_clusters(
+        points,
+        labels,
+        enabled=True,
+        radius_m=0.03,
+        min_points=3,
+        keep_largest=True,
+    )
+
+    assert filtered.tolist() == [0, 1, 1, 1, 1, 0, 0]
+    assert summary["target_points_before"] == 6
+    assert summary["target_points_after"] == 4
+    assert summary["removed_target_points"] == 2
+
+
+def test_filter_target_labels_by_3d_clusters_disabled_is_noop() -> None:
+    points = np.asarray([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+    labels = np.asarray([1, 1], dtype=np.int32)
+    filtered, summary = filter_target_labels_by_3d_clusters(
+        points,
+        labels,
+        enabled=False,
+        radius_m=0.03,
+        min_points=3,
+        keep_largest=True,
+    )
+    assert np.array_equal(filtered, labels)
+    assert summary["removed_target_points"] == 0
 
 
 def test_build_score_label_map_uses_mask_prob_threshold() -> None:

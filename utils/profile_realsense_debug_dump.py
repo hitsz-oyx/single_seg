@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tracker-image-size", type=int, default=896)
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--frame-voxel-size", type=float, default=0.003)
+    parser.add_argument("--target-cluster-filter-enabled", type=int, default=0)
+    parser.add_argument("--target-cluster-radius-m", type=float, default=0.03)
+    parser.add_argument("--target-cluster-min-points", type=int, default=30)
+    parser.add_argument("--target-cluster-keep-largest", type=int, default=1)
     parser.add_argument("--depth-min", type=float, default=0.1)
     parser.add_argument("--depth-max", type=float, default=3.0)
     parser.add_argument("--fx", type=float, default=910.0)
@@ -229,6 +233,10 @@ def main() -> None:
         depth_max=float(args.depth_max),
         stride=int(args.stride),
         frame_voxel_size=float(args.frame_voxel_size),
+        target_cluster_filter_enabled=bool(args.target_cluster_filter_enabled),
+        target_cluster_radius_m=float(args.target_cluster_radius_m),
+        target_cluster_min_points=int(args.target_cluster_min_points),
+        target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
         save_ply=False,
         save_debug_2d=False,
         tracker_image_size=int(args.tracker_image_size),
@@ -297,6 +305,7 @@ def main() -> None:
                 f"mask_post={float(breakdown['mask_postprocess_time_sec']):.4f}s "
                 f"backproject={float(item['backproject_time_sec']):.4f}s "
                 f"fuse={float(item['fuse_time_sec']):.4f}s "
+                f"cluster={float(breakdown.get('target_cluster_filter_time_sec', 0.0)):.4f}s "
                 f"points={int(result['points_xyz'].shape[0])}"
             )
         elapsed = time.perf_counter() - t0

@@ -158,6 +158,10 @@ tests/outputs/demo_spatial_single_object
 - `--tracker-image-size 896`: 当前默认输入尺寸
 - `--save-ply`: 保存完整场景带标签点云
 - `--save-debug-2d`: 保存逐帧 2D overlay
+- `--target-cluster-filter-enabled 1`: 对最终 3D 目标点做聚类去散点
+- `--target-cluster-radius-m 0.013`: 3D 聚类邻域半径，单位米
+- `--target-cluster-min-points 45`: 有效目标簇的最少点数
+- `--target-cluster-keep-largest 1`: 单物体场景只保留最大目标簇
 
 ## Python 用法
 
@@ -451,6 +455,17 @@ single_seg/realsense_rgbd_segmenter.py
 4. 再把对齐后的 `RGBD` 送进现有 `SingleObjectPointCloudSegmenter`
 5. 多个 D435 的点云最后再做融合
 
+融合后的目标点可以再做一层轻量 3D 聚类过滤，用来去掉深度估计导致的孤立散点。相关参数在 `configs/realsense_d435_live.yaml` 的 `segmenter` 里：
+
+```yaml
+target_cluster_filter_enabled: true
+target_cluster_radius_m: 0.013
+target_cluster_min_points: 45
+target_cluster_keep_largest: true
+```
+
+`target_cluster_radius_m` 控制点之间多远算相邻；`target_cluster_min_points` 控制小到什么程度会被当成散点；单物体任务建议保持 `target_cluster_keep_largest: true`。
+
 也就是说，这里输出的是“真 RGBD”，不是把 IR 灰度图简单伪装成 RGB。
 
 如果要和 D435 原生深度对比，可以改成 `--depth-source native`。这个模式只开 `color + depth`，用 RealSense SDK 把原生 depth 对齐到 color，不加载 `Fast-FoundationStereo` 模型。
@@ -561,10 +576,10 @@ fast_stereo:
   valid_iters: 4
   max_disp: 128
   scale: 0.75
-  optimize_build_volume: triton
+  optimize_build_volume: pytorch1
 ```
 
-在当前 `1280x720` rectified IR live dump 上，这组配置的 Fast 推理约在 `70 ms` 附近。`triton` 后端首次运行会有编译/自调优开销，live 前几帧或离线 profile 首帧会明显慢一些；看稳定速度时应跳过首帧。
+在当前 `1280x720` rectified IR live dump 上，这组配置的 Fast 推理约在 `70 ms` 附近。`pytorch1` 是当前默认后端；`triton` 也可用，但首次运行会有编译/自调优开销，live 前几帧或离线 profile 首帧会明显慢一些；看稳定速度时应跳过首帧。
 
 如果只追求速度，可以临时覆盖：
 
