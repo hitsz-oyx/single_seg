@@ -640,6 +640,38 @@ single-seg-realsense \
 
 单相机场景如果不传这个文件，默认使用单位位姿。
 
+### AprilTag 外参标定
+
+可以用 `utils/calibrate_realsense_apriltag_extrinsics.py` 从 AprilTag 直接生成 live 入口需要的 `camera_poses_json`。默认内置 `furniture-bench` 的 base tag 布局：`tag36h11` 的 `0/1/2/3` 四个 tag，边长 `0.048m`，中心分别在 `(-0.03,-0.03)`, `(0.03,-0.03)`, `(-0.03,0.03)`, `(0.03,0.03)`。
+
+先列出相机：
+
+```bash
+/home/oyx/miniconda3/envs/sam3/bin/python utils/calibrate_realsense_apriltag_extrinsics.py \
+  --list-cameras
+```
+
+标定两台相机并输出给 live 使用：
+
+```bash
+/home/oyx/miniconda3/envs/sam3/bin/python utils/calibrate_realsense_apriltag_extrinsics.py \
+  --serials 243122075507,SECOND_SERIAL \
+  --num-frames 30 \
+  --output tests/outputs/camera_poses_apriltag.json \
+  --debug-dir tests/outputs/apriltag_calibration_debug
+```
+
+然后在 live 中使用：
+
+```bash
+single-seg-realsense \
+  --config configs/realsense_d435_live.yaml \
+  --camera-count 2 \
+  --camera-poses-json tests/outputs/camera_poses_apriltag.json
+```
+
+输出里的 `cam2world_4x4` 默认是 `single_seg` 点云反投影使用的 OpenGL 相机坐标约定；文件里也会额外写入 `opencv_cv_cam2world_4x4`，方便排查 AprilTag/RealSense 原始坐标。
+
 ## 3D 可视化
 
 ```bash

@@ -50,6 +50,14 @@ from single_seg.realsense_rgbd_segmenter import (
     load_live_arg_defaults,
     project_points_to_depth_image,
 )
+from utils.calibrate_realsense_apriltag_extrinsics import (
+    CV_TO_GL,
+    average_transforms,
+    camera_to_world_from_detection,
+    furniture_base_tag_layout,
+    make_transform,
+    single_seg_pose_from_opencv_pose,
+)
 
 
 def test_repo_default_resources_exist() -> None:
@@ -111,6 +119,38 @@ def test_realsense_live_config_normalizes_serial_lists(tmp_path: Path) -> None:
     assert defaults["camera_count"] == 2
     assert defaults["camera_serials"] == "123,456"
     assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses.json"
+
+
+def test_furniture_base_apriltag_layout_matches_expected_offsets() -> None:
+    layout = furniture_base_tag_layout()
+    assert layout.tag_size_m == 0.048
+    assert sorted(layout.world_t_tag_by_id) == [0, 1, 2, 3]
+    assert np.allclose(layout.world_t_tag_by_id[0][:3, 3], [-0.03, -0.03, 0.0])
+    assert np.allclose(layout.world_t_tag_by_id[3][:3, 3], [0.03, 0.03, 0.0])
+
+
+def test_apriltag_camera_pose_conversion_uses_world_tag_pose() -> None:
+    class Detection:
+        pass
+
+    detection = Detection()
+    detection.pose_R = np.eye(3, dtype=np.float64)
+    detection.pose_t = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    world_t_tag = make_transform(np.asarray([0.2, -0.1, 0.4], dtype=np.float64))
+    world_t_camera_cv = camera_to_world_from_detection(detection, world_t_tag)
+    expected = make_transform(np.asarray([0.2, -0.1, -0.6], dtype=np.float64))
+    assert np.allclose(world_t_camera_cv, expected)
+    assert np.allclose(single_seg_pose_from_opencv_pose(world_t_camera_cv), expected @ CV_TO_GL)
+
+
+def test_average_transforms_averages_positions_and_keeps_rotation() -> None:
+    transforms = [
+        make_transform(np.asarray([0.0, 0.0, 0.0], dtype=np.float64)),
+        make_transform(np.asarray([0.2, 0.0, 0.0], dtype=np.float64)),
+    ]
+    averaged = average_transforms(transforms)
+    assert np.allclose(averaged[:3, 3], [0.1, 0.0, 0.0])
+    assert np.allclose(averaged[:3, :3], np.eye(3), atol=1e-6)
 
 
 def test_segmenter_from_config_uses_paths() -> None:
