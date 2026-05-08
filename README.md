@@ -609,7 +609,14 @@ single-seg-realsense \
 
 ### 多相机位姿文件格式
 
-当 `--camera-count > 1` 时，当前入口要求传 `--camera-poses-json`。格式示例：
+当 `--camera-count > 1` 时，当前入口要求有有效的 `camera_poses_json`。默认配置已经写到：
+
+```yaml
+realsense:
+  camera_poses_json: tests/outputs/camera_poses_apriltag.json
+```
+
+如果这个文件还没有生成，单相机运行会回退到单位位姿；多相机运行会报错，避免多相机点云在没有外参时被错误融合。格式示例：
 
 ```json
 {
@@ -638,7 +645,7 @@ single-seg-realsense \
 }
 ```
 
-单相机场景如果不传这个文件，默认使用单位位姿。
+单相机场景如果没有这个文件，默认使用单位位姿。
 
 ### AprilTag 外参标定
 
@@ -651,7 +658,7 @@ single-seg-realsense \
   --list-cameras
 ```
 
-标定两台相机并输出给 live 使用：
+标定两台相机并输出到配置文件默认路径：
 
 ```bash
 /home/oyx/miniconda3/envs/sam3/bin/python utils/calibrate_realsense_apriltag_extrinsics.py \
@@ -661,14 +668,15 @@ single-seg-realsense \
   --debug-dir tests/outputs/apriltag_calibration_debug
 ```
 
-然后在 live 中使用：
+生成后直接按配置运行 live 即可：
 
 ```bash
 single-seg-realsense \
   --config configs/realsense_d435_live.yaml \
-  --camera-count 2 \
-  --camera-poses-json tests/outputs/camera_poses_apriltag.json
+  --camera-count 2
 ```
+
+如果某台相机视野里完全没有 AprilTag，或者看到的 tag id 不在当前 layout 里，标定脚本会直接报错并打印该相机的 `camera_id/serial`、期望的 tag id、实际检测到的 tag id；如果传了 `--debug-dir`，还会保存最后一帧检测可视化图。
 
 输出里的 `cam2world_4x4` 默认是 `single_seg` 点云反投影使用的 OpenGL 相机坐标约定；文件里也会额外写入 `opencv_cv_cam2world_4x4`，方便排查 AprilTag/RealSense 原始坐标。
 

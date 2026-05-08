@@ -8,19 +8,19 @@
 segmenter:
   # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
   # 例如: plate, bowl, cup 等
-  target_name: plate
+  target_name: bowl
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json
+  prompt_task_info: assets/prompts/bowl/annotated/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts
+  prompt_image_root: assets/prompts/bowl/annotated
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live
+  output_dir: tests/outputs/realsense_live1
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -107,8 +107,7 @@ realsense:
 
   # 多相机位姿文件路径 (JSON 格式)
   # 包含每台相机的 cam2world_4x4 变换矩阵
-  # 默认路径与 AprilTag 外参标定脚本的输出一致
-  camera_poses_json: tests/outputs/camera_poses_apriltag.json
+  camera_poses_json: null
 
   # 最大处理帧数，0 表示无限制
   max_frames: 30

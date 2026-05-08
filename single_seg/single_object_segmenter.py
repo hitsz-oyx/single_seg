@@ -44,6 +44,7 @@ DEFAULT_SEED_BOX_MARGIN = 12
 DEFAULT_VIDEO_OBJECT_MIN_SCORE = 0.0
 DEFAULT_TRACKER_IMAGE_SIZE = 896
 DEFAULT_SYNC_TIMING = False
+DEFAULT_TORCH_CLUSTER_EXPANSION_STEPS = 32
 
 
 def resolve_default_checkpoint() -> Path:
@@ -1386,6 +1387,7 @@ def filter_target_labels_by_3d_clusters(
     target_count = int(np.count_nonzero(target_mask))
     summary: dict[str, object] = {
         "enabled": bool(enabled),
+        "backend": "numpy",
         "radius_m": float(radius_m),
         "min_points": int(min_points),
         "keep_largest": bool(keep_largest),
@@ -1417,6 +1419,173 @@ def filter_target_labels_by_3d_clusters(
     target_indices = np.flatnonzero(target_mask)
     labels_out[target_indices[~keep_target]] = 0
     target_after = int(np.count_nonzero(labels_out > 0))
+    summary["target_points_after"] = target_after
+    summary["removed_target_points"] = target_count - target_after
+    return labels_out, summary
+
+
+def dbscan_labels_from_points_torch(points: torch.Tensor, radius_m: float, min_points: int) -> torch.Tensor:
+    """用 torch 半径图对 3D 点执行 DBSCAN，返回每个点的簇 ID，噪声为 -1。"""
+    points = points.reshape(-1, 3)
+    num_points = int(points.shape[0])
+    device = points.device
+    if num_points == 0:
+        return torch.empty((0,), dtype=torch.int32, device=device)
+    radius = float(radius_m)
+    if radius <= 0.0:
+        return torch.full((num_points,), -1, dtype=torch.int32, device=device)
+    min_points = max(int(min_points), 1)
+    with no_autocast_context(device):
+        points_f = points.to(dtype=torch.float32)
+        point_norm = torch.sum(points_f * points_f, dim=1, keepdim=True)
+        dist_sq = point_norm + point_norm.T - 2.0 * (points_f @ points_f.T)
+        adjacency = dist_sq <= (radius * radius)
+        adjacency.fill_diagonal_(True)
+        core_mask = torch.sum(adjacency, dim=1) >= int(min_points)
+        core_indices = torch.nonzero(core_mask, as_tuple=False).flatten()
+        num_core = int(core_indices.shape[0])
+        labels = torch.full((num_points,), -1, dtype=torch.int32, device=device)
+        if num_core == 0:
+            return labels
+
+        core_adjacency = adjacency[core_indices][:, core_indices]
+        core_labels = torch.full((num_core,), -1, dtype=torch.int32, device=device)
+        unvisited = torch.ones((num_core,), dtype=torch.bool, device=device)
+        cluster_id = 0
+        while bool(torch.any(unvisited).item()):
+            seed = int(torch.nonzero(unvisited, as_tuple=False)[0].item())
+            component = torch.zeros((num_core,), dtype=torch.bool, device=device)
+            component[seed] = True
+            while True:
+                expanded = torch.any(core_adjacency[component], dim=0) | component
+                if bool(torch.equal(expanded, component)):
+                    break
+                component = expanded
+            core_labels[component] = int(cluster_id)
+            unvisited[component] = False
+            cluster_id += 1
+
+        labels[core_indices] = core_labels
+        border_mask = ~core_mask
+        if bool(torch.any(border_mask).item()):
+            border_indices = torch.nonzero(border_mask, as_tuple=False).flatten()
+            border_to_core = adjacency[border_indices][:, core_indices]
+            has_core_neighbor = torch.any(border_to_core, dim=1)
+            if bool(torch.any(has_core_neighbor).item()):
+                large_label = torch.full(
+                    (1,),
+                    int(cluster_id),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                neighbor_labels = torch.where(
+                    border_to_core,
+                    core_labels[None, :],
+                    large_label,
+                )
+                border_labels = torch.min(neighbor_labels, dim=1).values
+                labels[border_indices[has_core_neighbor]] = border_labels[has_core_neighbor]
+        return labels
+
+
+def filter_target_labels_by_3d_clusters_torch(
+    points_xyz: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    enabled: bool,
+    radius_m: float,
+    min_points: int,
+    keep_largest: bool,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """按 3D 聚类过滤目标标签（torch 实现），散点会被改为背景标签 0。"""
+    labels_out = labels.to(dtype=torch.int32).clone()
+    target_mask = labels_out > 0
+    target_count = int(torch.count_nonzero(target_mask).item())
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "backend": "torch",
+        "radius_m": float(radius_m),
+        "min_points": int(min_points),
+        "keep_largest": bool(keep_largest),
+        "target_points_before": target_count,
+        "target_points_after": target_count,
+        "removed_target_points": 0,
+        "num_clusters": 0,
+        "cluster_sizes": [],
+    }
+    if not enabled or target_count == 0:
+        return labels_out, summary
+
+    target_indices = torch.nonzero(target_mask, as_tuple=False).flatten()
+    target_points = points_xyz[target_indices]
+    if keep_largest:
+        radius = float(radius_m)
+        if radius <= 0.0:
+            keep_target = torch.zeros((target_count,), dtype=torch.bool, device=labels_out.device)
+            target_after = 0
+        else:
+            with no_autocast_context(points_xyz.device):
+                target_points_f = target_points.to(dtype=torch.float32)
+                point_norm = torch.sum(target_points_f * target_points_f, dim=1, keepdim=True)
+                adjacency = point_norm + point_norm.T - 2.0 * (target_points_f @ target_points_f.T)
+                adjacency = adjacency <= (radius * radius)
+                adjacency.fill_diagonal_(True)
+                neighbor_counts = torch.sum(adjacency, dim=1)
+                core_mask = neighbor_counts >= max(int(min_points), 1)
+                core_indices = torch.nonzero(core_mask, as_tuple=False).flatten()
+                if int(core_indices.shape[0]) == 0:
+                    keep_target = torch.zeros((target_count,), dtype=torch.bool, device=labels_out.device)
+                    target_after = 0
+                else:
+                    core_adjacency = adjacency[core_indices][:, core_indices].to(dtype=torch.float32)
+                    seed = int(torch.argmax(neighbor_counts[core_indices]).item())
+                    component_score = torch.zeros(
+                        (int(core_indices.shape[0]),),
+                        dtype=torch.float32,
+                        device=labels_out.device,
+                    )
+                    component_score[seed] = 1.0
+                    for _ in range(DEFAULT_TORCH_CLUSTER_EXPANSION_STEPS):
+                        component_score = torch.clamp(core_adjacency @ component_score, max=1.0)
+                    component = component_score > 0.0
+                    keep_target = torch.zeros((target_count,), dtype=torch.bool, device=labels_out.device)
+                    kept_core_indices = core_indices[component]
+                    keep_target[kept_core_indices] = True
+                    border_indices = torch.nonzero(~core_mask, as_tuple=False).flatten()
+                    if int(border_indices.shape[0]) > 0 and int(kept_core_indices.shape[0]) > 0:
+                        keep_target[border_indices] = torch.any(
+                            adjacency[border_indices][:, kept_core_indices],
+                            dim=1,
+                        )
+                    target_after = int(torch.count_nonzero(keep_target).item())
+        summary["num_clusters"] = 1 if target_after > 0 else 0
+        summary["cluster_sizes"] = [target_after] if target_after > 0 else []
+        summary["largest_only_fast_path"] = True
+        summary["expansion_steps"] = DEFAULT_TORCH_CLUSTER_EXPANSION_STEPS
+        labels_out[target_indices[~keep_target]] = 0
+        summary["target_points_after"] = target_after
+        summary["removed_target_points"] = target_count - target_after
+        return labels_out, summary
+
+    cluster_labels = dbscan_labels_from_points_torch(
+        target_points,
+        radius_m=float(radius_m),
+        min_points=int(min_points),
+    )
+    valid = cluster_labels >= 0
+    if bool(torch.any(valid).item()):
+        cluster_sizes_t = torch.bincount(cluster_labels[valid].to(torch.int64))
+        keep_target = valid.clone()
+        if keep_largest:
+            keep_cluster = int(torch.argmax(cluster_sizes_t).item())
+            keep_target = cluster_labels == keep_cluster
+        target_after = int(torch.count_nonzero(keep_target).item())
+        summary["num_clusters"] = int(cluster_sizes_t.shape[0])
+        summary["cluster_sizes"] = [int(value) for value in cluster_sizes_t.detach().cpu().tolist()]
+    else:
+        keep_target = torch.zeros((target_count,), dtype=torch.bool, device=labels_out.device)
+        target_after = 0
+    labels_out[target_indices[~keep_target]] = 0
     summary["target_points_after"] = target_after
     summary["removed_target_points"] = target_count - target_after
     return labels_out, summary
@@ -1969,6 +2138,7 @@ class SingleObjectPointCloudSegmenter:
         fuse_time = time.perf_counter() - fuse_t0
         target_cluster_summary: dict[str, object] = {
             "enabled": bool(self.target_cluster_filter_enabled),
+            "backend": "torch",
             "radius_m": float(self.target_cluster_radius_m),
             "min_points": int(self.target_cluster_min_points),
             "keep_largest": bool(self.target_cluster_keep_largest),
@@ -1978,29 +2148,17 @@ class SingleObjectPointCloudSegmenter:
             "num_clusters": 0,
             "cluster_sizes": [],
         }
-        cluster_filtered_labels_np: np.ndarray | None = None
         if self.target_cluster_filter_enabled and int(labels_t.numel()) > 0:
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             target_cluster_t0 = time.perf_counter()
-            target_mask_t = labels_t > 0
-            target_count = int(torch.count_nonzero(target_mask_t).item())
-            if target_count > 0:
-                labels_for_cluster = labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
-                target_mask_np = labels_for_cluster > 0
-                target_points_for_cluster = (
-                    points_xyz_t[target_mask_t].detach().cpu().numpy().astype(np.float32, copy=False)
-                )
-                filtered_target_labels_np, target_cluster_summary = filter_target_labels_by_3d_clusters(
-                    target_points_for_cluster,
-                    labels_for_cluster[target_mask_np],
-                    enabled=True,
-                    radius_m=self.target_cluster_radius_m,
-                    min_points=self.target_cluster_min_points,
-                    keep_largest=self.target_cluster_keep_largest,
-                )
-                labels_for_cluster[target_mask_np] = filtered_target_labels_np
-                cluster_filtered_labels_np = labels_for_cluster
-                labels_t = torch.as_tensor(cluster_filtered_labels_np, dtype=torch.int32, device=self.tensor_device)
+            labels_t, target_cluster_summary = filter_target_labels_by_3d_clusters_torch(
+                points_xyz_t,
+                labels_t,
+                enabled=True,
+                radius_m=self.target_cluster_radius_m,
+                min_points=self.target_cluster_min_points,
+                keep_largest=self.target_cluster_keep_largest,
+            )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             target_cluster_filter_time += time.perf_counter() - target_cluster_t0
         need_cpu_output = self.save_ply
@@ -2013,11 +2171,7 @@ class SingleObjectPointCloudSegmenter:
             cpu_transfer_t0 = time.perf_counter()
             points_xyz = points_xyz_t.detach().cpu().numpy().astype(np.float32, copy=False)
             raw_colors = raw_colors_t.detach().cpu().numpy().astype(np.uint8, copy=False)
-            labels = (
-                cluster_filtered_labels_np.astype(np.int32, copy=False)
-                if cluster_filtered_labels_np is not None
-                else labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
-            )
+            labels = labels_t.detach().cpu().numpy().astype(np.int32, copy=False)
             cpu_transfer_time += time.perf_counter() - cpu_transfer_t0
             colorize_t0 = time.perf_counter()
             vis_colors = raw_colors.copy()

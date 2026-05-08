@@ -413,7 +413,11 @@ class LiveCameraPose:
 def load_live_camera_pose_map(pose_path: Path | None) -> dict[str, LiveCameraPose]:
     if pose_path is None:
         return {}
-    payload = json.loads(Path(pose_path).read_text(encoding="utf-8"))
+    resolved_pose_path = Path(pose_path)
+    if not resolved_pose_path.is_file():
+        logging.warning(f"camera pose file not found, falling back to identity pose when allowed: {resolved_pose_path}")
+        return {}
+    payload = json.loads(resolved_pose_path.read_text(encoding="utf-8"))
     cameras = payload.get("cameras", payload)
     if not isinstance(cameras, list):
         raise ValueError("camera pose file must contain a list of cameras")

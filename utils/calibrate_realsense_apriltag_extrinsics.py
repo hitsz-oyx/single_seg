@@ -442,11 +442,20 @@ def calibrate_camera_from_frames(
     pose_errors: list[float] = []
     margins: list[float] = []
     tag_counts = {tag_id: 0 for tag_id in layout.world_t_tag_by_id}
+    detected_tag_counts: dict[int, int] = {}
+    configured_seen_counts: dict[int, int] = {}
     frames_used = 0
     last_debug: np.ndarray | None = None
+    debug_path: Path | None = None
     for frame in frames:
         detections = detector.detect(frame, intrinsics)
+        for detection in detections:
+            tag_id = int(detection.tag_id)
+            detected_tag_counts[tag_id] = detected_tag_counts.get(tag_id, 0) + 1
         matched = [detection for detection in detections if int(detection.tag_id) in layout.world_t_tag_by_id]
+        for detection in matched:
+            tag_id = int(detection.tag_id)
+            configured_seen_counts[tag_id] = configured_seen_counts.get(tag_id, 0) + 1
         if len(matched) < int(min_tags_per_frame):
             last_debug = draw_debug_detections(frame, detections, layout)
             continue
@@ -463,7 +472,27 @@ def calibrate_camera_from_frames(
             if hasattr(detection, "decision_margin"):
                 margins.append(float(detection.decision_margin))
     if not pose_observations:
-        raise RuntimeError(f"{camera_id} did not observe any configured AprilTag")
+        if debug_dir is not None and last_debug is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            debug_path = debug_dir / f"{camera_id}_detections.png"
+            cv2.imwrite(str(debug_path), last_debug)
+        configured_ids = sorted(int(tag_id) for tag_id in layout.world_t_tag_by_id)
+        detected_ids = sorted(int(tag_id) for tag_id in detected_tag_counts)
+        configured_seen_ids = sorted(int(tag_id) for tag_id in configured_seen_counts)
+        if not detected_ids:
+            reason = "没有检测到任何 AprilTag"
+        elif not configured_seen_ids:
+            reason = "检测到了 AprilTag，但 tag id 不在当前 tag layout 里"
+        else:
+            reason = f"检测到了配置内 AprilTag，但没有任何一帧满足 min_tags_per_frame={int(min_tags_per_frame)}"
+        debug_hint = f"; debug_image={debug_path}" if debug_path is not None else ""
+        raise RuntimeError(
+            f"{camera_id} serial={serial_number} 无法通过 AprilTag 标定外参：{reason}. "
+            f"frames={len(frames)}, valid_frames={frames_used}, "
+            f"configured_tag_ids={configured_ids}, detected_tag_ids={detected_ids}, "
+            f"configured_detected_counts={configured_seen_counts}, all_detected_counts={detected_tag_counts}"
+            f"{debug_hint}"
+        )
     world_t_camera_cv = average_transforms(pose_observations)
     if debug_dir is not None and last_debug is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)

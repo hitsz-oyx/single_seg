@@ -34,6 +34,7 @@ from single_seg.single_object_segmenter import (
     build_score_label_map,
     collect_common_frame_names,
     filter_target_labels_by_3d_clusters,
+    filter_target_labels_by_3d_clusters_torch,
     fuse_scene_geometry,
     fuse_scene_geometry_torch,
     largest_connected_component,
@@ -53,6 +54,7 @@ from single_seg.realsense_rgbd_segmenter import (
 from utils.calibrate_realsense_apriltag_extrinsics import (
     CV_TO_GL,
     average_transforms,
+    calibrate_camera_from_frames,
     camera_to_world_from_detection,
     furniture_base_tag_layout,
     make_transform,
@@ -87,6 +89,7 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     assert defaults["target_cluster_radius_m"] == 0.013
     assert defaults["target_cluster_min_points"] == 45
     assert defaults["target_cluster_keep_largest"] is True
+    assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses_apriltag.json"
     assert defaults["prompt_task_info"].exists()
     assert defaults["fast_model_path"] == (
         REPO_ROOT / "third_party" / "fastfoundationstereo" / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
@@ -151,6 +154,26 @@ def test_average_transforms_averages_positions_and_keeps_rotation() -> None:
     averaged = average_transforms(transforms)
     assert np.allclose(averaged[:3, 3], [0.1, 0.0, 0.0])
     assert np.allclose(averaged[:3, :3], np.eye(3), atol=1e-6)
+
+
+def test_apriltag_calibration_errors_when_camera_sees_no_tags(tmp_path: Path) -> None:
+    class EmptyDetector:
+        def detect(self, image, intrinsics):
+            return []
+
+    debug_dir = tmp_path / "debug"
+    with pytest.raises(RuntimeError, match="没有检测到任何 AprilTag"):
+        calibrate_camera_from_frames(
+            camera_id="cam_00",
+            serial_number="serial_00",
+            frames=[np.zeros((24, 32, 3), dtype=np.uint8)],
+            intrinsics={"fx": 20.0, "fy": 20.0, "cx": 16.0, "cy": 12.0},
+            layout=furniture_base_tag_layout(),
+            detector=EmptyDetector(),
+            min_tags_per_frame=1,
+            debug_dir=debug_dir,
+        )
+    assert (debug_dir / "cam_00_detections.png").exists()
 
 
 def test_segmenter_from_config_uses_paths() -> None:
@@ -292,6 +315,45 @@ def test_filter_target_labels_by_3d_clusters_disabled_is_noop() -> None:
     )
     assert np.array_equal(filtered, labels)
     assert summary["removed_target_points"] == 0
+
+
+def test_filter_target_labels_by_3d_clusters_torch_matches_numpy() -> None:
+    points = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [0.00, 0.00, 0.00],
+            [0.01, 0.00, 0.00],
+            [0.00, 0.01, 0.00],
+            [0.00, 0.00, 0.01],
+            [0.50, 0.50, 0.50],
+            [0.54, 0.50, 0.50],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.asarray([0, 1, 1, 1, 1, 1, 1], dtype=np.int32)
+    expected, expected_summary = filter_target_labels_by_3d_clusters(
+        points,
+        labels,
+        enabled=True,
+        radius_m=0.03,
+        min_points=3,
+        keep_largest=True,
+    )
+
+    filtered_t, summary = filter_target_labels_by_3d_clusters_torch(
+        torch.as_tensor(points),
+        torch.as_tensor(labels),
+        enabled=True,
+        radius_m=0.03,
+        min_points=3,
+        keep_largest=True,
+    )
+
+    assert np.array_equal(filtered_t.cpu().numpy(), expected)
+    assert summary["backend"] == "torch"
+    assert summary["target_points_before"] == expected_summary["target_points_before"]
+    assert summary["target_points_after"] == expected_summary["target_points_after"]
+    assert summary["removed_target_points"] == expected_summary["removed_target_points"]
 
 
 def test_build_score_label_map_uses_mask_prob_threshold() -> None:
