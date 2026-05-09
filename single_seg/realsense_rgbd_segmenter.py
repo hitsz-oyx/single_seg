@@ -33,6 +33,7 @@ FAST_STEREO_DEFAULT_MODEL = (
     FAST_STEREO_ROOT / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
 )
 DEPTH_SOURCE_CHOICES = ("fast", "native")
+STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
 
 if str(FAST_STEREO_ROOT) not in sys.path:
     sys.path.insert(0, str(FAST_STEREO_ROOT))
@@ -155,6 +156,13 @@ def normalize_depth_source(depth_source: object) -> str:
     return source
 
 
+def normalize_stereo_rectification_mode(mode: object) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in STEREO_RECTIFICATION_CHOICES:
+        raise ValueError(f"stereo_rectification_mode must be one of {STEREO_RECTIFICATION_CHOICES}, got {mode!r}")
+    return normalized
+
+
 def build_rectification(
     left_intr: rs.intrinsics,
     right_intr: rs.intrinsics,
@@ -192,6 +200,23 @@ def build_rectification(
         "rectified_k": p1[:3, :3].astype(np.float32),
         "rectified_to_left": rectified_to_left,
         "baseline_m": float(np.linalg.norm(t)),
+    }
+
+
+def build_passthrough_rectification(left_intr: rs.intrinsics, left_to_right: np.ndarray) -> dict[str, object]:
+    """Use RealSense IR frames directly when the device already returns rectified stereo streams."""
+    translation = np.asarray(left_to_right[:3, 3], dtype=np.float64)
+    baseline = abs(float(translation[0]))
+    if baseline <= 0.0:
+        baseline = float(np.linalg.norm(translation))
+    return {
+        "map1_l": None,
+        "map2_l": None,
+        "map1_r": None,
+        "map2_r": None,
+        "rectified_k": intrinsics_to_matrix(left_intr).astype(np.float32),
+        "rectified_to_left": np.eye(4, dtype=np.float64),
+        "baseline_m": baseline,
     }
 
 
@@ -389,17 +414,24 @@ def build_live_debug_camera_payload(
         "depth_aligned_file": "depth_aligned_m.npy",
         "color_intrinsics": to_jsonable(payload.get("color_intrinsics")),
         "pose_record": to_jsonable(payload.get("pose_record")),
+        "emitter_enabled": to_jsonable(payload.get("emitter_enabled")),
         "depth_min": float(depth_min),
         "depth_max": float(depth_max),
     }
     if depth_source == "fast":
         debug_payload.update(
             {
+                "stereo_rectification_mode": str(payload.get("stereo_rectification_mode", "opencv")),
+                "ir_left_raw_file": "ir_left_raw.png",
+                "ir_right_raw_file": "ir_right_raw.png",
                 "ir_left_rect_file": "ir_left_rect.png",
                 "ir_right_rect_file": "ir_right_rect.png",
                 "rectified_k": to_jsonable(payload["rectified_k"]),
                 "rectified_to_color": to_jsonable(payload["rectified_to_color"]),
                 "baseline_m": float(payload["baseline_m"]),
+                "left_ir_intrinsics": to_jsonable(payload.get("left_ir_intrinsics")),
+                "right_ir_intrinsics": to_jsonable(payload.get("right_ir_intrinsics")),
+                "left_to_right_4x4": to_jsonable(payload.get("left_to_right_4x4")),
             }
         )
     return debug_payload
@@ -441,7 +473,13 @@ def write_live_debug_config_snapshot(
             "stereo_height": camera.stereo_height,
             "fps": camera.fps,
             "depth_source": camera.depth_source,
+            "stereo_rectification_mode": camera.stereo_rectification_mode,
+            "requested_emitter_enabled": camera.emitter_enabled,
+            "applied_emitter_enabled": camera.applied_emitter_enabled,
             "color_intrinsics": to_jsonable(camera.color_intrinsics),
+            "left_ir_intrinsics": to_jsonable(camera.left_ir_intrinsics),
+            "right_ir_intrinsics": to_jsonable(camera.right_ir_intrinsics),
+            "left_to_right_4x4": to_jsonable(camera.left_to_right_4x4),
             "pose_record": to_jsonable(camera.pose_record),
         }
         for camera in cameras
@@ -669,6 +707,8 @@ class RealSenseRgbdCamera:
         alpha: float,
         wait_timeout_ms: int,
         depth_source: str,
+        stereo_rectification_mode: str = "opencv",
+        emitter_enabled: int | None = None,
     ) -> None:
         self.camera_id = str(camera_id)
         self.serial_number = str(serial_number)
@@ -681,15 +721,21 @@ class RealSenseRgbdCamera:
         self.alpha = float(alpha)
         self.wait_timeout_ms = int(wait_timeout_ms)
         self.depth_source = normalize_depth_source(depth_source)
+        self.stereo_rectification_mode = normalize_stereo_rectification_mode(stereo_rectification_mode)
+        self.emitter_enabled = None if emitter_enabled is None else bool(int(emitter_enabled))
         self.pipeline = rs.pipeline()
         self.profile: rs.pipeline_profile | None = None
         self.color_intrinsics: dict[str, float] | None = None
+        self.left_ir_intrinsics: dict[str, float] | None = None
+        self.right_ir_intrinsics: dict[str, float] | None = None
+        self.left_to_right_4x4: np.ndarray | None = None
         self.color_map1: np.ndarray | None = None
         self.color_map2: np.ndarray | None = None
-        self.rectification: dict[str, np.ndarray] | None = None
+        self.rectification: dict[str, object] | None = None
         self.rectified_to_color: np.ndarray | None = None
         self.align_to_color: object | None = None
         self.depth_scale = 0.001
+        self.applied_emitter_enabled: bool | None = None
         self.pose_record: dict[str, object] = pose_record_from_cam2world(self.camera_id, self.cam2world_4x4)
 
     def start(self) -> None:
@@ -702,11 +748,22 @@ class RealSenseRgbdCamera:
         else:
             config.enable_stream(rs.stream.depth, self.stereo_width, self.stereo_height, rs.format.z16, self.fps)
         self.profile = self.pipeline.start(config)
+        depth_sensor = self.profile.get_device().first_depth_sensor()
+        if self.emitter_enabled is not None:
+            if depth_sensor.supports(rs.option.emitter_enabled):
+                depth_sensor.set_option(rs.option.emitter_enabled, float(int(self.emitter_enabled)))
+                self.applied_emitter_enabled = bool(int(depth_sensor.get_option(rs.option.emitter_enabled)))
+                logging.info(
+                    f"Set RealSense emitter_enabled={int(self.applied_emitter_enabled)} "
+                    f"for camera {self.camera_id}"
+                )
+            else:
+                logging.warning(f"RealSense emitter_enabled option is not supported by camera {self.camera_id}")
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         color_intr = color_profile.get_intrinsics()
         self.color_intrinsics = intrinsics_to_payload(color_intr)
         if self.depth_source == "native":
-            self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
+            self.depth_scale = float(depth_sensor.get_depth_scale())
             self.align_to_color = rs.align(rs.stream.color)
             return
 
@@ -716,18 +773,24 @@ class RealSenseRgbdCamera:
         right_intr = right_profile.get_intrinsics()
         left_to_right = extrinsics_to_matrix(left_profile.get_extrinsics_to(right_profile))
         left_to_color = extrinsics_to_matrix(left_profile.get_extrinsics_to(color_profile))
-        self.rectification = build_rectification(
-            left_intr,
-            right_intr,
-            left_to_right,
-            image_size=(self.stereo_width, self.stereo_height),
-            alpha=self.alpha,
-        )
+        self.left_ir_intrinsics = intrinsics_to_payload(left_intr)
+        self.right_ir_intrinsics = intrinsics_to_payload(right_intr)
+        self.left_to_right_4x4 = left_to_right
+        if self.stereo_rectification_mode == "passthrough":
+            self.rectification = build_passthrough_rectification(left_intr, left_to_right)
+        else:
+            self.rectification = build_rectification(
+                left_intr,
+                right_intr,
+                left_to_right,
+                image_size=(self.stereo_width, self.stereo_height),
+                alpha=self.alpha,
+            )
         self.color_map1, self.color_map2 = build_undistort_maps(
             color_intr,
             image_size=(self.color_width, self.color_height),
         )
-        rectified_to_left = self.rectification["rectified_to_left"]
+        rectified_to_left = np.asarray(self.rectification["rectified_to_left"], dtype=np.float64)
         self.rectified_to_color = left_to_color @ rectified_to_left
 
     def warmup(self, num_frames: int) -> None:
@@ -750,6 +813,7 @@ class RealSenseRgbdCamera:
                 "camera_id": self.camera_id,
                 "serial_number": self.serial_number,
                 "depth_source": self.depth_source,
+                "emitter_enabled": self.applied_emitter_enabled,
                 "rgb": cv2.cvtColor(color_raw_bgr, cv2.COLOR_BGR2RGB),
                 "depth_m": depth_m,
                 "color_intrinsics": self.color_intrinsics,
@@ -772,28 +836,39 @@ class RealSenseRgbdCamera:
             self.color_map2,
             interpolation=cv2.INTER_LINEAR,
         )
-        left_rect = cv2.remap(
-            left_raw,
-            self.rectification["map1_l"],
-            self.rectification["map2_l"],
-            interpolation=cv2.INTER_LINEAR,
-        )
-        right_rect = cv2.remap(
-            right_raw,
-            self.rectification["map1_r"],
-            self.rectification["map2_r"],
-            interpolation=cv2.INTER_LINEAR,
-        )
+        if self.stereo_rectification_mode == "passthrough":
+            left_rect = np.ascontiguousarray(left_raw)
+            right_rect = np.ascontiguousarray(right_raw)
+        else:
+            left_rect = cv2.remap(
+                left_raw,
+                np.asarray(self.rectification["map1_l"]),
+                np.asarray(self.rectification["map2_l"]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            right_rect = cv2.remap(
+                right_raw,
+                np.asarray(self.rectification["map1_r"]),
+                np.asarray(self.rectification["map2_r"]),
+                interpolation=cv2.INTER_LINEAR,
+            )
         return {
             "camera_id": self.camera_id,
             "serial_number": self.serial_number,
             "depth_source": self.depth_source,
+            "emitter_enabled": self.applied_emitter_enabled,
             "rgb": cv2.cvtColor(color_undistorted_bgr, cv2.COLOR_BGR2RGB),
+            "ir_left_raw": left_raw,
+            "ir_right_raw": right_raw,
             "ir_left_rect": left_rect,
             "ir_right_rect": right_rect,
+            "stereo_rectification_mode": self.stereo_rectification_mode,
             "rectified_k": self.rectification["rectified_k"],
             "rectified_to_color": self.rectified_to_color,
             "baseline_m": self.rectification["baseline_m"],
+            "left_ir_intrinsics": self.left_ir_intrinsics,
+            "right_ir_intrinsics": self.right_ir_intrinsics,
+            "left_to_right_4x4": self.left_to_right_4x4,
             "color_intrinsics": self.color_intrinsics,
             "pose_record": self.pose_record,
         }
@@ -813,6 +888,8 @@ def write_live_debug(
     ir_left: np.ndarray | None,
     ir_right: np.ndarray | None,
     depth_aligned_m: np.ndarray | torch.Tensor,
+    ir_left_raw: np.ndarray | None = None,
+    ir_right_raw: np.ndarray | None = None,
     camera_payload: dict[str, object] | None = None,
 ) -> None:
     frame_dir = output_dir / "live_rgbd_debug" / f"frame_{frame_index:05d}" / camera_id
@@ -824,6 +901,10 @@ def write_live_debug(
             encoding="utf-8",
         )
     cv2.imwrite(str(frame_dir / "rgb.png"), rgb[..., ::-1])
+    if ir_left_raw is not None:
+        cv2.imwrite(str(frame_dir / "ir_left_raw.png"), ir_left_raw)
+    if ir_right_raw is not None:
+        cv2.imwrite(str(frame_dir / "ir_right_raw.png"), ir_right_raw)
     if ir_left is not None:
         cv2.imwrite(str(frame_dir / "ir_left_rect.png"), ir_left)
     if ir_right is not None:
@@ -924,6 +1005,8 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
         "stereo_width": realsense_cfg.get("stereo_width"),
         "stereo_height": realsense_cfg.get("stereo_height"),
         "stereo_alpha": realsense_cfg.get("stereo_alpha"),
+        "stereo_rectification_mode": realsense_cfg.get("stereo_rectification_mode"),
+        "emitter_enabled": realsense_cfg.get("emitter_enabled"),
         "depth_source": realsense_cfg.get("depth_source"),
         "low_bandwidth_mode": realsense_cfg.get("low_bandwidth_mode"),
         "max_frames": realsense_cfg.get("max_frames"),
@@ -936,7 +1019,9 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults[key] = resolve_repo_path(value)
         elif key == "depth_source":
             defaults[key] = normalize_depth_source(value)
-        elif key in {"low_bandwidth_mode", "save_live_debug"}:
+        elif key == "stereo_rectification_mode":
+            defaults[key] = normalize_stereo_rectification_mode(value)
+        elif key in {"low_bandwidth_mode", "save_live_debug", "emitter_enabled"}:
             defaults[key] = int(bool(value))
         else:
             defaults[key] = value
@@ -1016,6 +1101,8 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--stereo-width", type=int, default=480)
     parser.add_argument("--stereo-height", type=int, default=270)
     parser.add_argument("--stereo-alpha", type=float, default=0.0)
+    parser.add_argument("--stereo-rectification-mode", choices=STEREO_RECTIFICATION_CHOICES, default="opencv")
+    parser.add_argument("--emitter-enabled", type=int, choices=(0, 1), default=None)
     parser.add_argument("--depth-source", choices=DEPTH_SOURCE_CHOICES, default="fast")
     parser.add_argument("--low-bandwidth-mode", type=int, default=1)
     parser.add_argument("--fast-model-path", type=Path, default=FAST_STEREO_DEFAULT_MODEL)
@@ -1111,6 +1198,8 @@ def build_camera_inputs_from_live_frames(
                 ir_left=ir_left_rect,
                 ir_right=ir_right_rect,
                 depth_aligned_m=depth_aligned_m,
+                ir_left_raw=payload.get("ir_left_raw"),
+                ir_right_raw=payload.get("ir_right_raw"),
                 camera_payload=build_live_debug_camera_payload(
                     payload=payload,
                     depth_source=depth_source,
@@ -1157,6 +1246,8 @@ def run_live(args: argparse.Namespace) -> None:
                 alpha=float(args.stereo_alpha),
                 wait_timeout_ms=int(args.wait_timeout_ms),
                 depth_source=depth_source,
+                stereo_rectification_mode=str(args.stereo_rectification_mode),
+                emitter_enabled=args.emitter_enabled,
             )
             camera.start()
             camera.warmup(int(args.camera_warmup_frames))

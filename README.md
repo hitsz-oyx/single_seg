@@ -599,6 +599,8 @@ single-seg-realsense \
 - `--camera-serials`: 指定串号列表，逗号分隔；不传时默认按枚举顺序取前 `N` 台
 - `--camera-poses-json`: 多相机融合时提供每台 D435 的 `cam2world_4x4`
 - `--depth-source`: `fast` 使用 `IR1/IR2 + Fast-FoundationStereo`；`native` 使用 D435 原生 depth
+- `--stereo-rectification-mode`: Fast 路径的 IR 校正模式，`opencv` 为历史默认，`passthrough` 直接使用 RealSense 输出的 IR1/IR2
+- `--emitter-enabled`: 设置 RealSense IR 投影器，`0` 关闭、`1` 开启；不传则保持相机当前设置
 - `--fast-model-path`: 覆盖 `Fast-FoundationStereo` 权重路径
 - `--fast-valid-iters`: Fast refine 迭代次数；越小越快
 - `--fast-max-disp`: Fast 最大视差；当前低带宽 D435 数据默认 `192`

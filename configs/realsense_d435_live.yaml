@@ -148,6 +148,15 @@ realsense:
   # 1: 保留所有原始像素 (可能有黑边)
   stereo_alpha: 0.0
 
+  # Fast 深度使用的 IR 校正模式
+  # opencv: 用左右 IR 内外参重新 stereoRectify（历史默认）
+  # passthrough: 直接使用 RealSense 输出的 IR1/IR2，适合验证 D400 已 rectified 的情况
+  stereo_rectification_mode: opencv
+
+  # IR 投影器开关；null 表示不改相机当前设置
+  # 对 Fast-FoundationStereo 建议分别测试 0/1，散斑可能有帮助也可能带来域差
+  emitter_enabled: null
+
   # ---------------------------------------------------------------------------
   # 深度源选择
   # ---------------------------------------------------------------------------

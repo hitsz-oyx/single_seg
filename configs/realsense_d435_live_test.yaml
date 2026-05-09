@@ -8,19 +8,19 @@
 segmenter:
   # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
   # 例如: plate, bowl, cup 等
-  target_name: bowl
+  target_name: redcup
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/bowl/task_info.json
+  prompt_task_info: assets/prompts/redcup/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/bowl/
+  prompt_image_root: assets/prompts/redcup/
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live_three_cam_fast_nofilter
+  output_dir: tests/outputs/realsense_live_redcup_three_cam_native
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -60,7 +60,7 @@ segmenter:
 
   # 帧内点云体素大小 (米)，用于降采样
   # 值越小点云越精细，但点数更多
-  frame_voxel_size: 0.003
+  frame_voxel_size: 0.001
 
   # 是否启用目标点 3D 聚类去散点
   # true: 在最终 3D 分割结果里过滤由深度估计噪声造成的零散目标点
@@ -86,11 +86,6 @@ segmenter:
   # 是否保存点云文件 (PLY 格式)
   save_ply: false
 
-  # 保存 PLY 时是否写入估计法线
-  # true: 在 PLY 中增加 nx/ny/nz，法线会翻转到朝向最近相机
-  # false: 保持原始 PLY 字段
-  save_normal: false
-
   # 是否保存 2D 调试图 (分割 overlay)
   save_debug_2d: false
 
@@ -104,7 +99,7 @@ segmenter:
 # =============================================================================
 realsense:
   # 相机数量
-  camera_count: 1
+  camera_count: 3
 
   # 相机序列号列表 (逗号分隔)
   # 为 null 时自动选择前 N 台相机
@@ -146,7 +141,14 @@ realsense:
   # 0: 裁剪到最大有效区域
   # 1: 保留所有原始像素 (可能有黑边)
   stereo_alpha: 0.0
+  # Fast 深度使用的 IR 校正模式
+  # opencv: 用左右 IR 内外参重新 stereoRectify（历史默认）
+  # passthrough: 直接使用 RealSense 输出的 IR1/IR2，适合验证 D400 已 rectified 的情况
+  stereo_rectification_mode: opencv
 
+  # IR 投影器开关；null 表示不改相机当前设置
+  # 对 Fast-FoundationStereo 建议分别测试 0/1，散斑可能有帮助也可能带来域差
+  emitter_enabled: null
   # ---------------------------------------------------------------------------
   # 深度源选择
   # ---------------------------------------------------------------------------
@@ -154,7 +156,7 @@ realsense:
   # 深度来源:
   # - fast: 使用 IR1/IR2 + Fast-FoundationStereo 估计深度 (真 RGBD)
   # - native: 使用相机原生深度，对齐到 RGB
-  depth_source: fast
+  depth_source: native
 
   # 低带宽模式开关
   # true: 强制使用低分辨率 (color: 640x480, stereo: 480x270, fps: 6)
@@ -184,13 +186,13 @@ fast_stereo:
   # - 4: 速度优先
   # - 6: 当前 D435 低带宽数据上的平衡档
   # - 8/12: 质量优先
-  valid_iters: 4
+  valid_iters: 12
 
   # 最大视差范围 (像素)
   # 物体越近需要越大的视差范围
   # 当前 480x270 rectified IR 下，depth_min=0.1m 时 192 已覆盖近距离视差
   # 只有需要小于约 0.1m 的深度时再考虑 256+
-  max_disp: 128
+  max_disp: 192
 
   # cost volume 构建后端
   # pytorch1: 当前数据上稳定且和 triton 速度接近
@@ -200,7 +202,7 @@ fast_stereo:
   # 输入图像缩放比例
   # 1.0: 原始分辨率
   # <1.0: 缩小图像以加速
-  scale: 0.75
+  scale: 1.0
 
   # 是否移除不可见点 (遮挡区域)
   remove_invisible: true
