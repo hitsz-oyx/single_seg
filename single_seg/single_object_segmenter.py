@@ -128,6 +128,7 @@ class SingleSegConfig:
     target_cluster_min_points: int = 30  # 形成有效目标簇所需的最少点数
     target_cluster_keep_largest: bool = True  # 是否只保留最大目标簇
     save_ply: bool = True  # 是否保存 .ply 点云文件
+    save_normal: bool = False  # 是否在保存的 PLY 中写入估计法线
     save_debug_2d: bool = False  # 是否保存 2D 调试图
     tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE  # 追踪器输入图像尺寸
 
@@ -1614,6 +1615,41 @@ def write_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
         handle.write(verts.tobytes())
 
 
+def write_ply_with_normals(path: Path, points: np.ndarray, colors: np.ndarray, normals: np.ndarray) -> None:
+    """将带法线和颜色的点云数据写入 .ply 文件。"""
+    if points.shape[0] != colors.shape[0] or points.shape[0] != normals.shape[0]:
+        raise ValueError("points, colors, and normals must have the same length")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {points.shape[0]}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property float nx\nproperty float ny\nproperty float nz\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+    verts = np.empty(
+        points.shape[0],
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("nx", "<f4"),
+            ("ny", "<f4"),
+            ("nz", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ],
+    )
+    verts["x"], verts["y"], verts["z"] = points[:, 0], points[:, 1], points[:, 2]
+    verts["nx"], verts["ny"], verts["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
+    verts["red"], verts["green"], verts["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(verts.tobytes())
+
+
 def write_label_ply(path: Path, points: np.ndarray, labels: np.ndarray) -> None:
     """将带标签的点云数据写入 .ply 文件。"""
     if points.shape[0] != labels.shape[0]:
@@ -1632,6 +1668,100 @@ def write_label_ply(path: Path, points: np.ndarray, labels: np.ndarray) -> None:
     with path.open("wb") as handle:
         handle.write(header)
         handle.write(verts.tobytes())
+
+
+def write_label_ply_with_normals(path: Path, points: np.ndarray, labels: np.ndarray, normals: np.ndarray) -> None:
+    """将带法线和标签的点云数据写入 .ply 文件。"""
+    if points.shape[0] != labels.shape[0] or points.shape[0] != normals.shape[0]:
+        raise ValueError("points, labels, and normals must have the same length")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {points.shape[0]}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property float nx\nproperty float ny\nproperty float nz\n"
+        "property int label\n"
+        "end_header\n"
+    ).encode("ascii")
+    verts = np.empty(
+        points.shape[0],
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("nx", "<f4"),
+            ("ny", "<f4"),
+            ("nz", "<f4"),
+            ("label", "<i4"),
+        ],
+    )
+    verts["x"], verts["y"], verts["z"] = points[:, 0], points[:, 1], points[:, 2]
+    verts["nx"], verts["ny"], verts["nz"] = normals[:, 0], normals[:, 1], normals[:, 2]
+    verts["label"] = labels.astype(np.int32, copy=False)
+    with path.open("wb") as handle:
+        handle.write(header)
+        handle.write(verts.tobytes())
+
+
+def estimate_normals_towards_cameras(
+    points: np.ndarray,
+    *,
+    camera_centers: list[np.ndarray],
+    voxel_size: float,
+    normals_radius: float | None = None,
+    normals_max_nn: int = 30,
+) -> np.ndarray:
+    """估计点云法线，并将每个法线翻转到朝向最近相机。"""
+    points = np.asarray(points, dtype=np.float32)
+    if points.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    import open3d as o3d  # noqa: PLC0415
+
+    radius = float(normals_radius) if normals_radius is not None else 0.0
+    if radius <= 0.0:
+        radius = max(float(voxel_size) * 4.0, 0.02)
+    max_nn = max(int(normals_max_nn), 8)
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64, copy=False))
+    cloud.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius,
+            max_nn=max_nn,
+        )
+    )
+    normals = np.asarray(cloud.normals, dtype=np.float32)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.divide(
+        normals,
+        np.maximum(norms, 1e-8),
+        out=np.zeros_like(normals),
+        where=norms > 0.0,
+    )
+    centers = (
+        np.asarray(camera_centers, dtype=np.float32).reshape(-1, 3)
+        if camera_centers
+        else np.empty((0, 3), dtype=np.float32)
+    )
+    if centers.shape[0] > 0:
+        deltas = centers[None, :, :] - points[:, None, :]
+        nearest = np.argmin(np.einsum("nck,nck->nc", deltas, deltas), axis=1)
+        to_camera = deltas[np.arange(points.shape[0]), nearest]
+        flip = np.einsum("ij,ij->i", normals, to_camera) < 0.0
+        normals[flip] *= -1.0
+    return normals.astype(np.float32, copy=False)
+
+
+def camera_centers_from_inputs(camera_inputs: dict[str, dict[str, object]]) -> list[np.ndarray]:
+    """从当前帧相机输入中提取 world 坐标下的相机中心。"""
+    centers: list[np.ndarray] = []
+    for payload in camera_inputs.values():
+        pose_record = payload.get("pose_record")
+        if not isinstance(pose_record, dict) or pose_record.get("cam2world_4x4") is None:
+            continue
+        cam2world = np.asarray(pose_record["cam2world_4x4"], dtype=np.float64)
+        if cam2world.shape == (4, 4):
+            centers.append(cam2world[:3, 3].astype(np.float32, copy=False))
+    return centers
 
 
 def save_binary_mask_debug(
@@ -1706,6 +1836,7 @@ class SingleObjectPointCloudSegmenter:
         target_cluster_min_points: int = 30,
         target_cluster_keep_largest: bool = True,
         save_ply: bool = True,
+        save_normal: bool = False,
         save_debug_2d: bool = False,
         tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE,
     ) -> None:
@@ -1728,6 +1859,7 @@ class SingleObjectPointCloudSegmenter:
         self.target_cluster_min_points = int(target_cluster_min_points)
         self.target_cluster_keep_largest = bool(target_cluster_keep_largest)
         self.save_ply = bool(save_ply)
+        self.save_normal = bool(save_normal)
         self.save_debug_2d = bool(save_debug_2d)
         self.tracker_image_size = None if tracker_image_size is None else int(tracker_image_size)
         self.prompt_max_masks = DEFAULT_PROMPT_MAX_MASKS
@@ -1976,6 +2108,7 @@ class SingleObjectPointCloudSegmenter:
         target_cluster_filter_time = 0.0
         cpu_transfer_time = 0.0
         colorize_time = 0.0
+        normal_time = 0.0
         masks_by_camera: dict[str, torch.Tensor] = {}
         scores_by_camera: dict[str, float | None] = {}
         try:
@@ -2188,14 +2321,44 @@ class SingleObjectPointCloudSegmenter:
         if self.save_ply:
             assert points_xyz is not None and raw_colors is not None and labels is not None and vis_colors is not None
             frame_stem = frame_name.replace(".png", "")
-            write_ply(self.frame_output_dir / f"{frame_stem}_scene_rgb.ply", points_xyz, raw_colors)
-            write_ply(self.frame_output_dir / f"{frame_stem}_instance_rgb.ply", points_xyz, vis_colors)
-            write_label_ply(self.frame_output_dir / f"{frame_stem}_instance_label.ply", points_xyz, labels)
+            normals: np.ndarray | None = None
+            if self.save_normal:
+                normal_t0 = time.perf_counter()
+                normals = estimate_normals_towards_cameras(
+                    points_xyz,
+                    camera_centers=camera_centers_from_inputs(camera_inputs),
+                    voxel_size=self.frame_voxel_size,
+                )
+                normal_time += time.perf_counter() - normal_t0
+            if normals is not None:
+                write_ply_with_normals(
+                    self.frame_output_dir / f"{frame_stem}_scene_rgb.ply",
+                    points_xyz,
+                    raw_colors,
+                    normals,
+                )
+                write_ply_with_normals(
+                    self.frame_output_dir / f"{frame_stem}_instance_rgb.ply",
+                    points_xyz,
+                    vis_colors,
+                    normals,
+                )
+                write_label_ply_with_normals(
+                    self.frame_output_dir / f"{frame_stem}_instance_label.ply",
+                    points_xyz,
+                    labels,
+                    normals,
+                )
+            else:
+                write_ply(self.frame_output_dir / f"{frame_stem}_scene_rgb.ply", points_xyz, raw_colors)
+                write_ply(self.frame_output_dir / f"{frame_stem}_instance_rgb.ply", points_xyz, vis_colors)
+                write_label_ply(self.frame_output_dir / f"{frame_stem}_instance_label.ply", points_xyz, labels)
             meta = {
                 "frame_name": frame_name,
                 "target_name": self.target_name,
                 "num_points": int(points_xyz.shape[0]),
                 "num_labeled_points": int(np.count_nonzero(labels)),
+                "has_normals": bool(normals is not None),
                 "target_cluster_filter": target_cluster_summary,
                 "camera_summaries": camera_summaries,
                 "seed_info_by_camera": self.seed_info_by_camera,
@@ -2232,6 +2395,7 @@ class SingleObjectPointCloudSegmenter:
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
                     "cpu_transfer_time_sec": cpu_transfer_time,
                     "colorize_time_sec": colorize_time,
+                    "normal_time_sec": normal_time,
                 },
             }
         )
@@ -2256,6 +2420,7 @@ class SingleObjectPointCloudSegmenter:
                 "num_labeled_points": int(torch.count_nonzero(labels_t).item()),
                 "camera_summaries": camera_summaries,
                 "target_cluster_filter": target_cluster_summary,
+                "has_normals": bool(self.save_ply and self.save_normal),
                 "output_format": "torch",
             },
         }
@@ -2283,6 +2448,7 @@ class SingleObjectPointCloudSegmenter:
             "target_cluster_radius_m": float(self.target_cluster_radius_m),
             "target_cluster_min_points": int(self.target_cluster_min_points),
             "target_cluster_keep_largest": bool(self.target_cluster_keep_largest),
+            "save_normal": bool(self.save_normal),
             "image_processor_load_time_sec": self.image_processor_load_time_sec,
             "video_predictor_load_time_sec": self.video_predictor_load_time_sec,
             "active_camera_ids": list(self.active_camera_ids),
@@ -2338,6 +2504,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-mask-prob-threshold", type=float, default=0.95, help="视频掩码概率阈值")
     parser.add_argument("--tracker-image-size", type=int, default=DEFAULT_TRACKER_IMAGE_SIZE, help="追踪器图像尺寸")
     parser.add_argument("--save-ply", action="store_true", default=False, help="是否保存 PLY 点云文件")
+    parser.add_argument(
+        "--save-normal",
+        "--save-normals",
+        dest="save_normal",
+        action="store_true",
+        default=False,
+        help="保存 PLY 时是否写入估计法线",
+    )
     parser.add_argument("--save-debug-2d", action="store_true", default=False, help="是否保存 2D 调试图")
     parser.add_argument("--overwrite-output", action="store_true", help="是否覆盖已有的输出目录")
     return parser.parse_args()
@@ -2372,6 +2546,7 @@ def run_demo(args: argparse.Namespace) -> None:
         target_cluster_min_points=int(args.target_cluster_min_points),
         target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
         save_ply=bool(args.save_ply),
+        save_normal=bool(args.save_normal),
         save_debug_2d=bool(args.save_debug_2d),
         tracker_image_size=args.tracker_image_size,
     ) as segmenter:

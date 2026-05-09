@@ -980,6 +980,16 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR / "realsense_live")
     parser.add_argument("--overwrite-output", action="store_true")
     parser.add_argument("--save-ply", action="store_true", default=False)
+    parser.add_argument(
+        "--save-normal",
+        "--save-normals",
+        dest="save_normal",
+        type=int,
+        nargs="?",
+        const=1,
+        default=0,
+        help="保存 PLY 时是否写入估计法线，1 开启 / 0 关闭",
+    )
     parser.add_argument("--save-debug-2d", action="store_true", default=False)
     parser.add_argument("--max-frames", type=int, default=1)
     parser.add_argument("--stride", type=int, default=2)
@@ -1188,6 +1198,7 @@ def run_live(args: argparse.Namespace) -> None:
             target_cluster_min_points=int(args.target_cluster_min_points),
             target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
             save_ply=bool(args.save_ply),
+            save_normal=bool(args.save_normal),
             save_debug_2d=bool(args.save_debug_2d),
             tracker_image_size=int(args.tracker_image_size),
         ) as segmenter:

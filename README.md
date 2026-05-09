@@ -157,6 +157,7 @@ tests/outputs/demo_spatial_single_object
 - `--checkpoint-path`: SAM3 权重
 - `--tracker-image-size 896`: 当前默认输入尺寸
 - `--save-ply`: 保存完整场景带标签点云
+- `--save-normal`: 保存 PLY 时写入估计法线，法线会翻转到朝向最近相机
 - `--save-debug-2d`: 保存逐帧 2D overlay
 - `--target-cluster-filter-enabled 1`: 对最终 3D 目标点做聚类去散点
 - `--target-cluster-radius-m 0.013`: 3D 聚类邻域半径，单位米

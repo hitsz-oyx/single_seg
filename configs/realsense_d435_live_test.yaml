@@ -86,6 +86,11 @@ segmenter:
   # 是否保存点云文件 (PLY 格式)
   save_ply: false
 
+  # 保存 PLY 时是否写入估计法线
+  # true: 在 PLY 中增加 nx/ny/nz，法线会翻转到朝向最近相机
+  # false: 保持原始 PLY 字段
+  save_normal: false
+
   # 是否保存 2D 调试图 (分割 overlay)
   save_debug_2d: false
 
