@@ -530,6 +530,11 @@ tests/outputs/realsense_live
 tests/outputs/realsense_live/live_rgbd_debug/
 ```
 
+输出目录根部还会保存：
+
+- `effective_config.yaml`：命令行覆盖 YAML 后的最终生效配置，可直接用于复跑
+- `live_debug_config.yaml`：原始配置、最终配置、命令行参数、相机序列号和启动相机信息的调试快照
+
 单相机调试图包括：
 
 - `rgb.png`

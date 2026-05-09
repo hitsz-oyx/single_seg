@@ -454,6 +454,74 @@ def load_source_config_for_snapshot(config_path: Path | None) -> dict[str, objec
     return snapshot
 
 
+def resolved_path_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    return str(Path(value).expanduser().resolve())
+
+
+def build_effective_live_config(args: argparse.Namespace, *, serials: list[str]) -> dict[str, object]:
+    """Build a runnable YAML config from the final argparse namespace after CLI overrides."""
+    segmenter = {
+        "target_name": str(args.target_name),
+        "prompt_task_info": resolved_path_text(args.prompt_task_info),
+        "prompt_image_root": resolved_path_text(args.prompt_image_root),
+        "checkpoint_path": resolved_path_text(args.checkpoint_path),
+        "output_dir": resolved_path_text(args.output_dir),
+        "overwrite_output": bool(args.overwrite_output),
+        "confidence": float(args.confidence),
+        "mask_threshold": float(args.mask_threshold),
+        "prompt_keep_score_threshold": float(args.prompt_keep_score_threshold),
+        "video_mask_prob_threshold": float(args.video_mask_prob_threshold),
+        "depth_scale": 1.0,
+        "depth_min": float(args.depth_min),
+        "depth_max": float(args.depth_max),
+        "stride": int(args.stride),
+        "frame_voxel_size": float(args.frame_voxel_size),
+        "target_cluster_filter_enabled": bool(args.target_cluster_filter_enabled),
+        "target_cluster_radius_m": float(args.target_cluster_radius_m),
+        "target_cluster_min_points": int(args.target_cluster_min_points),
+        "target_cluster_keep_largest": bool(args.target_cluster_keep_largest),
+        "save_ply": bool(args.save_ply),
+        "save_normal": bool(args.save_normal),
+        "save_debug_2d": bool(args.save_debug_2d),
+        "tracker_image_size": None if args.tracker_image_size is None else int(args.tracker_image_size),
+    }
+    realsense = {
+        "camera_count": int(len(serials) if serials else args.camera_count),
+        "camera_serials": ",".join(str(serial) for serial in serials) if serials else normalize_serials_value(args.camera_serials),
+        "camera_poses_json": resolved_path_text(args.camera_poses_json),
+        "max_frames": int(args.max_frames),
+        "camera_warmup_frames": int(args.camera_warmup_frames),
+        "wait_timeout_ms": int(args.wait_timeout_ms),
+        "fps": int(args.fps),
+        "color_width": int(args.color_width),
+        "color_height": int(args.color_height),
+        "stereo_width": int(args.stereo_width),
+        "stereo_height": int(args.stereo_height),
+        "stereo_alpha": float(args.stereo_alpha),
+        "stereo_rectification_mode": normalize_stereo_rectification_mode(args.stereo_rectification_mode),
+        "emitter_enabled": None if args.emitter_enabled is None else int(args.emitter_enabled),
+        "depth_source": normalize_depth_source(args.depth_source),
+        "low_bandwidth_mode": bool(args.low_bandwidth_mode),
+        "save_live_debug": bool(args.save_live_debug),
+    }
+    fast_stereo = {
+        "model_path": resolved_path_text(args.fast_model_path),
+        "valid_iters": int(args.fast_valid_iters),
+        "max_disp": int(args.fast_max_disp),
+        "scale": float(args.fast_scale),
+        "remove_invisible": bool(args.fast_remove_invisible),
+        "hiera": bool(args.fast_hiera),
+        "optimize_build_volume": str(args.fast_optimize_build_volume),
+    }
+    return {
+        "segmenter": segmenter,
+        "realsense": realsense,
+        "fast_stereo": fast_stereo,
+    }
+
+
 def write_live_debug_config_snapshot(
     *,
     output_dir: Path,
@@ -484,8 +552,11 @@ def write_live_debug_config_snapshot(
         }
         for camera in cameras
     ]
+    effective_config = build_effective_live_config(args, serials=serials)
     snapshot = {
         "source_config": load_source_config_for_snapshot(args.config),
+        "effective_config": effective_config,
+        "effective_config_file": "effective_config.yaml",
         "effective_args": to_jsonable(vars(args)),
         "resolved_camera_serials": [str(serial) for serial in serials],
         "depth_source": str(depth_source),
@@ -493,6 +564,10 @@ def write_live_debug_config_snapshot(
         "command_argv": list(sys.argv),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "effective_config.yaml").write_text(
+        yaml.safe_dump(to_jsonable(effective_config), allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     (output_dir / "live_debug_config.yaml").write_text(
         yaml.safe_dump(snapshot, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
@@ -1322,6 +1397,9 @@ def run_live(args: argparse.Namespace) -> None:
                 result = segmenter.process_frame(
                     frame_name=frame_name,
                     camera_inputs=camera_inputs,
+                    live_debug_root=(
+                        segmenter.output_dir / "live_rgbd_debug" if bool(args.save_live_debug) else None
+                    ),
                 )
                 logging.info(
                     f"[frame {result['frame_index']:03d}] {frame_name} "

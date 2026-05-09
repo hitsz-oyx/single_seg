@@ -43,11 +43,14 @@ from single_seg.single_object_segmenter import (
     select_best_seed_mask,
     semantic_name_from_asset,
     split_prompt_entries,
+    write_live_debug_target_object_cloud,
 )
 from single_seg.realsense_rgbd_segmenter import (
     align_rectified_depth_to_color,
     align_rectified_depth_to_color_torch,
+    build_arg_parser,
     build_camera_inputs_from_live_frames,
+    build_effective_live_config,
     load_live_arg_defaults,
     project_points_to_depth_image,
 )
@@ -122,6 +125,120 @@ def test_realsense_live_config_normalizes_serial_lists(tmp_path: Path) -> None:
     assert defaults["camera_count"] == 2
     assert defaults["camera_serials"] == "123,456"
     assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses.json"
+
+
+def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
+    config_path = REPO_ROOT / "configs" / "realsense_d435_live.yaml"
+    output_dir = tmp_path / "live_out"
+    parser = build_arg_parser(load_live_arg_defaults(config_path))
+    args = parser.parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--target-name",
+            "bowl",
+            "--camera-count",
+            "3",
+            "--camera-serials",
+            "111,222,333",
+            "--output-dir",
+            str(output_dir),
+            "--fast-scale",
+            "1.0",
+            "--stereo-rectification-mode",
+            "passthrough",
+            "--emitter-enabled",
+            "0",
+            "--save-ply",
+            "--save-normal",
+            "1",
+        ]
+    )
+    effective = build_effective_live_config(args, serials=["111", "222", "333"])
+
+    assert effective["segmenter"]["target_name"] == "bowl"
+    assert effective["segmenter"]["output_dir"] == str(output_dir.resolve())
+    assert effective["segmenter"]["save_ply"] is True
+    assert effective["segmenter"]["save_normal"] is True
+    assert effective["realsense"]["camera_count"] == 3
+    assert effective["realsense"]["camera_serials"] == "111,222,333"
+    assert effective["realsense"]["stereo_rectification_mode"] == "passthrough"
+    assert effective["realsense"]["emitter_enabled"] == 0
+    assert effective["fast_stereo"]["scale"] == 1.0
+
+
+def read_ply_header(path: Path) -> str:
+    with path.open("rb") as handle:
+        chunks: list[bytes] = []
+        while True:
+            line = handle.readline()
+            if not line:
+                break
+            chunks.append(line)
+            if line == b"end_header\n":
+                break
+    return b"".join(chunks).decode("ascii")
+
+
+def test_live_debug_target_object_cloud_writes_object_only_ply(tmp_path: Path) -> None:
+    summary = write_live_debug_target_object_cloud(
+        live_debug_root=tmp_path / "live_rgbd_debug",
+        frame_name="frame_00000.png",
+        camera_id="cam_00",
+        target_name="bowl",
+        points=np.asarray([[0.0, 0.0, 0.5], [0.1, 0.0, 0.5]], dtype=np.float32),
+        colors=np.asarray([[10, 20, 30], [40, 50, 60]], dtype=np.uint8),
+        save_normal=False,
+        camera_center=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        voxel_size=0.003,
+        score=0.75,
+        target_pixels=8,
+    )
+
+    ply_path = tmp_path / "live_rgbd_debug" / "frame_00000" / "cam_00" / "target_object_rgb.ply"
+    meta_path = tmp_path / "live_rgbd_debug" / "frame_00000" / "cam_00" / "target_object_pointcloud.json"
+    header = read_ply_header(ply_path)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    assert summary["num_points"] == 2
+    assert summary["has_normals"] is False
+    assert meta["target_name"] == "bowl"
+    assert meta["target_pixels"] == 8
+    assert "element vertex 2" in header
+    assert "property float nx" not in header
+
+
+def test_live_debug_target_object_cloud_respects_save_normal(tmp_path: Path) -> None:
+    write_live_debug_target_object_cloud(
+        live_debug_root=tmp_path / "live_rgbd_debug",
+        frame_name="frame_00001.png",
+        camera_id="cam_01",
+        target_name="bowl",
+        points=np.asarray(
+            [
+                [0.0, 0.0, 0.5],
+                [0.1, 0.0, 0.5],
+                [0.0, 0.1, 0.5],
+                [0.1, 0.1, 0.5],
+            ],
+            dtype=np.float32,
+        ),
+        colors=np.full((4, 3), 128, dtype=np.uint8),
+        save_normal=True,
+        camera_center=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+        voxel_size=0.003,
+    )
+
+    ply_path = tmp_path / "live_rgbd_debug" / "frame_00001" / "cam_01" / "target_object_rgb.ply"
+    meta_path = tmp_path / "live_rgbd_debug" / "frame_00001" / "cam_01" / "target_object_pointcloud.json"
+    header = read_ply_header(ply_path)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    assert meta["num_points"] == 4
+    assert meta["has_normals"] is True
+    assert "property float nx" in header
+    assert "property float ny" in header
+    assert "property float nz" in header
 
 
 def test_furniture_base_apriltag_layout_matches_expected_offsets() -> None:

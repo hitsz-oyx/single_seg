@@ -1764,6 +1764,66 @@ def camera_centers_from_inputs(camera_inputs: dict[str, dict[str, object]]) -> l
     return centers
 
 
+def camera_center_from_pose_record(pose_record: dict[str, object]) -> np.ndarray | None:
+    """从单个相机位姿记录中提取 world 坐标下的相机中心。"""
+    cam2world_payload = pose_record.get("cam2world_4x4")
+    if cam2world_payload is None:
+        return None
+    cam2world = np.asarray(cam2world_payload, dtype=np.float64)
+    if cam2world.shape != (4, 4):
+        return None
+    return cam2world[:3, 3].astype(np.float32, copy=False)
+
+
+def write_live_debug_target_object_cloud(
+    *,
+    live_debug_root: Path,
+    frame_name: str,
+    camera_id: str,
+    target_name: str,
+    points: np.ndarray,
+    colors: np.ndarray,
+    save_normal: bool,
+    camera_center: np.ndarray | None,
+    voxel_size: float,
+    score: float | None = None,
+    target_pixels: int | None = None,
+) -> dict[str, object]:
+    """保存 live debug 单相机目标物体点云，不包含背景点。"""
+    frame_stem = frame_name.replace(".png", "")
+    camera_dir = live_debug_root / frame_stem / camera_id
+    camera_dir.mkdir(parents=True, exist_ok=True)
+    points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    ply_name = "target_object_rgb.ply"
+    normals: np.ndarray | None = None
+    if save_normal:
+        camera_centers = [] if camera_center is None else [np.asarray(camera_center, dtype=np.float32)]
+        normals = estimate_normals_towards_cameras(
+            points,
+            camera_centers=camera_centers,
+            voxel_size=float(voxel_size),
+        )
+        write_ply_with_normals(camera_dir / ply_name, points, colors, normals)
+    else:
+        write_ply(camera_dir / ply_name, points, colors)
+    summary = {
+        "frame_name": frame_name,
+        "camera_id": camera_id,
+        "target_name": target_name,
+        "ply_file": ply_name,
+        "num_points": int(points.shape[0]),
+        "has_normals": bool(normals is not None),
+        "score": None if score is None else float(score),
+        "target_pixels": None if target_pixels is None else int(target_pixels),
+    }
+    (camera_dir / "target_object_pointcloud.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
 def save_binary_mask_debug(
     output_dir: Path,
     frame_name: str,
@@ -2084,6 +2144,7 @@ class SingleObjectPointCloudSegmenter:
         *,
         frame_name: str,
         camera_inputs: dict[str, dict[str, object]],
+        live_debug_root: Path | None = None,
     ) -> dict[str, object]:
         """处理一帧多相机 RGBD 输入，并返回标记的点云。"""
         if self.closed:
@@ -2106,6 +2167,7 @@ class SingleObjectPointCloudSegmenter:
         camera_prepare_time = 0.0
         camera_bookkeeping_time = 0.0
         target_cluster_filter_time = 0.0
+        live_debug_object_ply_time = 0.0
         cpu_transfer_time = 0.0
         colorize_time = 0.0
         normal_time = 0.0
@@ -2238,19 +2300,42 @@ class SingleObjectPointCloudSegmenter:
             camera_backproject_time = time.perf_counter() - camera_backproject_t0
             backproject_time += camera_backproject_time
             camera_bookkeeping_t0 = time.perf_counter()
+            target_pixels = int(torch.count_nonzero(mask_t).item())
+            target_points_count = int(torch.count_nonzero(point_labels).item())
+            target_object_summary: dict[str, object] | None = None
+            if live_debug_root is not None:
+                live_debug_object_t0 = time.perf_counter()
+                target_point_mask = point_labels > 0
+                target_points = points[target_point_mask].detach().cpu().numpy().astype(np.float32, copy=False)
+                target_colors = colors[target_point_mask].detach().cpu().numpy().astype(np.uint8, copy=False)
+                target_object_summary = write_live_debug_target_object_cloud(
+                    live_debug_root=Path(live_debug_root),
+                    frame_name=frame_name,
+                    camera_id=camera_id,
+                    target_name=self.target_name,
+                    points=target_points,
+                    colors=target_colors,
+                    save_normal=self.save_normal,
+                    camera_center=camera_center_from_pose_record(pose_record),
+                    voxel_size=self.frame_voxel_size,
+                    score=score,
+                    target_pixels=target_pixels,
+                )
+                live_debug_object_ply_time += time.perf_counter() - live_debug_object_t0
             if int(points.shape[0]) > 0:
                 point_chunks.append(points)
                 color_chunks.append(colors)
                 label_chunks.append(point_labels)
-            camera_summaries.append(
-                {
-                    "camera_id": camera_id,
-                    "target_pixels": int(torch.count_nonzero(mask_t).item()),
-                    "num_points_backprojected": int(points.shape[0]),
-                    "num_target_points_backprojected": int(torch.count_nonzero(point_labels).item()),
-                    "backproject_time_sec": camera_backproject_time,
-                }
-            )
+            camera_summary = {
+                "camera_id": camera_id,
+                "target_pixels": target_pixels,
+                "num_points_backprojected": int(points.shape[0]),
+                "num_target_points_backprojected": target_points_count,
+                "backproject_time_sec": camera_backproject_time,
+            }
+            if target_object_summary is not None:
+                camera_summary["target_object_pointcloud"] = target_object_summary
+            camera_summaries.append(camera_summary)
             camera_bookkeeping_time += time.perf_counter() - camera_bookkeeping_t0
 
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
@@ -2393,6 +2478,7 @@ class SingleObjectPointCloudSegmenter:
                     "camera_prepare_time_sec": camera_prepare_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
+                    "live_debug_object_ply_time_sec": live_debug_object_ply_time,
                     "cpu_transfer_time_sec": cpu_transfer_time,
                     "colorize_time_sec": colorize_time,
                     "normal_time_sec": normal_time,
