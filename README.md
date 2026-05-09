@@ -463,9 +463,11 @@ target_cluster_filter_enabled: true
 target_cluster_radius_m: 0.013
 target_cluster_min_points: 45
 target_cluster_keep_largest: true
+target_3d_mask_erode_kernel: 0
 ```
 
 `target_cluster_radius_m` 控制点之间多远算相邻；`target_cluster_min_points` 控制小到什么程度会被当成散点；单物体任务建议保持 `target_cluster_keep_largest: true`。
+`target_3d_mask_erode_kernel` 只影响 3D 取点，不改变 2D mask 调试图；设为 `3` 或 `5` 可以先缩掉目标 mask 边界，减少深度断层和背景混入。
 
 也就是说，这里输出的是“真 RGBD”，不是把 IR 灰度图简单伪装成 RGB。
 
@@ -583,9 +585,12 @@ fast_stereo:
   max_disp: 128
   scale: 0.75
   optimize_build_volume: pytorch1
+  depth_edge_filter_enabled: false
+  depth_edge_filter_threshold_m: 0.5
 ```
 
 在当前 `1280x720` rectified IR live dump 上，这组配置的 Fast 推理约在 `70 ms` 附近。`pytorch1` 是当前默认后端；`triton` 也可用，但首次运行会有编译/自调优开销，live 前几帧或离线 profile 首帧会明显慢一些；看稳定速度时应跳过首帧。
+`depth_edge_filter_enabled` 打开后会对对齐到 RGB 后的 Fast 深度做 Sobel 深度突变过滤，去掉边缘飞点；阈值越小过滤越强，过小会吃掉真实物体边缘。
 
 如果只追求速度，可以临时覆盖：
 
@@ -610,6 +615,9 @@ single-seg-realsense \
 - `--fast-valid-iters`: Fast refine 迭代次数；越小越快
 - `--fast-max-disp`: Fast 最大视差；当前低带宽 D435 数据默认 `192`
 - `--fast-optimize-build-volume`: Fast cost-volume 后端，支持 `pytorch1` 或 `triton`
+- `--fast-depth-edge-filter-enabled`: 是否启用 Fast 深度边缘过滤
+- `--fast-depth-edge-filter-threshold-m`: 深度边缘过滤阈值，默认 `0.5`
+- `--target-3d-mask-erode-kernel`: 仅用于 3D 取点的目标 mask 腐蚀核大小，`0/1` 关闭
 - `--save-ply`: 保存融合后的点云输出
 
 当前代码内部的相机数量已经是动态的，不再假设固定 3 相机。  

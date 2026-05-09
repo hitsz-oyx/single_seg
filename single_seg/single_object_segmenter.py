@@ -127,6 +127,7 @@ class SingleSegConfig:
     target_cluster_radius_m: float = 0.03  # 目标点聚类邻域半径（米）
     target_cluster_min_points: int = 30  # 形成有效目标簇所需的最少点数
     target_cluster_keep_largest: bool = True  # 是否只保留最大目标簇
+    target_3d_mask_erode_kernel: int = 0  # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
     save_ply: bool = True  # 是否保存 .ply 点云文件
     save_normal: bool = False  # 是否在保存的 PLY 中写入估计法线
     save_debug_2d: bool = False  # 是否保存 2D 调试图
@@ -1206,6 +1207,33 @@ def backproject_scene_points_with_labels_torch(
         return pts_world, colors, labels
 
 
+def erode_binary_mask_torch(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Erode a 2D boolean mask with an ellipse-like kernel on the mask device."""
+    kernel = int(kernel_size)
+    if kernel <= 1:
+        return mask.to(dtype=torch.bool)
+    if kernel % 2 == 0:
+        kernel += 1
+    mask_bool = mask.to(dtype=torch.bool)
+    if mask_bool.ndim != 2:
+        raise ValueError(f"mask erosion expects a 2D mask, got shape={tuple(mask_bool.shape)}")
+    radius = kernel // 2
+    yy, xx = torch.meshgrid(
+        torch.arange(kernel, dtype=torch.float32, device=mask_bool.device),
+        torch.arange(kernel, dtype=torch.float32, device=mask_bool.device),
+        indexing="ij",
+    )
+    center = float(radius)
+    if radius <= 0:
+        return mask_bool
+    footprint = (((xx - center) / float(radius)) ** 2 + ((yy - center) / float(radius)) ** 2) <= 1.0
+    footprint_f = footprint.to(dtype=torch.float32)
+    weight = footprint_f.reshape(1, 1, kernel, kernel)
+    mask_f = mask_bool.to(dtype=torch.float32).reshape(1, 1, *mask_bool.shape)
+    counts = torch.nn.functional.conv2d(mask_f, weight, padding=radius).reshape_as(mask_bool)
+    return counts >= footprint_f.sum()
+
+
 def fuse_scene_geometry(
     point_chunks: list[np.ndarray],
     color_chunks: list[np.ndarray],
@@ -1895,6 +1923,7 @@ class SingleObjectPointCloudSegmenter:
         target_cluster_radius_m: float = 0.03,
         target_cluster_min_points: int = 30,
         target_cluster_keep_largest: bool = True,
+        target_3d_mask_erode_kernel: int = 0,
         save_ply: bool = True,
         save_normal: bool = False,
         save_debug_2d: bool = False,
@@ -1918,6 +1947,10 @@ class SingleObjectPointCloudSegmenter:
         self.target_cluster_radius_m = float(target_cluster_radius_m)
         self.target_cluster_min_points = int(target_cluster_min_points)
         self.target_cluster_keep_largest = bool(target_cluster_keep_largest)
+        target_erode_kernel = max(int(target_3d_mask_erode_kernel), 0)
+        if target_erode_kernel > 1 and target_erode_kernel % 2 == 0:
+            target_erode_kernel += 1
+        self.target_3d_mask_erode_kernel = target_erode_kernel
         self.save_ply = bool(save_ply)
         self.save_normal = bool(save_normal)
         self.save_debug_2d = bool(save_debug_2d)
@@ -2164,6 +2197,7 @@ class SingleObjectPointCloudSegmenter:
         fuse_time = 0.0
         compose_inputs_time = 0.0
         mask_postprocess_time = 0.0
+        target_mask_erode_time = 0.0
         camera_prepare_time = 0.0
         camera_bookkeeping_time = 0.0
         target_cluster_filter_time = 0.0
@@ -2278,6 +2312,26 @@ class SingleObjectPointCloudSegmenter:
                 fovy_deg=fovy_deg,
             )
             camera_prepare_time += time.perf_counter() - camera_prepare_t0
+            mask_3d_t = mask_t
+            target_pixels_before_3d = int(torch.count_nonzero(mask_t).item())
+            target_mask_erode_summary: dict[str, object] = {
+                "enabled": bool(self.target_3d_mask_erode_kernel > 1),
+                "kernel_size": int(self.target_3d_mask_erode_kernel),
+                "target_pixels_before": target_pixels_before_3d,
+                "target_pixels_after": target_pixels_before_3d,
+                "removed_target_pixels": 0,
+            }
+            if self.target_3d_mask_erode_kernel > 1:
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_mask_erode_t0 = time.perf_counter()
+                mask_3d_t = erode_binary_mask_torch(mask_t, self.target_3d_mask_erode_kernel)
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_mask_erode_time += time.perf_counter() - target_mask_erode_t0
+                after_pixels = int(torch.count_nonzero(mask_3d_t).item())
+                target_mask_erode_summary["target_pixels_after"] = after_pixels
+                target_mask_erode_summary["removed_target_pixels"] = int(
+                    max(target_pixels_before_3d - after_pixels, 0)
+                )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             camera_backproject_t0 = time.perf_counter()
             sampled_depth = (
@@ -2288,7 +2342,7 @@ class SingleObjectPointCloudSegmenter:
             points, colors, point_labels = backproject_scene_points_with_labels_torch(
                 sampled_rgb=np.ascontiguousarray(rgb[:: self.stride, :: self.stride]),
                 sampled_depth_m=sampled_depth,
-                sampled_mask=mask_t[:: self.stride, :: self.stride],
+                sampled_mask=mask_3d_t[:: self.stride, :: self.stride],
                 cam2world_gl=np.asarray(pose_record["cam2world_4x4"], dtype=np.float64),
                 x_scale=x_scale,
                 y_scale=y_scale,
@@ -2301,6 +2355,7 @@ class SingleObjectPointCloudSegmenter:
             backproject_time += camera_backproject_time
             camera_bookkeeping_t0 = time.perf_counter()
             target_pixels = int(torch.count_nonzero(mask_t).item())
+            target_pixels_for_3d = int(target_mask_erode_summary["target_pixels_after"])
             target_points_count = int(torch.count_nonzero(point_labels).item())
             target_object_summary: dict[str, object] | None = None
             if live_debug_root is not None:
@@ -2329,9 +2384,11 @@ class SingleObjectPointCloudSegmenter:
             camera_summary = {
                 "camera_id": camera_id,
                 "target_pixels": target_pixels,
+                "target_pixels_for_3d": target_pixels_for_3d,
                 "num_points_backprojected": int(points.shape[0]),
                 "num_target_points_backprojected": target_points_count,
                 "backproject_time_sec": camera_backproject_time,
+                "target_3d_mask_erode": target_mask_erode_summary,
             }
             if target_object_summary is not None:
                 camera_summary["target_object_pointcloud"] = target_object_summary
@@ -2475,6 +2532,7 @@ class SingleObjectPointCloudSegmenter:
                     "frame_resource_build_time_sec": frame_resource_build_time,
                     "compose_inputs_time_sec": compose_inputs_time,
                     "mask_postprocess_time_sec": mask_postprocess_time,
+                    "target_mask_erode_time_sec": target_mask_erode_time,
                     "camera_prepare_time_sec": camera_prepare_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
@@ -2534,6 +2592,7 @@ class SingleObjectPointCloudSegmenter:
             "target_cluster_radius_m": float(self.target_cluster_radius_m),
             "target_cluster_min_points": int(self.target_cluster_min_points),
             "target_cluster_keep_largest": bool(self.target_cluster_keep_largest),
+            "target_3d_mask_erode_kernel": int(self.target_3d_mask_erode_kernel),
             "save_normal": bool(self.save_normal),
             "image_processor_load_time_sec": self.image_processor_load_time_sec,
             "video_predictor_load_time_sec": self.video_predictor_load_time_sec,
@@ -2581,6 +2640,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cluster-radius-m", type=float, default=0.03, help="目标点 3D 聚类邻域半径（米）")
     parser.add_argument("--target-cluster-min-points", type=int, default=30, help="形成有效目标簇所需的最少点数")
     parser.add_argument("--target-cluster-keep-largest", type=int, default=1, help="是否只保留最大目标簇")
+    parser.add_argument("--target-3d-mask-erode-kernel", type=int, default=0, help="反投影前仅用于 3D 取点的目标 mask 腐蚀核大小，0/1 表示关闭")
     parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2, help="保留提示掩码的评分阈值")
     parser.add_argument("--depth-scale", type=float, default=1000.0, help="深度图缩放比例")
     parser.add_argument("--depth-min", type=float, default=0.1, help="最小有效深度")
@@ -2631,6 +2691,7 @@ def run_demo(args: argparse.Namespace) -> None:
         target_cluster_radius_m=float(args.target_cluster_radius_m),
         target_cluster_min_points=int(args.target_cluster_min_points),
         target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
+        target_3d_mask_erode_kernel=int(args.target_3d_mask_erode_kernel),
         save_ply=bool(args.save_ply),
         save_normal=bool(args.save_normal),
         save_debug_2d=bool(args.save_debug_2d),

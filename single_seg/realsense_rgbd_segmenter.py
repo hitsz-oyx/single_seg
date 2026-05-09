@@ -383,6 +383,43 @@ def align_rectified_depth_to_color_torch(
     )
 
 
+def filter_depth_edges_torch(depth_m: torch.Tensor, *, threshold_m: float) -> torch.Tensor:
+    """Remove depth pixels around strong local depth jumps with a Sobel filter."""
+    threshold = float(threshold_m)
+    depth = depth_m.to(dtype=torch.float32)
+    valid = torch.isfinite(depth) & (depth > 0)
+    depth_clean = torch.where(valid, depth, torch.zeros((), dtype=torch.float32, device=depth.device))
+    if threshold <= 0.0 or depth_clean.numel() == 0:
+        return depth_clean
+    if depth_clean.ndim != 2:
+        raise ValueError(f"depth edge filter expects a 2D depth map, got shape={tuple(depth_clean.shape)}")
+    kernel_x = depth_clean.new_tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+    ).reshape(1, 1, 3, 3)
+    kernel_y = depth_clean.new_tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+    ).reshape(1, 1, 3, 3)
+    depth_4d = depth_clean.reshape(1, 1, *depth_clean.shape)
+    depth_padded = torch.nn.functional.pad(depth_4d, (1, 1, 1, 1), mode="replicate")
+    grad_x = torch.nn.functional.conv2d(depth_padded, kernel_x).reshape_as(depth_clean).abs()
+    grad_y = torch.nn.functional.conv2d(depth_padded, kernel_y).reshape_as(depth_clean).abs()
+    edge = (grad_x > threshold) | (grad_y > threshold)
+    return torch.where(edge, torch.zeros((), dtype=torch.float32, device=depth.device), depth_clean)
+
+
+def filter_depth_edges_numpy(depth_m: np.ndarray, *, threshold_m: float) -> np.ndarray:
+    """NumPy/OpenCV equivalent of filter_depth_edges_torch for tests or CPU paths."""
+    threshold = float(threshold_m)
+    depth = np.asarray(depth_m, dtype=np.float32).copy()
+    depth[~np.isfinite(depth) | (depth <= 0)] = 0.0
+    if threshold <= 0.0 or depth.size == 0:
+        return depth
+    grad_x = np.abs(cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3))
+    grad_y = np.abs(cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3))
+    depth[(grad_x > threshold) | (grad_y > threshold)] = 0.0
+    return depth
+
+
 def to_jsonable(value: object) -> object:
     if torch.is_tensor(value):
         return value.detach().cpu().tolist()
@@ -482,6 +519,7 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "target_cluster_radius_m": float(args.target_cluster_radius_m),
         "target_cluster_min_points": int(args.target_cluster_min_points),
         "target_cluster_keep_largest": bool(args.target_cluster_keep_largest),
+        "target_3d_mask_erode_kernel": int(args.target_3d_mask_erode_kernel),
         "save_ply": bool(args.save_ply),
         "save_normal": bool(args.save_normal),
         "save_debug_2d": bool(args.save_debug_2d),
@@ -512,6 +550,8 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "max_disp": int(args.fast_max_disp),
         "scale": float(args.fast_scale),
         "remove_invisible": bool(args.fast_remove_invisible),
+        "depth_edge_filter_enabled": bool(args.fast_depth_edge_filter_enabled),
+        "depth_edge_filter_threshold_m": float(args.fast_depth_edge_filter_threshold_m),
         "hiera": bool(args.fast_hiera),
         "optimize_build_volume": str(args.fast_optimize_build_volume),
     }
@@ -1110,6 +1150,14 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             "remove_invisible",
             fast_cfg.get("fast_remove_invisible"),
         ),
+        "fast_depth_edge_filter_enabled": fast_cfg.get(
+            "depth_edge_filter_enabled",
+            fast_cfg.get("fast_depth_edge_filter_enabled"),
+        ),
+        "fast_depth_edge_filter_threshold_m": fast_cfg.get(
+            "depth_edge_filter_threshold_m",
+            fast_cfg.get("fast_depth_edge_filter_threshold_m"),
+        ),
         "fast_hiera": fast_cfg.get("hiera", fast_cfg.get("fast_hiera")),
         "fast_optimize_build_volume": fast_cfg.get(
             "optimize_build_volume",
@@ -1121,7 +1169,7 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             continue
         if key == "fast_model_path":
             defaults[key] = resolve_repo_path(value)
-        elif key in {"fast_remove_invisible", "fast_hiera"}:
+        elif key in {"fast_remove_invisible", "fast_hiera", "fast_depth_edge_filter_enabled"}:
             defaults[key] = int(bool(value))
         else:
             defaults[key] = value
@@ -1158,6 +1206,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--target-cluster-radius-m", type=float, default=0.03)
     parser.add_argument("--target-cluster-min-points", type=int, default=30)
     parser.add_argument("--target-cluster-keep-largest", type=int, default=1)
+    parser.add_argument("--target-3d-mask-erode-kernel", type=int, default=0)
     parser.add_argument("--depth-min", type=float, default=0.1)
     parser.add_argument("--depth-max", type=float, default=3.0)
     parser.add_argument("--confidence", type=float, default=0.25)
@@ -1185,6 +1234,8 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--fast-max-disp", type=int, default=192)
     parser.add_argument("--fast-scale", type=float, default=1.0)
     parser.add_argument("--fast-remove-invisible", type=int, default=1)
+    parser.add_argument("--fast-depth-edge-filter-enabled", type=int, default=0)
+    parser.add_argument("--fast-depth-edge-filter-threshold-m", type=float, default=0.5)
     parser.add_argument("--fast-hiera", type=int, default=0)
     parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     parser.add_argument("--save-live-debug", type=int, default=1)
@@ -1207,6 +1258,8 @@ def build_camera_inputs_from_live_frames(
     stereo_runner: FastFoundationStereoRunner | None,
     depth_min: float,
     depth_max: float,
+    fast_depth_edge_filter_enabled: bool = False,
+    fast_depth_edge_filter_threshold_m: float = 0.5,
     output_dir: Path,
     frame_index: int,
     write_debug_images: bool,
@@ -1241,6 +1294,7 @@ def build_camera_inputs_from_live_frames(
                 color_intrinsics=dict(payload["color_intrinsics"]),
                 color_shape=rgb.shape[:2],
             )
+        edge_filter_summary: dict[str, object] | None = None
         if torch.is_tensor(depth_aligned_m):
             depth_aligned_m = depth_aligned_m.to(dtype=torch.float32)
             depth_aligned_m = torch.where(
@@ -1250,11 +1304,41 @@ def build_camera_inputs_from_live_frames(
                 depth_aligned_m,
                 torch.zeros((), dtype=torch.float32, device=depth_aligned_m.device),
             )
+            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled):
+                valid_before = int(torch.count_nonzero(depth_aligned_m > 0).item())
+                depth_aligned_m = filter_depth_edges_torch(
+                    depth_aligned_m,
+                    threshold_m=float(fast_depth_edge_filter_threshold_m),
+                )
+                valid_after = int(torch.count_nonzero(depth_aligned_m > 0).item())
+                edge_filter_summary = {
+                    "enabled": True,
+                    "backend": "torch",
+                    "threshold_m": float(fast_depth_edge_filter_threshold_m),
+                    "valid_pixels_before": valid_before,
+                    "valid_pixels_after": valid_after,
+                    "removed_pixels": int(max(valid_before - valid_after, 0)),
+                }
             depth_valid_ratio = float((depth_aligned_m > 0).float().mean().item())
         else:
             depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32).copy()
             depth_aligned_m[~np.isfinite(depth_aligned_m)] = 0.0
             depth_aligned_m[(depth_aligned_m < float(depth_min)) | (depth_aligned_m > float(depth_max))] = 0.0
+            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled):
+                valid_before = int(np.count_nonzero(depth_aligned_m > 0))
+                depth_aligned_m = filter_depth_edges_numpy(
+                    depth_aligned_m,
+                    threshold_m=float(fast_depth_edge_filter_threshold_m),
+                )
+                valid_after = int(np.count_nonzero(depth_aligned_m > 0))
+                edge_filter_summary = {
+                    "enabled": True,
+                    "backend": "opencv",
+                    "threshold_m": float(fast_depth_edge_filter_threshold_m),
+                    "valid_pixels_before": valid_before,
+                    "valid_pixels_after": valid_after,
+                    "removed_pixels": int(max(valid_before - valid_after, 0)),
+                }
             depth_valid_ratio = float((depth_aligned_m > 0).mean())
         camera_inputs[camera_id] = {
             "rgb": rgb,
@@ -1263,7 +1347,17 @@ def build_camera_inputs_from_live_frames(
             "pose_record": dict(payload["pose_record"]),
             "fovy_deg": None,
         }
+        if edge_filter_summary is not None:
+            camera_inputs[camera_id]["fast_depth_edge_filter"] = edge_filter_summary
         if write_debug_images:
+            camera_payload = build_live_debug_camera_payload(
+                payload=payload,
+                depth_source=depth_source,
+                depth_min=float(depth_min),
+                depth_max=float(depth_max),
+            )
+            if edge_filter_summary is not None:
+                camera_payload["fast_depth_edge_filter"] = edge_filter_summary
             write_live_debug(
                 output_dir=output_dir,
                 frame_index=frame_index,
@@ -1275,12 +1369,7 @@ def build_camera_inputs_from_live_frames(
                 depth_aligned_m=depth_aligned_m,
                 ir_left_raw=payload.get("ir_left_raw"),
                 ir_right_raw=payload.get("ir_right_raw"),
-                camera_payload=build_live_debug_camera_payload(
-                    payload=payload,
-                    depth_source=depth_source,
-                    depth_min=float(depth_min),
-                    depth_max=float(depth_max),
-                ),
+                camera_payload=camera_payload,
             )
         logging.info(
             f"Built RGBD for {camera_id}: source={depth_source} rgb={rgb.shape} "
@@ -1363,6 +1452,7 @@ def run_live(args: argparse.Namespace) -> None:
             target_cluster_radius_m=float(args.target_cluster_radius_m),
             target_cluster_min_points=int(args.target_cluster_min_points),
             target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
+            target_3d_mask_erode_kernel=int(args.target_3d_mask_erode_kernel),
             save_ply=bool(args.save_ply),
             save_normal=bool(args.save_normal),
             save_debug_2d=bool(args.save_debug_2d),
@@ -1388,6 +1478,8 @@ def run_live(args: argparse.Namespace) -> None:
                     stereo_runner=stereo_runner,
                     depth_min=float(args.depth_min),
                     depth_max=float(args.depth_max),
+                    fast_depth_edge_filter_enabled=bool(args.fast_depth_edge_filter_enabled),
+                    fast_depth_edge_filter_threshold_m=float(args.fast_depth_edge_filter_threshold_m),
                     output_dir=Path(args.output_dir).resolve(),
                     frame_index=frame_index,
                     write_debug_images=bool(args.save_live_debug),

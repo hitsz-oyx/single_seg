@@ -33,6 +33,7 @@ from single_seg.single_object_segmenter import (
     backproject_scene_points_with_labels_torch,
     build_score_label_map,
     collect_common_frame_names,
+    erode_binary_mask_torch,
     filter_target_labels_by_3d_clusters,
     filter_target_labels_by_3d_clusters_torch,
     fuse_scene_geometry,
@@ -51,6 +52,7 @@ from single_seg.realsense_rgbd_segmenter import (
     build_arg_parser,
     build_camera_inputs_from_live_frames,
     build_effective_live_config,
+    filter_depth_edges_torch,
     load_live_arg_defaults,
     project_points_to_depth_image,
 )
@@ -92,6 +94,9 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     assert defaults["target_cluster_radius_m"] == 0.013
     assert defaults["target_cluster_min_points"] == 45
     assert defaults["target_cluster_keep_largest"] is True
+    assert defaults["target_3d_mask_erode_kernel"] == 0
+    assert defaults["fast_depth_edge_filter_enabled"] == 0
+    assert defaults["fast_depth_edge_filter_threshold_m"] == 0.5
     assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses_apriltag.json"
     assert defaults["prompt_task_info"].exists()
     assert defaults["fast_model_path"] == (
@@ -145,6 +150,12 @@ def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
             str(output_dir),
             "--fast-scale",
             "1.0",
+            "--fast-depth-edge-filter-enabled",
+            "1",
+            "--fast-depth-edge-filter-threshold-m",
+            "0.25",
+            "--target-3d-mask-erode-kernel",
+            "5",
             "--stereo-rectification-mode",
             "passthrough",
             "--emitter-enabled",
@@ -160,11 +171,14 @@ def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
     assert effective["segmenter"]["output_dir"] == str(output_dir.resolve())
     assert effective["segmenter"]["save_ply"] is True
     assert effective["segmenter"]["save_normal"] is True
+    assert effective["segmenter"]["target_3d_mask_erode_kernel"] == 5
     assert effective["realsense"]["camera_count"] == 3
     assert effective["realsense"]["camera_serials"] == "111,222,333"
     assert effective["realsense"]["stereo_rectification_mode"] == "passthrough"
     assert effective["realsense"]["emitter_enabled"] == 0
     assert effective["fast_stereo"]["scale"] == 1.0
+    assert effective["fast_stereo"]["depth_edge_filter_enabled"] is True
+    assert effective["fast_stereo"]["depth_edge_filter_threshold_m"] == 0.25
 
 
 def read_ply_header(path: Path) -> str:
@@ -700,6 +714,23 @@ def test_backproject_scene_points_with_labels_torch_matches_numpy() -> None:
     assert np.allclose(np_points, t_points.numpy(), atol=1e-6)
     assert np.array_equal(np_colors, t_colors.numpy())
     assert np.array_equal(np_labels, t_labels.numpy())
+
+
+def test_erode_binary_mask_torch_shrinks_boundary_only() -> None:
+    mask = torch.zeros((7, 7), dtype=torch.bool)
+    mask[1:6, 1:6] = True
+    eroded = erode_binary_mask_torch(mask, 3)
+    expected = torch.zeros((7, 7), dtype=torch.bool)
+    expected[2:5, 2:5] = True
+    assert torch.equal(eroded, expected)
+
+
+def test_filter_depth_edges_torch_removes_depth_jumps() -> None:
+    depth = torch.ones((5, 5), dtype=torch.float32)
+    depth[:, 3:] = 2.0
+    filtered = filter_depth_edges_torch(depth, threshold_m=0.5)
+    assert int(torch.count_nonzero(filtered > 0).item()) < int(depth.numel())
+    assert torch.allclose(filtered[:, 0], torch.ones(5))
 
 
 def test_fuse_scene_geometry_torch_matches_numpy() -> None:

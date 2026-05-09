@@ -19,6 +19,7 @@ segmenter:
   depth_max: 3.0
   stride: 2
   frame_voxel_size: 0.003
+  target_3d_mask_erode_kernel: 0
 
   save_ply: false
   save_debug_2d: false

@@ -79,6 +79,10 @@ segmenter:
   # 单物体任务建议 true；如果目标本身会被深度切成多个独立部分，可以设为 false
   target_cluster_keep_largest: true
 
+  # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
+  # 0/1: 关闭；3/5: 去掉 mask 边界处容易混入背景或深度断层的像素
+  target_3d_mask_erode_kernel: 0
+
   # ---------------------------------------------------------------------------
   # 输出选项
   # ---------------------------------------------------------------------------
@@ -206,6 +210,15 @@ fast_stereo:
 
   # 是否移除不可见点 (遮挡区域)
   remove_invisible: true
+
+  # 是否启用 Fast 深度边缘过滤
+  # true: 对对齐到 RGB 后的深度图做 Sobel 深度突变检测，去掉边缘飞点
+  # false: 保留原始 Fast 深度
+  depth_edge_filter_enabled: false
+
+  # 深度边缘过滤阈值 (米)，参考 Fast-FoundationStereoPhysics demo 默认 0.5
+  # 值越小过滤越强，过小会吃掉真实物体边缘
+  depth_edge_filter_threshold_m: 0.5
 
   # 是否使用分层推理 (更精细但更慢)
   hiera: false

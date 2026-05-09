@@ -29,6 +29,10 @@ segmenter:
   stride: 2
   frame_voxel_size: 0.003
 
+  # Target-mask shrinking used only for 3D point selection.
+  # 0/1 disables it; values like 3 or 5 remove uncertain mask-boundary pixels before backprojection.
+  target_3d_mask_erode_kernel: 0
+
   # Output toggles.
   save_ply: true
   save_normal: false
