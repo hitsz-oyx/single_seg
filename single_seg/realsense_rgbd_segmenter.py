@@ -365,6 +365,8 @@ def to_jsonable(value: object) -> object:
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -401,6 +403,62 @@ def build_live_debug_camera_payload(
             }
         )
     return debug_payload
+
+
+def load_source_config_for_snapshot(config_path: Path | None) -> dict[str, object] | None:
+    """加载原始配置文件内容，用于 live debug 输出留档。"""
+    if config_path is None:
+        return None
+    resolved_path = resolve_repo_path(config_path)
+    snapshot: dict[str, object] = {"path": str(resolved_path)}
+    if not resolved_path.is_file():
+        snapshot["error"] = "config file not found"
+        return snapshot
+    try:
+        with resolved_path.open("r", encoding="utf-8") as handle:
+            snapshot["config"] = yaml.safe_load(handle) or {}
+    except Exception as exc:  # noqa: BLE001 - debug snapshot should not stop a run
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    return snapshot
+
+
+def write_live_debug_config_snapshot(
+    *,
+    output_dir: Path,
+    args: argparse.Namespace,
+    serials: list[str],
+    cameras: list["RealSenseRgbdCamera"],
+    depth_source: str,
+) -> None:
+    """保存本次 live 运行的原始配置和实际生效参数，便于后续复现 debug。"""
+    camera_records = [
+        {
+            "camera_id": camera.camera_id,
+            "serial_number": camera.serial_number,
+            "color_width": camera.color_width,
+            "color_height": camera.color_height,
+            "stereo_width": camera.stereo_width,
+            "stereo_height": camera.stereo_height,
+            "fps": camera.fps,
+            "depth_source": camera.depth_source,
+            "color_intrinsics": to_jsonable(camera.color_intrinsics),
+            "pose_record": to_jsonable(camera.pose_record),
+        }
+        for camera in cameras
+    ]
+    snapshot = {
+        "source_config": load_source_config_for_snapshot(args.config),
+        "effective_args": to_jsonable(vars(args)),
+        "resolved_camera_serials": [str(serial) for serial in serials],
+        "depth_source": str(depth_source),
+        "started_cameras": camera_records,
+        "command_argv": list(sys.argv),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "live_debug_config.yaml").write_text(
+        yaml.safe_dump(snapshot, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 @dataclass(frozen=True)
@@ -1134,6 +1192,15 @@ def run_live(args: argparse.Namespace) -> None:
             tracker_image_size=int(args.tracker_image_size),
         ) as segmenter:
             logging.info("SingleObjectPointCloudSegmenter loaded")
+            if bool(args.save_live_debug):
+                write_live_debug_config_snapshot(
+                    output_dir=segmenter.output_dir,
+                    args=args,
+                    serials=serials,
+                    cameras=cameras,
+                    depth_source=depth_source,
+                )
+                logging.info(f"Saved live debug config snapshot to {segmenter.output_dir / 'live_debug_config.yaml'}")
             frame_limit = None if int(args.max_frames) <= 0 else int(args.max_frames)
             frame_index = 0
             while frame_limit is None or frame_index < frame_limit:

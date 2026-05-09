@@ -11,16 +11,16 @@ segmenter:
   target_name: bowl
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/bowl/annotated/task_info.json
+  prompt_task_info: assets/prompts/bowl/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/bowl/annotated
+  prompt_image_root: assets/prompts/bowl/
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live1
+  output_dir: tests/outputs/realsense_live_three_cam_fast_nofilter
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -65,7 +65,7 @@ segmenter:
   # 是否启用目标点 3D 聚类去散点
   # true: 在最终 3D 分割结果里过滤由深度估计噪声造成的零散目标点
   # false: 保留所有被 2D mask 标成目标的 3D 点
-  target_cluster_filter_enabled: true
+  target_cluster_filter_enabled: false
 
   # 3D 聚类邻域半径 (米)
   # 半径越大，距离较远的目标点越容易连成同一簇；过大可能把背景误连进目标
@@ -125,7 +125,7 @@ realsense:
   # 帧率 (FPS)
   # 低带宽模式推荐: 6
   # 正常模式推荐: 15-30
-  fps: 30
+  fps: 6
 
   # RGB 彩色图像分辨率
   color_width: 1280
