@@ -43,8 +43,8 @@ segmenter:
   target_plane_filter_ransac_iterations: 256
 
   # Optional target depth-band filtering for strict point selection.
-  target_depth_band_filter_enabled: false
-  target_depth_band_filter_range_m: 0.015
+  target_depth_band_filter_enabled: true
+  target_depth_band_filter_range_m: 0.08
   target_depth_band_filter_min_valid_pixels: 50
   target_depth_band_filter_min_keep_pixels: 20
 
@@ -55,3 +55,8 @@ segmenter:
 
   # Runtime options.
   tracker_image_size: 896
+
+  # Optional target-mask 3D clustering for removing scattered false-positive points.
+  target_cluster_filter_enabled: true
+  target_cluster_radius_m: 0.025
+  target_cluster_min_points: 35

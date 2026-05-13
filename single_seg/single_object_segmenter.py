@@ -123,9 +123,9 @@ class SingleSegConfig:
     depth_max: float = 3.0  # 最大有效深度（米）
     stride: int = 2  # 处理帧的步长
     frame_voxel_size: float = 0.003  # 帧体素大小（用于下采样点云）
-    target_cluster_filter_enabled: bool = False  # 是否启用目标点 3D 聚类去散点
-    target_cluster_radius_m: float = 0.03  # 目标点聚类邻域半径（米）
-    target_cluster_min_points: int = 30  # 形成有效目标簇所需的最少点数
+    target_cluster_filter_enabled: bool = True  # 是否启用目标点 3D 聚类去散点
+    target_cluster_radius_m: float = 0.025  # 目标点聚类邻域半径（米）
+    target_cluster_min_points: int = 35  # 形成有效目标簇所需的最少点数
     target_cluster_keep_largest: bool = True  # 是否只保留最大目标簇
     target_plane_filter_enabled: bool = False  # 是否启用目标点主平面剔除（常用于去掉桌面点）
     target_plane_filter_distance_m: float = 0.004  # 点到主平面的最大距离（米）
@@ -134,8 +134,8 @@ class SingleSegConfig:
     target_plane_filter_max_inlier_ratio: float = 0.85  # 主平面内点占目标点的最高比例，过高时跳过以免误删目标
     target_plane_filter_max_planes: int = 1  # 单帧单相机最多剔除几个主平面
     target_plane_filter_ransac_iterations: int = 256  # 主平面 RANSAC 迭代次数
-    target_depth_band_filter_enabled: bool = False  # 是否按目标核心深度带过滤 3D 取点 mask
-    target_depth_band_filter_range_m: float = 0.015  # 保留距离目标深度中位数多少米内的像素
+    target_depth_band_filter_enabled: bool = True  # 是否按目标核心深度带过滤 3D 取点 mask
+    target_depth_band_filter_range_m: float = 0.08  # 保留距离目标深度中位数多少米内的像素
     target_depth_band_filter_min_valid_pixels: int = 50  # 估计目标深度中位数所需的最少有效像素
     target_depth_band_filter_min_keep_pixels: int = 20  # 过滤后至少保留的像素数，过少时跳过过滤
     target_3d_mask_erode_kernel: int = 0  # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
@@ -143,6 +143,7 @@ class SingleSegConfig:
     save_normal: bool = False  # 是否在保存的 PLY 中写入估计法线
     save_debug_2d: bool = False  # 是否保存 2D 调试图
     tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE  # 追踪器输入图像尺寸
+    target_vis_color: tuple[int, int, int] | None = None  # 目标点可视化颜色 R,G,B，默认红色 (255,70,70)
 
     @classmethod
     def from_mapping(
@@ -2259,9 +2260,9 @@ class SingleObjectPointCloudSegmenter:
         depth_max: float = 3.0,
         stride: int = 2,
         frame_voxel_size: float = 0.003,
-        target_cluster_filter_enabled: bool = False,
-        target_cluster_radius_m: float = 0.03,
-        target_cluster_min_points: int = 30,
+        target_cluster_filter_enabled: bool = True,
+        target_cluster_radius_m: float = 0.025,
+        target_cluster_min_points: int = 35,
         target_cluster_keep_largest: bool = True,
         target_plane_filter_enabled: bool = False,
         target_plane_filter_distance_m: float = 0.004,
@@ -2270,8 +2271,8 @@ class SingleObjectPointCloudSegmenter:
         target_plane_filter_max_inlier_ratio: float = 0.85,
         target_plane_filter_max_planes: int = 1,
         target_plane_filter_ransac_iterations: int = 256,
-        target_depth_band_filter_enabled: bool = False,
-        target_depth_band_filter_range_m: float = 0.015,
+        target_depth_band_filter_enabled: bool = True,
+        target_depth_band_filter_range_m: float = 0.08,
         target_depth_band_filter_min_valid_pixels: int = 50,
         target_depth_band_filter_min_keep_pixels: int = 20,
         target_3d_mask_erode_kernel: int = 0,
@@ -2874,7 +2875,7 @@ class SingleObjectPointCloudSegmenter:
             )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             target_cluster_filter_time += time.perf_counter() - target_cluster_t0
-        need_cpu_output = self.save_ply
+        need_cpu_output = self.save_ply or live_debug_root is not None
         points_xyz: np.ndarray | None = None
         raw_colors: np.ndarray | None = None
         labels: np.ndarray | None = None

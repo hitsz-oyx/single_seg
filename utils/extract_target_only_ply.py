@@ -59,6 +59,7 @@ def read_ply_points_and_colors(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def read_ply_labels(path: Path) -> np.ndarray:
+    """读取 instance_label.ply 中的 label 列。"""
     with open(path, "rb") as f:
         header_bytes = b""
         while True:
@@ -66,14 +67,8 @@ def read_ply_labels(path: Path) -> np.ndarray:
             header_bytes += line
             if line.startswith(b"end_header"):
                 break
-        header = header_bytes.decode("ascii")
-        has_normal = any(line.startswith("property float nx") for line in header.strip().split("\n"))
-        if has_normal:
-            dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                              ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
-                              ("label", "<i4")])
-        else:
-            dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("label", "<i4")])
+
+        dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("label", "<i4")])
         data = np.frombuffer(f.read(), dtype=dtype)
         return data["label"].astype(np.int32)
 
@@ -115,8 +110,6 @@ def main() -> None:
     for scene_path in scene_files:
         stem = scene_path.stem.replace("_scene_rgb", "")
         label_path = input_dir / f"{stem}_instance_label.ply"
-        if not label_path.is_file():
-            label_path = input_dir / f"{stem}_label.ply"
         if not label_path.is_file():
             print(f"  skipping {stem}: label file not found")
             continue
