@@ -33,6 +33,21 @@ segmenter:
   # 0/1 disables it; values like 3 or 5 remove uncertain mask-boundary pixels before backprojection.
   target_3d_mask_erode_kernel: 0
 
+  # Optional dominant-plane removal for target points, useful when a tabletop is included in the 2D mask.
+  target_plane_filter_enabled: false
+  target_plane_filter_distance_m: 0.004
+  target_plane_filter_min_points: 80
+  target_plane_filter_min_inlier_ratio: 0.25
+  target_plane_filter_max_inlier_ratio: 0.85
+  target_plane_filter_max_planes: 1
+  target_plane_filter_ransac_iterations: 256
+
+  # Optional target depth-band filtering for strict point selection.
+  target_depth_band_filter_enabled: false
+  target_depth_band_filter_range_m: 0.015
+  target_depth_band_filter_min_valid_pixels: 50
+  target_depth_band_filter_min_keep_pixels: 20
+
   # Output toggles.
   save_ply: true
   save_normal: false

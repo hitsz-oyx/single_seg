@@ -34,6 +34,7 @@ FAST_STEREO_DEFAULT_MODEL = (
 )
 DEPTH_SOURCE_CHOICES = ("fast", "native")
 STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
+DEPTH_EDGE_FILTER_STAGE_CHOICES = ("rectified", "aligned")
 
 if str(FAST_STEREO_ROOT) not in sys.path:
     sys.path.insert(0, str(FAST_STEREO_ROOT))
@@ -160,6 +161,13 @@ def normalize_stereo_rectification_mode(mode: object) -> str:
     normalized = str(mode).strip().lower()
     if normalized not in STEREO_RECTIFICATION_CHOICES:
         raise ValueError(f"stereo_rectification_mode must be one of {STEREO_RECTIFICATION_CHOICES}, got {mode!r}")
+    return normalized
+
+
+def normalize_depth_edge_filter_stage(stage: object) -> str:
+    normalized = str(stage).strip().lower()
+    if normalized not in DEPTH_EDGE_FILTER_STAGE_CHOICES:
+        raise ValueError(f"depth_edge_filter_stage must be one of {DEPTH_EDGE_FILTER_STAGE_CHOICES}, got {stage!r}")
     return normalized
 
 
@@ -519,6 +527,17 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "target_cluster_radius_m": float(args.target_cluster_radius_m),
         "target_cluster_min_points": int(args.target_cluster_min_points),
         "target_cluster_keep_largest": bool(args.target_cluster_keep_largest),
+        "target_plane_filter_enabled": bool(args.target_plane_filter_enabled),
+        "target_plane_filter_distance_m": float(args.target_plane_filter_distance_m),
+        "target_plane_filter_min_points": int(args.target_plane_filter_min_points),
+        "target_plane_filter_min_inlier_ratio": float(args.target_plane_filter_min_inlier_ratio),
+        "target_plane_filter_max_inlier_ratio": float(args.target_plane_filter_max_inlier_ratio),
+        "target_plane_filter_max_planes": int(args.target_plane_filter_max_planes),
+        "target_plane_filter_ransac_iterations": int(args.target_plane_filter_ransac_iterations),
+        "target_depth_band_filter_enabled": bool(args.target_depth_band_filter_enabled),
+        "target_depth_band_filter_range_m": float(args.target_depth_band_filter_range_m),
+        "target_depth_band_filter_min_valid_pixels": int(args.target_depth_band_filter_min_valid_pixels),
+        "target_depth_band_filter_min_keep_pixels": int(args.target_depth_band_filter_min_keep_pixels),
         "target_3d_mask_erode_kernel": int(args.target_3d_mask_erode_kernel),
         "save_ply": bool(args.save_ply),
         "save_normal": bool(args.save_normal),
@@ -552,6 +571,7 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "remove_invisible": bool(args.fast_remove_invisible),
         "depth_edge_filter_enabled": bool(args.fast_depth_edge_filter_enabled),
         "depth_edge_filter_threshold_m": float(args.fast_depth_edge_filter_threshold_m),
+        "depth_edge_filter_stage": normalize_depth_edge_filter_stage(args.fast_depth_edge_filter_stage),
         "hiera": bool(args.fast_hiera),
         "optimize_build_volume": str(args.fast_optimize_build_volume),
     }
@@ -1158,6 +1178,10 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             "depth_edge_filter_threshold_m",
             fast_cfg.get("fast_depth_edge_filter_threshold_m"),
         ),
+        "fast_depth_edge_filter_stage": fast_cfg.get(
+            "depth_edge_filter_stage",
+            fast_cfg.get("fast_depth_edge_filter_stage"),
+        ),
         "fast_hiera": fast_cfg.get("hiera", fast_cfg.get("fast_hiera")),
         "fast_optimize_build_volume": fast_cfg.get(
             "optimize_build_volume",
@@ -1169,6 +1193,8 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             continue
         if key == "fast_model_path":
             defaults[key] = resolve_repo_path(value)
+        elif key == "fast_depth_edge_filter_stage":
+            defaults[key] = normalize_depth_edge_filter_stage(value)
         elif key in {"fast_remove_invisible", "fast_hiera", "fast_depth_edge_filter_enabled"}:
             defaults[key] = int(bool(value))
         else:
@@ -1206,6 +1232,17 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--target-cluster-radius-m", type=float, default=0.03)
     parser.add_argument("--target-cluster-min-points", type=int, default=30)
     parser.add_argument("--target-cluster-keep-largest", type=int, default=1)
+    parser.add_argument("--target-plane-filter-enabled", type=int, default=0)
+    parser.add_argument("--target-plane-filter-distance-m", type=float, default=0.004)
+    parser.add_argument("--target-plane-filter-min-points", type=int, default=80)
+    parser.add_argument("--target-plane-filter-min-inlier-ratio", type=float, default=0.25)
+    parser.add_argument("--target-plane-filter-max-inlier-ratio", type=float, default=0.85)
+    parser.add_argument("--target-plane-filter-max-planes", type=int, default=1)
+    parser.add_argument("--target-plane-filter-ransac-iterations", type=int, default=256)
+    parser.add_argument("--target-depth-band-filter-enabled", type=int, default=0)
+    parser.add_argument("--target-depth-band-filter-range-m", type=float, default=0.015)
+    parser.add_argument("--target-depth-band-filter-min-valid-pixels", type=int, default=50)
+    parser.add_argument("--target-depth-band-filter-min-keep-pixels", type=int, default=20)
     parser.add_argument("--target-3d-mask-erode-kernel", type=int, default=0)
     parser.add_argument("--depth-min", type=float, default=0.1)
     parser.add_argument("--depth-max", type=float, default=3.0)
@@ -1236,6 +1273,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--fast-remove-invisible", type=int, default=1)
     parser.add_argument("--fast-depth-edge-filter-enabled", type=int, default=0)
     parser.add_argument("--fast-depth-edge-filter-threshold-m", type=float, default=0.5)
+    parser.add_argument("--fast-depth-edge-filter-stage", choices=DEPTH_EDGE_FILTER_STAGE_CHOICES, default="rectified")
     parser.add_argument("--fast-hiera", type=int, default=0)
     parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     parser.add_argument("--save-live-debug", type=int, default=1)
@@ -1260,11 +1298,13 @@ def build_camera_inputs_from_live_frames(
     depth_max: float,
     fast_depth_edge_filter_enabled: bool = False,
     fast_depth_edge_filter_threshold_m: float = 0.5,
+    fast_depth_edge_filter_stage: str = "rectified",
     output_dir: Path,
     frame_index: int,
     write_debug_images: bool,
 ) -> dict[str, dict[str, object]]:
     camera_inputs: dict[str, dict[str, object]] = {}
+    edge_filter_stage = normalize_depth_edge_filter_stage(fast_depth_edge_filter_stage)
     for payload in captured_frames:
         camera_id = str(payload["camera_id"])
         depth_source = normalize_depth_source(payload.get("depth_source", "fast"))
@@ -1272,6 +1312,7 @@ def build_camera_inputs_from_live_frames(
         rgb = np.asarray(payload["rgb"], dtype=np.uint8)
         ir_left_rect: np.ndarray | None = None
         ir_right_rect: np.ndarray | None = None
+        edge_filter_summary: dict[str, object] | None = None
         if depth_source == "native":
             depth_aligned_m = np.asarray(payload["depth_m"], dtype=np.float32)
         else:
@@ -1287,14 +1328,32 @@ def build_camera_inputs_from_live_frames(
                 return_torch=True,
                 include_input_images=False,
             )
+            rectified_depth_m = stereo_output["depth_m"]
+            if bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "rectified":
+                if not torch.is_tensor(rectified_depth_m):
+                    raise RuntimeError("Fast rectified depth edge filtering requires torch depth output")
+                valid_before = int(torch.count_nonzero(torch.isfinite(rectified_depth_m) & (rectified_depth_m > 0)).item())
+                rectified_depth_m = filter_depth_edges_torch(
+                    rectified_depth_m,
+                    threshold_m=float(fast_depth_edge_filter_threshold_m),
+                )
+                valid_after = int(torch.count_nonzero(rectified_depth_m > 0).item())
+                edge_filter_summary = {
+                    "enabled": True,
+                    "backend": "torch",
+                    "stage": edge_filter_stage,
+                    "threshold_m": float(fast_depth_edge_filter_threshold_m),
+                    "valid_pixels_before": valid_before,
+                    "valid_pixels_after": valid_after,
+                    "removed_pixels": int(max(valid_before - valid_after, 0)),
+                }
             depth_aligned_m = align_rectified_depth_to_color_torch(
-                stereo_output["depth_m"],
+                rectified_depth_m,
                 rectified_intrinsics=stereo_output["rectified_intrinsics"],
                 rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
                 color_intrinsics=dict(payload["color_intrinsics"]),
                 color_shape=rgb.shape[:2],
             )
-        edge_filter_summary: dict[str, object] | None = None
         if torch.is_tensor(depth_aligned_m):
             depth_aligned_m = depth_aligned_m.to(dtype=torch.float32)
             depth_aligned_m = torch.where(
@@ -1304,7 +1363,7 @@ def build_camera_inputs_from_live_frames(
                 depth_aligned_m,
                 torch.zeros((), dtype=torch.float32, device=depth_aligned_m.device),
             )
-            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled):
+            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "aligned":
                 valid_before = int(torch.count_nonzero(depth_aligned_m > 0).item())
                 depth_aligned_m = filter_depth_edges_torch(
                     depth_aligned_m,
@@ -1314,6 +1373,7 @@ def build_camera_inputs_from_live_frames(
                 edge_filter_summary = {
                     "enabled": True,
                     "backend": "torch",
+                    "stage": edge_filter_stage,
                     "threshold_m": float(fast_depth_edge_filter_threshold_m),
                     "valid_pixels_before": valid_before,
                     "valid_pixels_after": valid_after,
@@ -1324,7 +1384,7 @@ def build_camera_inputs_from_live_frames(
             depth_aligned_m = np.asarray(depth_aligned_m, dtype=np.float32).copy()
             depth_aligned_m[~np.isfinite(depth_aligned_m)] = 0.0
             depth_aligned_m[(depth_aligned_m < float(depth_min)) | (depth_aligned_m > float(depth_max))] = 0.0
-            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled):
+            if depth_source == "fast" and bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "aligned":
                 valid_before = int(np.count_nonzero(depth_aligned_m > 0))
                 depth_aligned_m = filter_depth_edges_numpy(
                     depth_aligned_m,
@@ -1334,6 +1394,7 @@ def build_camera_inputs_from_live_frames(
                 edge_filter_summary = {
                     "enabled": True,
                     "backend": "opencv",
+                    "stage": edge_filter_stage,
                     "threshold_m": float(fast_depth_edge_filter_threshold_m),
                     "valid_pixels_before": valid_before,
                     "valid_pixels_after": valid_after,
@@ -1452,6 +1513,17 @@ def run_live(args: argparse.Namespace) -> None:
             target_cluster_radius_m=float(args.target_cluster_radius_m),
             target_cluster_min_points=int(args.target_cluster_min_points),
             target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
+            target_plane_filter_enabled=bool(args.target_plane_filter_enabled),
+            target_plane_filter_distance_m=float(args.target_plane_filter_distance_m),
+            target_plane_filter_min_points=int(args.target_plane_filter_min_points),
+            target_plane_filter_min_inlier_ratio=float(args.target_plane_filter_min_inlier_ratio),
+            target_plane_filter_max_inlier_ratio=float(args.target_plane_filter_max_inlier_ratio),
+            target_plane_filter_max_planes=int(args.target_plane_filter_max_planes),
+            target_plane_filter_ransac_iterations=int(args.target_plane_filter_ransac_iterations),
+            target_depth_band_filter_enabled=bool(args.target_depth_band_filter_enabled),
+            target_depth_band_filter_range_m=float(args.target_depth_band_filter_range_m),
+            target_depth_band_filter_min_valid_pixels=int(args.target_depth_band_filter_min_valid_pixels),
+            target_depth_band_filter_min_keep_pixels=int(args.target_depth_band_filter_min_keep_pixels),
             target_3d_mask_erode_kernel=int(args.target_3d_mask_erode_kernel),
             save_ply=bool(args.save_ply),
             save_normal=bool(args.save_normal),
@@ -1480,6 +1552,7 @@ def run_live(args: argparse.Namespace) -> None:
                     depth_max=float(args.depth_max),
                     fast_depth_edge_filter_enabled=bool(args.fast_depth_edge_filter_enabled),
                     fast_depth_edge_filter_threshold_m=float(args.fast_depth_edge_filter_threshold_m),
+                    fast_depth_edge_filter_stage=str(args.fast_depth_edge_filter_stage),
                     output_dir=Path(args.output_dir).resolve(),
                     frame_index=frame_index,
                     write_debug_images=bool(args.save_live_debug),

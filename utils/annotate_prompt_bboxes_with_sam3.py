@@ -144,12 +144,14 @@ def load_sam3_processor(*, checkpoint_path: Path, confidence: float, mask_thresh
     try:
         return Sam3Processor(
             model,
+            device=device,
             confidence_threshold=float(confidence),
             mask_threshold=float(mask_threshold),
         )
     except TypeError:
         return Sam3Processor(
             model,
+            device=device,
             confidence_threshold=float(confidence),
         )
 

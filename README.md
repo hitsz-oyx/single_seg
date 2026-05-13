@@ -463,11 +463,24 @@ target_cluster_filter_enabled: true
 target_cluster_radius_m: 0.013
 target_cluster_min_points: 45
 target_cluster_keep_largest: true
+target_plane_filter_enabled: false
+target_plane_filter_distance_m: 0.004
+target_plane_filter_min_points: 80
+target_plane_filter_min_inlier_ratio: 0.25
+target_plane_filter_max_inlier_ratio: 0.85
+target_plane_filter_max_planes: 1
+target_plane_filter_ransac_iterations: 256
+target_depth_band_filter_enabled: false
+target_depth_band_filter_range_m: 0.015
+target_depth_band_filter_min_valid_pixels: 50
+target_depth_band_filter_min_keep_pixels: 20
 target_3d_mask_erode_kernel: 0
 ```
 
 `target_cluster_radius_m` 控制点之间多远算相邻；`target_cluster_min_points` 控制小到什么程度会被当成散点；单物体任务建议保持 `target_cluster_keep_largest: true`。
 `target_3d_mask_erode_kernel` 只影响 3D 取点，不改变 2D mask 调试图；设为 `3` 或 `5` 可以先缩掉目标 mask 边界，减少深度断层和背景混入。
+如果桌面点已经和目标在 3D 里连成一块，单纯聚类不会把它们分开，可以打开 `target_plane_filter_enabled`。这个开关会在每个相机的目标点云里拟合占比足够大的主平面，把主平面内点改回背景；`target_plane_filter_distance_m` 控制点离平面多近会被删除，`target_plane_filter_min/max_inlier_ratio` 用来避免没有明显平面或目标整体近似平面时误删，`target_plane_filter_max_planes` 默认 `1` 更保守，桌面残留明显时可临时调到 `2` 对比。
+如果目标允许点少但要尽量少误点，优先试 `target_depth_band_filter_enabled`。它在反投影前统计目标 mask 内有效深度的中位数，只保留距离该中位数 `target_depth_band_filter_range_m` 以内的像素；红杯这类小物体可以从 `0.012` 到 `0.015` 试起。这个过滤比平面剔除更适合处理桌面碎点和深度边界误点。
 
 也就是说，这里输出的是“真 RGBD”，不是把 IR 灰度图简单伪装成 RGB。
 
@@ -587,10 +600,11 @@ fast_stereo:
   optimize_build_volume: pytorch1
   depth_edge_filter_enabled: false
   depth_edge_filter_threshold_m: 0.5
+  depth_edge_filter_stage: rectified
 ```
 
 在当前 `1280x720` rectified IR live dump 上，这组配置的 Fast 推理约在 `70 ms` 附近。`pytorch1` 是当前默认后端；`triton` 也可用，但首次运行会有编译/自调优开销，live 前几帧或离线 profile 首帧会明显慢一些；看稳定速度时应跳过首帧。
-`depth_edge_filter_enabled` 打开后会对对齐到 RGB 后的 Fast 深度做 Sobel 深度突变过滤，去掉边缘飞点；阈值越小过滤越强，过小会吃掉真实物体边缘。
+`depth_edge_filter_enabled` 打开后会做 Sobel 深度突变过滤，去掉边缘飞点；`depth_edge_filter_stage: rectified` 表示在 IR rectified depth 上过滤，通常比投影到 RGB 后再过滤更稳。阈值越小过滤越强，过小会吃掉真实物体边缘。
 
 如果只追求速度，可以临时覆盖：
 
@@ -617,6 +631,7 @@ single-seg-realsense \
 - `--fast-optimize-build-volume`: Fast cost-volume 后端，支持 `pytorch1` 或 `triton`
 - `--fast-depth-edge-filter-enabled`: 是否启用 Fast 深度边缘过滤
 - `--fast-depth-edge-filter-threshold-m`: 深度边缘过滤阈值，默认 `0.5`
+- `--fast-depth-edge-filter-stage`: 深度边缘过滤位置，推荐 `rectified`
 - `--target-3d-mask-erode-kernel`: 仅用于 3D 取点的目标 mask 腐蚀核大小，`0/1` 关闭
 - `--save-ply`: 保存融合后的点云输出
 

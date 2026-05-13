@@ -34,8 +34,12 @@ from single_seg.single_object_segmenter import (
     build_score_label_map,
     collect_common_frame_names,
     erode_binary_mask_torch,
+    filter_target_mask_by_depth_band,
+    filter_target_mask_by_depth_band_torch,
     filter_target_labels_by_3d_clusters,
     filter_target_labels_by_3d_clusters_torch,
+    filter_target_labels_by_dominant_plane,
+    filter_target_labels_by_dominant_plane_torch,
     fuse_scene_geometry,
     fuse_scene_geometry_torch,
     largest_connected_component,
@@ -94,9 +98,21 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     assert defaults["target_cluster_radius_m"] == 0.013
     assert defaults["target_cluster_min_points"] == 45
     assert defaults["target_cluster_keep_largest"] is True
+    assert defaults["target_plane_filter_enabled"] is False
+    assert defaults["target_plane_filter_distance_m"] == 0.004
+    assert defaults["target_plane_filter_min_points"] == 80
+    assert defaults["target_plane_filter_min_inlier_ratio"] == 0.25
+    assert defaults["target_plane_filter_max_inlier_ratio"] == 0.85
+    assert defaults["target_plane_filter_max_planes"] == 1
+    assert defaults["target_plane_filter_ransac_iterations"] == 256
+    assert defaults["target_depth_band_filter_enabled"] is False
+    assert defaults["target_depth_band_filter_range_m"] == 0.015
+    assert defaults["target_depth_band_filter_min_valid_pixels"] == 50
+    assert defaults["target_depth_band_filter_min_keep_pixels"] == 20
     assert defaults["target_3d_mask_erode_kernel"] == 0
     assert defaults["fast_depth_edge_filter_enabled"] == 0
     assert defaults["fast_depth_edge_filter_threshold_m"] == 0.5
+    assert defaults["fast_depth_edge_filter_stage"] == "rectified"
     assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses_apriltag.json"
     assert defaults["prompt_task_info"].exists()
     assert defaults["fast_model_path"] == (
@@ -154,6 +170,30 @@ def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
             "1",
             "--fast-depth-edge-filter-threshold-m",
             "0.25",
+            "--fast-depth-edge-filter-stage",
+            "aligned",
+            "--target-plane-filter-enabled",
+            "1",
+            "--target-plane-filter-distance-m",
+            "0.006",
+            "--target-plane-filter-min-points",
+            "20",
+            "--target-plane-filter-min-inlier-ratio",
+            "0.2",
+            "--target-plane-filter-max-inlier-ratio",
+            "0.9",
+            "--target-plane-filter-max-planes",
+            "2",
+            "--target-plane-filter-ransac-iterations",
+            "64",
+            "--target-depth-band-filter-enabled",
+            "1",
+            "--target-depth-band-filter-range-m",
+            "0.012",
+            "--target-depth-band-filter-min-valid-pixels",
+            "30",
+            "--target-depth-band-filter-min-keep-pixels",
+            "10",
             "--target-3d-mask-erode-kernel",
             "5",
             "--stereo-rectification-mode",
@@ -171,6 +211,17 @@ def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
     assert effective["segmenter"]["output_dir"] == str(output_dir.resolve())
     assert effective["segmenter"]["save_ply"] is True
     assert effective["segmenter"]["save_normal"] is True
+    assert effective["segmenter"]["target_plane_filter_enabled"] is True
+    assert effective["segmenter"]["target_plane_filter_distance_m"] == 0.006
+    assert effective["segmenter"]["target_plane_filter_min_points"] == 20
+    assert effective["segmenter"]["target_plane_filter_min_inlier_ratio"] == 0.2
+    assert effective["segmenter"]["target_plane_filter_max_inlier_ratio"] == 0.9
+    assert effective["segmenter"]["target_plane_filter_max_planes"] == 2
+    assert effective["segmenter"]["target_plane_filter_ransac_iterations"] == 64
+    assert effective["segmenter"]["target_depth_band_filter_enabled"] is True
+    assert effective["segmenter"]["target_depth_band_filter_range_m"] == 0.012
+    assert effective["segmenter"]["target_depth_band_filter_min_valid_pixels"] == 30
+    assert effective["segmenter"]["target_depth_band_filter_min_keep_pixels"] == 10
     assert effective["segmenter"]["target_3d_mask_erode_kernel"] == 5
     assert effective["realsense"]["camera_count"] == 3
     assert effective["realsense"]["camera_serials"] == "111,222,333"
@@ -179,6 +230,7 @@ def test_effective_live_config_reflects_cli_overrides(tmp_path: Path) -> None:
     assert effective["fast_stereo"]["scale"] == 1.0
     assert effective["fast_stereo"]["depth_edge_filter_enabled"] is True
     assert effective["fast_stereo"]["depth_edge_filter_threshold_m"] == 0.25
+    assert effective["fast_stereo"]["depth_edge_filter_stage"] == "aligned"
 
 
 def read_ply_header(path: Path) -> str:
@@ -487,6 +539,86 @@ def test_filter_target_labels_by_3d_clusters_torch_matches_numpy() -> None:
     assert summary["removed_target_points"] == expected_summary["removed_target_points"]
 
 
+def test_filter_target_labels_by_dominant_plane_removes_planar_target_points() -> None:
+    plane_points = np.asarray(
+        [[x * 0.01, y * 0.01, 0.0] for y in range(4) for x in range(6)],
+        dtype=np.float32,
+    )
+    object_points = np.asarray(
+        [
+            [0.02, 0.01, 0.05],
+            [0.03, 0.01, 0.06],
+            [0.02, 0.02, 0.07],
+            [0.03, 0.02, 0.08],
+        ],
+        dtype=np.float32,
+    )
+    points = np.concatenate([np.asarray([[1.0, 1.0, 1.0]], dtype=np.float32), plane_points, object_points], axis=0)
+    labels = np.concatenate(
+        [
+            np.asarray([0], dtype=np.int32),
+            np.ones((plane_points.shape[0] + object_points.shape[0],), dtype=np.int32),
+        ],
+        axis=0,
+    )
+
+    filtered, summary = filter_target_labels_by_dominant_plane(
+        points,
+        labels,
+        enabled=True,
+        distance_m=0.001,
+        min_points=12,
+        min_inlier_ratio=0.4,
+        max_inlier_ratio=0.9,
+        max_planes=1,
+        ransac_iterations=64,
+    )
+
+    assert summary["plane_applied"] is True
+    assert summary["removed_target_points"] == plane_points.shape[0]
+    assert filtered[0] == 0
+    assert int(np.count_nonzero(filtered[1 : 1 + plane_points.shape[0]])) == 0
+    assert np.all(filtered[-object_points.shape[0] :] == 1)
+
+
+def test_filter_target_labels_by_dominant_plane_torch_matches_numpy() -> None:
+    plane_points = np.asarray(
+        [[x * 0.01, y * 0.01, 0.0] for y in range(4) for x in range(6)],
+        dtype=np.float32,
+    )
+    object_points = np.asarray([[0.02, 0.01, 0.05], [0.03, 0.02, 0.07]], dtype=np.float32)
+    points = np.concatenate([plane_points, object_points], axis=0)
+    labels = np.ones((points.shape[0],), dtype=np.int32)
+    expected, expected_summary = filter_target_labels_by_dominant_plane(
+        points,
+        labels,
+        enabled=True,
+        distance_m=0.001,
+        min_points=12,
+        min_inlier_ratio=0.4,
+        max_inlier_ratio=0.95,
+        max_planes=1,
+        ransac_iterations=64,
+    )
+
+    filtered_t, summary = filter_target_labels_by_dominant_plane_torch(
+        torch.as_tensor(points),
+        torch.as_tensor(labels),
+        enabled=True,
+        distance_m=0.001,
+        min_points=12,
+        min_inlier_ratio=0.4,
+        max_inlier_ratio=0.95,
+        max_planes=1,
+        ransac_iterations=64,
+    )
+
+    assert np.array_equal(filtered_t.cpu().numpy(), expected)
+    assert summary["backend"] == "torch_cpu_ransac"
+    assert summary["plane_applied"] == expected_summary["plane_applied"]
+    assert summary["removed_target_points"] == expected_summary["removed_target_points"]
+
+
 def test_build_score_label_map_uses_mask_prob_threshold() -> None:
     logits = np.full((1, 6, 6), -10.0, dtype=np.float32)
     logits[0, 1:5, 1:5] = 2.0
@@ -723,6 +855,66 @@ def test_erode_binary_mask_torch_shrinks_boundary_only() -> None:
     expected = torch.zeros((7, 7), dtype=torch.bool)
     expected[2:5, 2:5] = True
     assert torch.equal(eroded, expected)
+
+
+def test_filter_target_mask_by_depth_band_removes_depth_outliers() -> None:
+    mask = np.ones((3, 4), dtype=bool)
+    depth = np.asarray(
+        [
+            [1.00, 1.01, 1.02, 1.30],
+            [1.00, 1.01, 1.02, 1.35],
+            [1.00, 1.01, 1.02, 0.00],
+        ],
+        dtype=np.float32,
+    )
+    filtered, summary = filter_target_mask_by_depth_band(
+        mask,
+        depth,
+        enabled=True,
+        range_m=0.03,
+        min_valid_pixels=3,
+        min_keep_pixels=3,
+    )
+
+    assert summary["applied"] is True
+    assert summary["center_depth_m"] == pytest.approx(1.01, abs=1e-6)
+    assert int(np.count_nonzero(filtered)) == 9
+    assert not filtered[0, 3]
+    assert not filtered[1, 3]
+    assert not filtered[2, 3]
+
+
+def test_filter_target_mask_by_depth_band_torch_matches_numpy() -> None:
+    mask = np.ones((3, 4), dtype=bool)
+    depth = np.asarray(
+        [
+            [1.00, 1.01, 1.02, 1.30],
+            [1.00, 1.01, 1.02, 1.35],
+            [1.00, 1.01, 1.02, 0.00],
+        ],
+        dtype=np.float32,
+    )
+    expected, expected_summary = filter_target_mask_by_depth_band(
+        mask,
+        depth,
+        enabled=True,
+        range_m=0.03,
+        min_valid_pixels=3,
+        min_keep_pixels=3,
+    )
+    filtered_t, summary = filter_target_mask_by_depth_band_torch(
+        torch.as_tensor(mask),
+        torch.as_tensor(depth),
+        enabled=True,
+        range_m=0.03,
+        min_valid_pixels=3,
+        min_keep_pixels=3,
+    )
+
+    assert np.array_equal(filtered_t.cpu().numpy(), expected)
+    assert summary["backend"] == "torch"
+    assert summary["target_pixels_after"] == expected_summary["target_pixels_after"]
+    assert summary["removed_target_pixels"] == expected_summary["removed_target_pixels"]
 
 
 def test_filter_depth_edges_torch_removes_depth_jumps() -> None:

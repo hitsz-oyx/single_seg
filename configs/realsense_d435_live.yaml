@@ -79,6 +79,43 @@ segmenter:
   # 单物体任务建议 true；如果目标本身会被深度切成多个独立部分，可以设为 false
   target_cluster_keep_largest: true
 
+  # 是否启用目标点主平面剔除
+  # true: 在每个相机的目标点云里拟合占比足够大的平面，并把该平面点改回背景
+  # 适合目标 mask 把桌面扫进来且桌面与目标在 3D 中连在一起的情况
+  target_plane_filter_enabled: false
+
+  # 主平面内点距离阈值 (米)，越大删得越多
+  target_plane_filter_distance_m: 0.004
+
+  # 主平面至少需要的内点数量，低于该值时跳过
+  target_plane_filter_min_points: 80
+
+  # 主平面内点占目标点的最低比例，低于该比例认为没有明显桌面平面
+  target_plane_filter_min_inlier_ratio: 0.25
+
+  # 主平面内点占目标点的最高比例，高于该比例时跳过，避免目标整体被误删
+  target_plane_filter_max_inlier_ratio: 0.85
+
+  # 单帧单相机最多剔除几个目标主平面
+  # 1 更保守；桌面残留明显时可临时调到 2
+  target_plane_filter_max_planes: 1
+
+  # 主平面 RANSAC 迭代次数，越大越稳但越慢
+  target_plane_filter_ransac_iterations: 256
+
+  # 是否按目标核心深度带过滤 3D 取点 mask
+  # true: 只保留目标 mask 中距离有效深度中位数较近的像素，宁可点少也减少桌面/背景误点
+  target_depth_band_filter_enabled: false
+
+  # 目标核心深度带半径 (米)，越小越严格；红杯这类小物体可从 0.012-0.015 试起
+  target_depth_band_filter_range_m: 0.015
+
+  # 估计深度中位数所需的最少有效像素，低于该值时跳过过滤
+  target_depth_band_filter_min_valid_pixels: 50
+
+  # 过滤后至少保留的像素数，低于该值时跳过过滤，避免整目标被删空
+  target_depth_band_filter_min_keep_pixels: 20
+
   # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
   # 0/1: 关闭；3/5: 去掉 mask 边界处容易混入背景或深度断层的像素
   target_3d_mask_erode_kernel: 0
@@ -227,6 +264,10 @@ fast_stereo:
   # 深度边缘过滤阈值 (米)，参考 Fast-FoundationStereoPhysics demo 默认 0.5
   # 值越小过滤越强，过小会吃掉真实物体边缘
   depth_edge_filter_threshold_m: 0.5
+
+  # 深度边缘过滤位置
+  # rectified: 在 IR rectified depth 上过滤，推荐；aligned: 投影到 RGB 后过滤，容易被空洞边界打碎
+  depth_edge_filter_stage: rectified
 
   # 是否使用分层推理 (更精细但更慢)
   hiera: false

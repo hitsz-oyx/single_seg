@@ -127,6 +127,17 @@ class SingleSegConfig:
     target_cluster_radius_m: float = 0.03  # 目标点聚类邻域半径（米）
     target_cluster_min_points: int = 30  # 形成有效目标簇所需的最少点数
     target_cluster_keep_largest: bool = True  # 是否只保留最大目标簇
+    target_plane_filter_enabled: bool = False  # 是否启用目标点主平面剔除（常用于去掉桌面点）
+    target_plane_filter_distance_m: float = 0.004  # 点到主平面的最大距离（米）
+    target_plane_filter_min_points: int = 80  # 主平面至少需要的内点数量
+    target_plane_filter_min_inlier_ratio: float = 0.25  # 主平面内点占目标点的最低比例
+    target_plane_filter_max_inlier_ratio: float = 0.85  # 主平面内点占目标点的最高比例，过高时跳过以免误删目标
+    target_plane_filter_max_planes: int = 1  # 单帧单相机最多剔除几个主平面
+    target_plane_filter_ransac_iterations: int = 256  # 主平面 RANSAC 迭代次数
+    target_depth_band_filter_enabled: bool = False  # 是否按目标核心深度带过滤 3D 取点 mask
+    target_depth_band_filter_range_m: float = 0.015  # 保留距离目标深度中位数多少米内的像素
+    target_depth_band_filter_min_valid_pixels: int = 50  # 估计目标深度中位数所需的最少有效像素
+    target_depth_band_filter_min_keep_pixels: int = 20  # 过滤后至少保留的像素数，过少时跳过过滤
     target_3d_mask_erode_kernel: int = 0  # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
     save_ply: bool = True  # 是否保存 .ply 点云文件
     save_normal: bool = False  # 是否在保存的 PLY 中写入估计法线
@@ -556,12 +567,14 @@ def load_sam3_image_processor(
     try:
         return Sam3Processor(
             model,
+            device=resolved_device,
             confidence_threshold=float(confidence),
             mask_threshold=float(mask_threshold),
         )
     except TypeError:
         return Sam3Processor(
             model,
+            device=resolved_device,
             confidence_threshold=float(confidence),
         )
 
@@ -1234,6 +1247,100 @@ def erode_binary_mask_torch(mask: torch.Tensor, kernel_size: int) -> torch.Tenso
     return counts >= footprint_f.sum()
 
 
+def filter_target_mask_by_depth_band(
+    mask: np.ndarray,
+    depth_m: np.ndarray,
+    *,
+    enabled: bool,
+    range_m: float,
+    min_valid_pixels: int,
+    min_keep_pixels: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """按目标 mask 内有效深度的中位数做深度带过滤，优先减少背景误点。"""
+    mask_bool = np.asarray(mask, dtype=bool)
+    depth = np.asarray(depth_m, dtype=np.float32)
+    valid = mask_bool & np.isfinite(depth) & (depth > 0.0)
+    valid_pixels = int(np.count_nonzero(valid))
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "backend": "numpy",
+        "range_m": float(range_m),
+        "min_valid_pixels": int(min_valid_pixels),
+        "min_keep_pixels": int(min_keep_pixels),
+        "target_pixels_before": int(np.count_nonzero(mask_bool)),
+        "valid_depth_pixels": valid_pixels,
+        "target_pixels_after": int(np.count_nonzero(mask_bool)),
+        "removed_target_pixels": 0,
+        "center_depth_m": None,
+        "applied": False,
+        "skipped_reason": None,
+    }
+    if not enabled:
+        return mask_bool, summary
+    if valid_pixels < max(int(min_valid_pixels), 1):
+        summary["skipped_reason"] = "not_enough_valid_depth_pixels"
+        return mask_bool, summary
+    depth_center = float(np.median(depth[valid]))
+    keep = valid & (np.abs(depth - depth_center) <= max(float(range_m), 0.0))
+    keep_pixels = int(np.count_nonzero(keep))
+    summary["center_depth_m"] = depth_center
+    if keep_pixels < max(int(min_keep_pixels), 1):
+        summary["skipped_reason"] = "not_enough_kept_pixels"
+        return mask_bool, summary
+    summary["target_pixels_after"] = keep_pixels
+    summary["removed_target_pixels"] = int(max(summary["target_pixels_before"] - keep_pixels, 0))
+    summary["applied"] = True
+    return keep, summary
+
+
+def filter_target_mask_by_depth_band_torch(
+    mask: torch.Tensor,
+    depth_m: torch.Tensor,
+    *,
+    enabled: bool,
+    range_m: float,
+    min_valid_pixels: int,
+    min_keep_pixels: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """按目标 mask 内有效深度的中位数做深度带过滤（torch 实现）。"""
+    mask_bool = mask.to(dtype=torch.bool)
+    depth = depth_m.to(dtype=torch.float32)
+    valid = mask_bool & torch.isfinite(depth) & (depth > 0.0)
+    valid_pixels = int(torch.count_nonzero(valid).item())
+    target_pixels_before = int(torch.count_nonzero(mask_bool).item())
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "backend": "torch",
+        "range_m": float(range_m),
+        "min_valid_pixels": int(min_valid_pixels),
+        "min_keep_pixels": int(min_keep_pixels),
+        "target_pixels_before": target_pixels_before,
+        "valid_depth_pixels": valid_pixels,
+        "target_pixels_after": target_pixels_before,
+        "removed_target_pixels": 0,
+        "center_depth_m": None,
+        "applied": False,
+        "skipped_reason": None,
+    }
+    if not enabled:
+        return mask_bool, summary
+    if valid_pixels < max(int(min_valid_pixels), 1):
+        summary["skipped_reason"] = "not_enough_valid_depth_pixels"
+        return mask_bool, summary
+    with no_autocast_context(depth.device):
+        center = torch.median(depth[valid])
+        keep = valid & (torch.abs(depth - center) <= max(float(range_m), 0.0))
+        keep_pixels = int(torch.count_nonzero(keep).item())
+    summary["center_depth_m"] = float(center.item())
+    if keep_pixels < max(int(min_keep_pixels), 1):
+        summary["skipped_reason"] = "not_enough_kept_pixels"
+        return mask_bool, summary
+    summary["target_pixels_after"] = keep_pixels
+    summary["removed_target_pixels"] = int(max(target_pixels_before - keep_pixels, 0))
+    summary["applied"] = True
+    return keep, summary
+
+
 def fuse_scene_geometry(
     point_chunks: list[np.ndarray],
     color_chunks: list[np.ndarray],
@@ -1453,6 +1560,179 @@ def filter_target_labels_by_3d_clusters(
     return labels_out, summary
 
 
+def fit_dominant_plane_ransac(
+    points: np.ndarray,
+    *,
+    distance_m: float,
+    min_points: int,
+    num_iterations: int,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """用确定性 RANSAC 拟合主平面，返回 plane=[nx,ny,nz,d] 和内点 mask。"""
+    points_f = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    num_points = int(points_f.shape[0])
+    if num_points < max(int(min_points), 3):
+        return None
+    threshold = max(float(distance_m), 0.0)
+    if threshold <= 0.0:
+        return None
+
+    rng = np.random.default_rng(int(seed))
+    best_plane: np.ndarray | None = None
+    best_inliers: np.ndarray | None = None
+    best_count = -1
+    best_mean_distance = float("inf")
+    iterations = max(int(num_iterations), 1)
+    for _ in range(iterations):
+        ids = rng.choice(num_points, size=3, replace=False)
+        p0, p1, p2 = points_f[ids]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-8:
+            continue
+        normal = normal / norm
+        d = -float(np.dot(normal, p0))
+        distances = np.abs(points_f @ normal + d)
+        inliers = distances <= threshold
+        count = int(np.count_nonzero(inliers))
+        if count <= 0:
+            continue
+        mean_distance = float(np.mean(distances[inliers]))
+        if count > best_count or (count == best_count and mean_distance < best_mean_distance):
+            best_plane = np.asarray([normal[0], normal[1], normal[2], d], dtype=np.float32)
+            best_inliers = inliers
+            best_count = count
+            best_mean_distance = mean_distance
+
+    if best_plane is None or best_inliers is None or best_count < max(int(min_points), 3):
+        return None
+
+    inlier_points = points_f[best_inliers]
+    centroid = inlier_points.mean(axis=0)
+    _, _, vh = np.linalg.svd(inlier_points - centroid, full_matrices=False)
+    normal = vh[-1].astype(np.float32, copy=False)
+    norm = float(np.linalg.norm(normal))
+    if norm <= 1e-8:
+        return best_plane, best_inliers
+    normal = normal / norm
+    d = -float(np.dot(normal, centroid))
+    refined_plane = np.asarray([normal[0], normal[1], normal[2], d], dtype=np.float32)
+    refined_inliers = np.abs(points_f @ normal + d) <= threshold
+    if int(np.count_nonzero(refined_inliers)) >= max(int(min_points), 3):
+        return refined_plane, refined_inliers
+    return best_plane, best_inliers
+
+
+def filter_target_labels_by_dominant_plane(
+    points_xyz: np.ndarray,
+    labels: np.ndarray,
+    *,
+    enabled: bool,
+    distance_m: float,
+    min_points: int,
+    min_inlier_ratio: float,
+    max_inlier_ratio: float,
+    max_planes: int,
+    ransac_iterations: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """按目标点中的主平面过滤标签，常用于去掉被 2D mask 扫进来的桌面点。"""
+    labels_out = np.asarray(labels, dtype=np.int32).copy()
+    target_mask = labels_out > 0
+    target_indices = np.flatnonzero(target_mask)
+    target_count = int(target_indices.shape[0])
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "backend": "numpy_ransac",
+        "distance_m": float(distance_m),
+        "min_points": int(min_points),
+        "min_inlier_ratio": float(min_inlier_ratio),
+        "max_inlier_ratio": float(max_inlier_ratio),
+        "max_planes": int(max_planes),
+        "ransac_iterations": int(ransac_iterations),
+        "target_points_before": target_count,
+        "target_points_after": target_count,
+        "removed_target_points": 0,
+        "plane_found": False,
+        "plane_applied": False,
+        "plane": None,
+        "plane_inliers": 0,
+        "plane_inlier_ratio": 0.0,
+        "planes": [],
+        "skipped_reason": None,
+    }
+    if not enabled or target_count == 0:
+        return labels_out, summary
+    min_points_i = max(int(min_points), 3)
+    if target_count < min_points_i:
+        summary["skipped_reason"] = "not_enough_target_points"
+        return labels_out, summary
+    points_all = np.asarray(points_xyz, dtype=np.float32)
+    remaining_indices = target_indices.copy()
+    planes: list[dict[str, object]] = []
+    max_planes_i = max(int(max_planes), 1)
+    for plane_index in range(max_planes_i):
+        remaining_count = int(remaining_indices.shape[0])
+        if remaining_count < min_points_i:
+            if not planes:
+                summary["skipped_reason"] = "not_enough_target_points"
+            break
+        target_points = points_all[remaining_indices]
+        fitted = fit_dominant_plane_ransac(
+            target_points,
+            distance_m=float(distance_m),
+            min_points=min_points_i,
+            num_iterations=int(ransac_iterations),
+            seed=int(plane_index),
+        )
+        if fitted is None:
+            if not planes:
+                summary["skipped_reason"] = "no_plane"
+            break
+        plane, inlier_mask = fitted
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        inlier_ratio = float(inlier_count / max(remaining_count, 1))
+        plane_record = {
+            "index": int(plane_index),
+            "plane": [float(value) for value in plane.tolist()],
+            "inliers": inlier_count,
+            "inlier_ratio": inlier_ratio,
+            "applied": False,
+            "skipped_reason": None,
+        }
+        summary["plane_found"] = True
+        if summary["plane"] is None:
+            summary["plane"] = plane_record["plane"]
+            summary["plane_inliers"] = inlier_count
+            summary["plane_inlier_ratio"] = inlier_ratio
+        if inlier_count < min_points_i:
+            plane_record["skipped_reason"] = "not_enough_plane_inliers"
+            if not planes:
+                summary["skipped_reason"] = plane_record["skipped_reason"]
+            break
+        if inlier_ratio < float(min_inlier_ratio):
+            plane_record["skipped_reason"] = "inlier_ratio_too_low"
+            if not planes:
+                summary["skipped_reason"] = plane_record["skipped_reason"]
+            break
+        if inlier_ratio > float(max_inlier_ratio):
+            plane_record["skipped_reason"] = "inlier_ratio_too_high"
+            if not planes:
+                summary["skipped_reason"] = plane_record["skipped_reason"]
+            break
+
+        labels_out[remaining_indices[inlier_mask]] = 0
+        plane_record["applied"] = True
+        planes.append(plane_record)
+        remaining_indices = remaining_indices[~inlier_mask]
+
+    target_after = int(np.count_nonzero(labels_out > 0))
+    summary["target_points_after"] = target_after
+    summary["removed_target_points"] = int(target_count - target_after)
+    summary["plane_applied"] = bool(planes)
+    summary["planes"] = planes
+    return labels_out, summary
+
+
 def dbscan_labels_from_points_torch(points: torch.Tensor, radius_m: float, min_points: int) -> torch.Tensor:
     """用 torch 半径图对 3D 点执行 DBSCAN，返回每个点的簇 ID，噪声为 -1。"""
     points = points.reshape(-1, 3)
@@ -1617,6 +1897,66 @@ def filter_target_labels_by_3d_clusters_torch(
     labels_out[target_indices[~keep_target]] = 0
     summary["target_points_after"] = target_after
     summary["removed_target_points"] = target_count - target_after
+    return labels_out, summary
+
+
+def filter_target_labels_by_dominant_plane_torch(
+    points_xyz: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    enabled: bool,
+    distance_m: float,
+    min_points: int,
+    min_inlier_ratio: float,
+    max_inlier_ratio: float,
+    max_planes: int,
+    ransac_iterations: int,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """按目标点中的主平面过滤标签（torch 输入，CPU RANSAC 拟合）。"""
+    labels_out = labels.to(dtype=torch.int32).clone()
+    target_mask = labels_out > 0
+    target_indices = torch.nonzero(target_mask, as_tuple=False).flatten()
+    target_count = int(target_indices.shape[0])
+    summary: dict[str, object] = {
+        "enabled": bool(enabled),
+        "backend": "torch_cpu_ransac",
+        "distance_m": float(distance_m),
+        "min_points": int(min_points),
+        "min_inlier_ratio": float(min_inlier_ratio),
+        "max_inlier_ratio": float(max_inlier_ratio),
+        "max_planes": int(max_planes),
+        "ransac_iterations": int(ransac_iterations),
+        "target_points_before": target_count,
+        "target_points_after": target_count,
+        "removed_target_points": 0,
+        "plane_found": False,
+        "plane_applied": False,
+        "plane": None,
+        "plane_inliers": 0,
+        "plane_inlier_ratio": 0.0,
+        "planes": [],
+        "skipped_reason": None,
+    }
+    if not enabled or target_count == 0:
+        return labels_out, summary
+
+    target_points_np = points_xyz[target_indices].detach().cpu().numpy().astype(np.float32, copy=False)
+    target_labels_np = np.ones((target_count,), dtype=np.int32)
+    filtered_target_labels, np_summary = filter_target_labels_by_dominant_plane(
+        target_points_np,
+        target_labels_np,
+        enabled=True,
+        distance_m=float(distance_m),
+        min_points=int(min_points),
+        min_inlier_ratio=float(min_inlier_ratio),
+        max_inlier_ratio=float(max_inlier_ratio),
+        max_planes=int(max_planes),
+        ransac_iterations=int(ransac_iterations),
+    )
+    summary.update(np_summary)
+    summary["backend"] = "torch_cpu_ransac"
+    keep_target = torch.as_tensor(filtered_target_labels > 0, dtype=torch.bool, device=labels_out.device)
+    labels_out[target_indices[~keep_target]] = 0
     return labels_out, summary
 
 
@@ -1923,11 +2263,23 @@ class SingleObjectPointCloudSegmenter:
         target_cluster_radius_m: float = 0.03,
         target_cluster_min_points: int = 30,
         target_cluster_keep_largest: bool = True,
+        target_plane_filter_enabled: bool = False,
+        target_plane_filter_distance_m: float = 0.004,
+        target_plane_filter_min_points: int = 80,
+        target_plane_filter_min_inlier_ratio: float = 0.25,
+        target_plane_filter_max_inlier_ratio: float = 0.85,
+        target_plane_filter_max_planes: int = 1,
+        target_plane_filter_ransac_iterations: int = 256,
+        target_depth_band_filter_enabled: bool = False,
+        target_depth_band_filter_range_m: float = 0.015,
+        target_depth_band_filter_min_valid_pixels: int = 50,
+        target_depth_band_filter_min_keep_pixels: int = 20,
         target_3d_mask_erode_kernel: int = 0,
         save_ply: bool = True,
         save_normal: bool = False,
         save_debug_2d: bool = False,
         tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE,
+        target_vis_color: tuple[int, int, int] | None = None,
     ) -> None:
         self.target_name = str(target_name)
         self.prompt_task_info = Path(prompt_task_info).resolve()
@@ -1947,6 +2299,17 @@ class SingleObjectPointCloudSegmenter:
         self.target_cluster_radius_m = float(target_cluster_radius_m)
         self.target_cluster_min_points = int(target_cluster_min_points)
         self.target_cluster_keep_largest = bool(target_cluster_keep_largest)
+        self.target_plane_filter_enabled = bool(target_plane_filter_enabled)
+        self.target_plane_filter_distance_m = float(target_plane_filter_distance_m)
+        self.target_plane_filter_min_points = int(target_plane_filter_min_points)
+        self.target_plane_filter_min_inlier_ratio = float(target_plane_filter_min_inlier_ratio)
+        self.target_plane_filter_max_inlier_ratio = float(target_plane_filter_max_inlier_ratio)
+        self.target_plane_filter_max_planes = int(target_plane_filter_max_planes)
+        self.target_plane_filter_ransac_iterations = int(target_plane_filter_ransac_iterations)
+        self.target_depth_band_filter_enabled = bool(target_depth_band_filter_enabled)
+        self.target_depth_band_filter_range_m = float(target_depth_band_filter_range_m)
+        self.target_depth_band_filter_min_valid_pixels = int(target_depth_band_filter_min_valid_pixels)
+        self.target_depth_band_filter_min_keep_pixels = int(target_depth_band_filter_min_keep_pixels)
         target_erode_kernel = max(int(target_3d_mask_erode_kernel), 0)
         if target_erode_kernel > 1 and target_erode_kernel % 2 == 0:
             target_erode_kernel += 1
@@ -1955,6 +2318,9 @@ class SingleObjectPointCloudSegmenter:
         self.save_normal = bool(save_normal)
         self.save_debug_2d = bool(save_debug_2d)
         self.tracker_image_size = None if tracker_image_size is None else int(tracker_image_size)
+        self.target_vis_color = (
+            tuple(int(c) for c in target_vis_color) if target_vis_color is not None else (255, 70, 70)
+        )
         self.prompt_max_masks = DEFAULT_PROMPT_MAX_MASKS
         self.prompt_ref_cell = DEFAULT_PROMPT_REF_CELL
         self.prompt_max_cols = DEFAULT_PROMPT_MAX_COLS
@@ -2198,8 +2564,10 @@ class SingleObjectPointCloudSegmenter:
         compose_inputs_time = 0.0
         mask_postprocess_time = 0.0
         target_mask_erode_time = 0.0
+        target_depth_band_filter_time = 0.0
         camera_prepare_time = 0.0
         camera_bookkeeping_time = 0.0
+        target_plane_filter_time = 0.0
         target_cluster_filter_time = 0.0
         live_debug_object_ply_time = 0.0
         cpu_transfer_time = 0.0
@@ -2332,6 +2700,38 @@ class SingleObjectPointCloudSegmenter:
                 target_mask_erode_summary["removed_target_pixels"] = int(
                     max(target_pixels_before_3d - after_pixels, 0)
                 )
+            target_depth_band_summary: dict[str, object] = {
+                "enabled": bool(self.target_depth_band_filter_enabled),
+                "backend": "torch",
+                "range_m": float(self.target_depth_band_filter_range_m),
+                "min_valid_pixels": int(self.target_depth_band_filter_min_valid_pixels),
+                "min_keep_pixels": int(self.target_depth_band_filter_min_keep_pixels),
+                "target_pixels_before": int(torch.count_nonzero(mask_3d_t).item()),
+                "valid_depth_pixels": 0,
+                "target_pixels_after": int(torch.count_nonzero(mask_3d_t).item()),
+                "removed_target_pixels": 0,
+                "center_depth_m": None,
+                "applied": False,
+                "skipped_reason": None,
+            }
+            if self.target_depth_band_filter_enabled:
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_depth_band_t0 = time.perf_counter()
+                depth_for_filter = (
+                    depth_m
+                    if torch.is_tensor(depth_m)
+                    else torch.as_tensor(np.ascontiguousarray(depth_m), dtype=torch.float32, device=self.tensor_device)
+                )
+                mask_3d_t, target_depth_band_summary = filter_target_mask_by_depth_band_torch(
+                    mask_3d_t,
+                    depth_for_filter,
+                    enabled=True,
+                    range_m=self.target_depth_band_filter_range_m,
+                    min_valid_pixels=self.target_depth_band_filter_min_valid_pixels,
+                    min_keep_pixels=self.target_depth_band_filter_min_keep_pixels,
+                )
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_depth_band_filter_time += time.perf_counter() - target_depth_band_t0
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             camera_backproject_t0 = time.perf_counter()
             sampled_depth = (
@@ -2353,9 +2753,45 @@ class SingleObjectPointCloudSegmenter:
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             camera_backproject_time = time.perf_counter() - camera_backproject_t0
             backproject_time += camera_backproject_time
+            target_plane_filter_summary: dict[str, object] = {
+                "enabled": bool(self.target_plane_filter_enabled),
+                "backend": "torch_cpu_ransac",
+                "distance_m": float(self.target_plane_filter_distance_m),
+                "min_points": int(self.target_plane_filter_min_points),
+                "min_inlier_ratio": float(self.target_plane_filter_min_inlier_ratio),
+                "max_inlier_ratio": float(self.target_plane_filter_max_inlier_ratio),
+                "max_planes": int(self.target_plane_filter_max_planes),
+                "ransac_iterations": int(self.target_plane_filter_ransac_iterations),
+                "target_points_before": int(torch.count_nonzero(point_labels > 0).item()),
+                "target_points_after": int(torch.count_nonzero(point_labels > 0).item()),
+                "removed_target_points": 0,
+                "plane_found": False,
+                "plane_applied": False,
+                "plane": None,
+                "plane_inliers": 0,
+                "plane_inlier_ratio": 0.0,
+                "planes": [],
+                "skipped_reason": None,
+            }
+            if self.target_plane_filter_enabled and int(points.shape[0]) > 0:
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_plane_t0 = time.perf_counter()
+                point_labels, target_plane_filter_summary = filter_target_labels_by_dominant_plane_torch(
+                    points,
+                    point_labels,
+                    enabled=True,
+                    distance_m=self.target_plane_filter_distance_m,
+                    min_points=self.target_plane_filter_min_points,
+                    min_inlier_ratio=self.target_plane_filter_min_inlier_ratio,
+                    max_inlier_ratio=self.target_plane_filter_max_inlier_ratio,
+                    max_planes=self.target_plane_filter_max_planes,
+                    ransac_iterations=self.target_plane_filter_ransac_iterations,
+                )
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+                target_plane_filter_time += time.perf_counter() - target_plane_t0
             camera_bookkeeping_t0 = time.perf_counter()
             target_pixels = int(torch.count_nonzero(mask_t).item())
-            target_pixels_for_3d = int(target_mask_erode_summary["target_pixels_after"])
+            target_pixels_for_3d = int(torch.count_nonzero(mask_3d_t).item())
             target_points_count = int(torch.count_nonzero(point_labels).item())
             target_object_summary: dict[str, object] | None = None
             if live_debug_root is not None:
@@ -2389,6 +2825,8 @@ class SingleObjectPointCloudSegmenter:
                 "num_target_points_backprojected": target_points_count,
                 "backproject_time_sec": camera_backproject_time,
                 "target_3d_mask_erode": target_mask_erode_summary,
+                "target_depth_band_filter": target_depth_band_summary,
+                "target_plane_filter": target_plane_filter_summary,
             }
             if target_object_summary is not None:
                 camera_summary["target_object_pointcloud"] = target_object_summary
@@ -2451,12 +2889,14 @@ class SingleObjectPointCloudSegmenter:
             colorize_t0 = time.perf_counter()
             vis_colors = raw_colors.copy()
             if vis_colors.shape[0] > 0:
-                vis_colors[labels > 0] = np.array([255, 70, 70], dtype=np.uint8)
+                vis_colors[labels > 0] = np.array(self.target_vis_color, dtype=np.uint8)
             colorize_time += time.perf_counter() - colorize_t0
         colorize_t0 = time.perf_counter()
         vis_colors_t = raw_colors_t.clone()
         if vis_colors_t.shape[0] > 0:
-            vis_colors_t[labels_t > 0] = torch.tensor([255, 70, 70], dtype=torch.uint8, device=self.tensor_device)
+            vis_colors_t[labels_t > 0] = torch.tensor(
+                self.target_vis_color, dtype=torch.uint8, device=self.tensor_device
+            )
         colorize_time += time.perf_counter() - colorize_t0
 
         save_t0 = time.perf_counter()
@@ -2533,6 +2973,8 @@ class SingleObjectPointCloudSegmenter:
                     "compose_inputs_time_sec": compose_inputs_time,
                     "mask_postprocess_time_sec": mask_postprocess_time,
                     "target_mask_erode_time_sec": target_mask_erode_time,
+                    "target_depth_band_filter_time_sec": target_depth_band_filter_time,
+                    "target_plane_filter_time_sec": target_plane_filter_time,
                     "camera_prepare_time_sec": camera_prepare_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
@@ -2554,7 +2996,7 @@ class SingleObjectPointCloudSegmenter:
             "semantic_colors": vis_colors_t,
             "label_names": [self.target_name],
             "label_values": [0, 1],
-            "palette": torch.tensor([[255, 70, 70]], dtype=torch.uint8, device=self.tensor_device),
+            "palette": torch.tensor([self.target_vis_color], dtype=torch.uint8, device=self.tensor_device),
             "camera_summaries": camera_summaries,
             "target_cluster_filter": target_cluster_summary,
             "meta": {
@@ -2592,6 +3034,17 @@ class SingleObjectPointCloudSegmenter:
             "target_cluster_radius_m": float(self.target_cluster_radius_m),
             "target_cluster_min_points": int(self.target_cluster_min_points),
             "target_cluster_keep_largest": bool(self.target_cluster_keep_largest),
+            "target_plane_filter_enabled": bool(self.target_plane_filter_enabled),
+            "target_plane_filter_distance_m": float(self.target_plane_filter_distance_m),
+            "target_plane_filter_min_points": int(self.target_plane_filter_min_points),
+            "target_plane_filter_min_inlier_ratio": float(self.target_plane_filter_min_inlier_ratio),
+            "target_plane_filter_max_inlier_ratio": float(self.target_plane_filter_max_inlier_ratio),
+            "target_plane_filter_max_planes": int(self.target_plane_filter_max_planes),
+            "target_plane_filter_ransac_iterations": int(self.target_plane_filter_ransac_iterations),
+            "target_depth_band_filter_enabled": bool(self.target_depth_band_filter_enabled),
+            "target_depth_band_filter_range_m": float(self.target_depth_band_filter_range_m),
+            "target_depth_band_filter_min_valid_pixels": int(self.target_depth_band_filter_min_valid_pixels),
+            "target_depth_band_filter_min_keep_pixels": int(self.target_depth_band_filter_min_keep_pixels),
             "target_3d_mask_erode_kernel": int(self.target_3d_mask_erode_kernel),
             "save_normal": bool(self.save_normal),
             "image_processor_load_time_sec": self.image_processor_load_time_sec,
@@ -2640,6 +3093,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-cluster-radius-m", type=float, default=0.03, help="目标点 3D 聚类邻域半径（米）")
     parser.add_argument("--target-cluster-min-points", type=int, default=30, help="形成有效目标簇所需的最少点数")
     parser.add_argument("--target-cluster-keep-largest", type=int, default=1, help="是否只保留最大目标簇")
+    parser.add_argument("--target-plane-filter-enabled", type=int, default=0, help="是否启用目标点主平面剔除")
+    parser.add_argument("--target-plane-filter-distance-m", type=float, default=0.004, help="目标主平面内点距离阈值（米）")
+    parser.add_argument("--target-plane-filter-min-points", type=int, default=80, help="目标主平面最少内点数")
+    parser.add_argument("--target-plane-filter-min-inlier-ratio", type=float, default=0.25, help="目标主平面最低内点比例")
+    parser.add_argument("--target-plane-filter-max-inlier-ratio", type=float, default=0.85, help="目标主平面最高内点比例")
+    parser.add_argument("--target-plane-filter-max-planes", type=int, default=1, help="单帧单相机最多剔除几个目标主平面")
+    parser.add_argument("--target-plane-filter-ransac-iterations", type=int, default=256, help="目标主平面 RANSAC 迭代次数")
+    parser.add_argument("--target-depth-band-filter-enabled", type=int, default=0, help="是否按目标核心深度带过滤 3D 取点 mask")
+    parser.add_argument("--target-depth-band-filter-range-m", type=float, default=0.015, help="目标核心深度带半径（米）")
+    parser.add_argument("--target-depth-band-filter-min-valid-pixels", type=int, default=50, help="估计目标核心深度所需最少有效像素")
+    parser.add_argument("--target-depth-band-filter-min-keep-pixels", type=int, default=20, help="深度带过滤后至少保留的像素数")
     parser.add_argument("--target-3d-mask-erode-kernel", type=int, default=0, help="反投影前仅用于 3D 取点的目标 mask 腐蚀核大小，0/1 表示关闭")
     parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2, help="保留提示掩码的评分阈值")
     parser.add_argument("--depth-scale", type=float, default=1000.0, help="深度图缩放比例")
@@ -2691,6 +3155,17 @@ def run_demo(args: argparse.Namespace) -> None:
         target_cluster_radius_m=float(args.target_cluster_radius_m),
         target_cluster_min_points=int(args.target_cluster_min_points),
         target_cluster_keep_largest=bool(args.target_cluster_keep_largest),
+        target_plane_filter_enabled=bool(args.target_plane_filter_enabled),
+        target_plane_filter_distance_m=float(args.target_plane_filter_distance_m),
+        target_plane_filter_min_points=int(args.target_plane_filter_min_points),
+        target_plane_filter_min_inlier_ratio=float(args.target_plane_filter_min_inlier_ratio),
+        target_plane_filter_max_inlier_ratio=float(args.target_plane_filter_max_inlier_ratio),
+        target_plane_filter_max_planes=int(args.target_plane_filter_max_planes),
+        target_plane_filter_ransac_iterations=int(args.target_plane_filter_ransac_iterations),
+        target_depth_band_filter_enabled=bool(args.target_depth_band_filter_enabled),
+        target_depth_band_filter_range_m=float(args.target_depth_band_filter_range_m),
+        target_depth_band_filter_min_valid_pixels=int(args.target_depth_band_filter_min_valid_pixels),
+        target_depth_band_filter_min_keep_pixels=int(args.target_depth_band_filter_min_keep_pixels),
         target_3d_mask_erode_kernel=int(args.target_3d_mask_erode_kernel),
         save_ply=bool(args.save_ply),
         save_normal=bool(args.save_normal),
