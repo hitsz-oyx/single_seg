@@ -743,3 +743,119 @@ DISPLAY=localhost:10.0 /home/oyx/miniconda3/envs/sam3/bin/python \
 - `A` 上一帧
 - `R` 重置视角
 - `Q` 关闭
+
+## 多相机外参微调（ICP 配准）
+
+基于 mesh 标定物体，对多相机外参做微调。算法由用户设计：
+
+1. **主相机配准** — 主相机的世界坐标点云配准到 mesh，得到 `T_MW` (world→mesh)
+2. **定义 mesh 位姿** — `T_MW` 定义了 mesh 在世界坐标系中的位姿
+3. **非主相机微调** — 对每个非主相机：
+   - `predicted_T_MC = T_MW @ original_cam2world` (camera→mesh 空间的初始值)
+   - 相机坐标点云 → ICP → mesh，以 `predicted_T_MC` 为初值做局部微调
+   - `new_cam2world = inv(T_MW) @ refined_T_MC`
+
+主相机配准支持两种后端，通过 `--use-goicp` 开关控制：
+
+| 后端 | 特点 | 用法 |
+|------|------|------|
+| **Open3D ICP（默认）** | 质心对齐为初值，局部迭代，调整量小（~3-5°） | 不加 `--use-goicp` |
+| **Go-ICP** | 全局搜索最优解，可能找到不同局部最优，调整量可能更大 | 加 `--use-goicp`，需 `pip install py_goicp` |
+
+### 核心文件
+
+| 文件 | 说明 |
+|------|------|
+| `icp/register_to_mesh.py` | 主脚本：配准+微调，输出 `refined_extrinsics.json` |
+| `icp/goicp.py` | Go-ICP 后端的可复用接口（可选依赖） |
+| `icp/Register.STL` | 标定物体的 mesh 文件 |
+| `icp/config.yaml` | 配准参数配置文件，含详细注释 |
+
+### 用法
+
+**自动检测模式**（推荐 —— 给数据目录，自动寻找点云和外参）：
+
+```bash
+python icp/register_to_mesh.py \
+  --data-dir tests/outputs/realsense_live_register_hand_three_cam_fast \
+  --mesh icp/Register.STL \
+  --master-camera cam_00
+```
+
+**使用 Go-ICP 全局配准**：
+
+```bash
+python icp/register_to_mesh.py \
+  --data-dir tests/outputs/realsense_live_register_hand_three_cam_fast \
+  --mesh icp/Register.STL \
+  --master-camera cam_00 \
+  --use-goicp
+```
+
+**显式模式**（手动指定外参 JSON 和各相机点云 PLY）：
+
+```bash
+python icp/register_to_mesh.py \
+  --mesh icp/Register.STL \
+  --extrinsics path/to/extrinsics.json \
+  --point-cloud cam_00=/path/to/cam00.ply cam_01=/path/to/cam01.ply \
+  --master-camera cam_00 \
+  --output path/to/refined_extrinsics.json
+```
+
+**覆盖配准参数**：
+
+```bash
+python icp/register_to_mesh.py \
+  --data-dir tests/outputs/realsense_live_register_hand_three_cam_fast \
+  --mesh icp/Register.STL \
+  --master-camera cam_00 \
+  --voxel-size 0.005 \
+  --master-icp-dist 0.08 \
+  --refine-icp-dist 0.002
+```
+
+### 输出
+
+输出 `refined_extrinsics.json`，包含每个相机的：
+
+- `original_cam2world_4x4`：原始外参
+- `refined_cam2world_4x4`：微调后的外参
+- `adjustment_rotation_deg` / `adjustment_translation_m`：相对原始外参的调整量
+- `icp_fitness` / `icp_inlier_rmse`：点云重叠质量指标
+- `verify_vs_master_fitness` / `verify_vs_master_rmse`：微调后与主相机点云的重叠验证
+
+输出目录结构：
+
+- 外参 JSON → `configs/refined_extrinsics.json`
+- 场景点云（`--save-fused 1` 时）→ `tests/outputs/{data_dir}_refined/fused/`
+
+```text
+configs/
+└── refined_extrinsics.json      # 微调后的外参
+
+tests/outputs/{data_dir}_refined/
+└── fused/                        # --save-fused 时生成
+    ├── original_fused.ply        # 原始外参融合场景点云
+    ├── refined_fused.ply         # 新外参融合场景点云
+    └── comparison_colored.ply    # 着色对比（蓝=新外参 橙=原始外参）
+```
+
+### 参数速查
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--mesh` | — | 标定物体 .stl 文件 **（必填）** |
+| `--master-camera` | `cam_00` | 主相机 ID |
+| `--camera-ids` | `cam_00 cam_01 cam_02` | 所有相机 ID 列表 |
+| `--output` | `configs/refined_extrinsics.json` | 输出 JSON 路径 |
+| `--data-dir` | — | [自动检测] 数据目录 |
+| `--extrinsics` | — | [显式] 原始外参 JSON |
+| `--point-cloud` | — | [显式] 点云文件列表 |
+| `--use-goicp` | `false` | Go-ICP 全局配准开关 |
+| `--voxel-size` | `0.003` | 体素下采样大小（米） |
+| `--master-icp-dist` | `0.05` | 主相机配准最大对应距离（米） |
+| `--refine-icp-dist` | `0.003` | 非主相机微调最大对应距离（米） |
+| `--num-mesh-points` | `100000` | mesh 采样点数 |
+| `--visualize` | `0` | 显示 Open3D 可视化窗口 |
+| `--save-fused` | `0` | 保存融合场景点云（.ply）用于对比 |

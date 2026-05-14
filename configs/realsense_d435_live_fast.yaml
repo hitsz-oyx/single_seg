@@ -65,15 +65,15 @@ segmenter:
   # 是否启用目标点 3D 聚类去散点
   # true: 在最终 3D 分割结果里过滤由深度估计噪声造成的零散目标点
   # false: 保留所有被 2D mask 标成目标的 3D 点
-  target_cluster_filter_enabled: true
+  target_cluster_filter_enabled: false
 
   # 3D 聚类邻域半径 (米)
   # 半径越大，距离较远的目标点越容易连成同一簇；过大可能把背景误连进目标
-  target_cluster_radius_m: 0.025
+  target_cluster_radius_m: 0.013
 
   # 形成有效目标簇所需的最少点数
   # 小于该数量的孤立小簇会被视为散点
-  target_cluster_min_points: 35
+  target_cluster_min_points: 45
 
   # 是否只保留最大目标簇
   # 单物体任务建议 true；如果目标本身会被深度切成多个独立部分，可以设为 false
@@ -105,10 +105,10 @@ segmenter:
 
   # 是否按目标核心深度带过滤 3D 取点 mask
   # true: 只保留目标 mask 中距离有效深度中位数较近的像素，宁可点少也减少桌面/背景误点
-  target_depth_band_filter_enabled: true
+  target_depth_band_filter_enabled: false
 
   # 目标核心深度带半径 (米)，越小越严格；红杯这类小物体可从 0.012-0.015 试起
-  target_depth_band_filter_range_m: 0.08
+  target_depth_band_filter_range_m: 0.015
 
   # 估计深度中位数所需的最少有效像素，低于该值时跳过过滤
   target_depth_band_filter_min_valid_pixels: 50
@@ -135,6 +135,11 @@ segmenter:
   # 值越大精度越高，但速度越慢
   # 推荐: 640, 896, 1024
   tracker_image_size: 896
+
+  # 目标点云高亮颜色 R,G,B
+  # 默认 null = 红色 (255,70,70)
+  # 例如 [30, 60, 180] 为深蓝
+  target_vis_color: [30, 60, 180]
 
 # =============================================================================
 # RealSense 相机配置
