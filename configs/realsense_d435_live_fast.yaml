@@ -20,7 +20,7 @@ segmenter:
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live_redcup_three_cam_fast
+  output_dir: tests/outputs/realsense_live_redcup_three_cam_fast_icp
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -69,11 +69,11 @@ segmenter:
 
   # 3D 聚类邻域半径 (米)
   # 半径越大，距离较远的目标点越容易连成同一簇；过大可能把背景误连进目标
-  target_cluster_radius_m: 0.013
+  target_cluster_radius_m: 0.025
 
   # 形成有效目标簇所需的最少点数
   # 小于该数量的孤立小簇会被视为散点
-  target_cluster_min_points: 45
+  target_cluster_min_points: 35
 
   # 是否只保留最大目标簇
   # 单物体任务建议 true；如果目标本身会被深度切成多个独立部分，可以设为 false
@@ -105,16 +105,16 @@ segmenter:
 
   # 是否按目标核心深度带过滤 3D 取点 mask
   # true: 只保留目标 mask 中距离有效深度中位数较近的像素，宁可点少也减少桌面/背景误点
-  target_depth_band_filter_enabled: false
+  target_depth_band_filter_enabled: true
 
   # 目标核心深度带半径 (米)，越小越严格；红杯这类小物体可从 0.012-0.015 试起
-  target_depth_band_filter_range_m: 0.015
+  target_depth_band_filter_range_m: 0.070
 
   # 估计深度中位数所需的最少有效像素，低于该值时跳过过滤
   target_depth_band_filter_min_valid_pixels: 50
 
   # 过滤后至少保留的像素数，低于该值时跳过过滤，避免整目标被删空
-  target_depth_band_filter_min_keep_pixels: 20
+  target_depth_band_filter_min_keep_pixels: 30
 
   # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
   # 0/1: 关闭；3/5: 去掉 mask 边界处容易混入背景或深度断层的像素
@@ -157,7 +157,7 @@ realsense:
   camera_poses_json: null
 
   # 最大处理帧数，0 表示无限制
-  max_frames: 5
+  max_frames: 2
 
   # 相机预热帧数，启动后等待 N 帧稳定
   camera_warmup_frames: 5

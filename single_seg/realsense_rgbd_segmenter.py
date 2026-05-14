@@ -1251,6 +1251,8 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--prompt-keep-score-threshold", type=float, default=0.2)
     parser.add_argument("--video-mask-prob-threshold", type=float, default=0.95)
     parser.add_argument("--tracker-image-size", type=int, default=896)
+    parser.add_argument("--target-vis-color", type=int, nargs=3, default=None, metavar=("R", "G", "B"),
+                        help="目标点云高亮颜色 R G B，例如 30 60 180 为深蓝")
     parser.add_argument("--camera-count", type=int, default=1)
     parser.add_argument("--camera-serials", type=str, default=None)
     parser.add_argument("--camera-poses-json", type=Path, default=None)
@@ -1529,6 +1531,7 @@ def run_live(args: argparse.Namespace) -> None:
             save_normal=bool(args.save_normal),
             save_debug_2d=bool(args.save_debug_2d),
             tracker_image_size=int(args.tracker_image_size),
+            target_vis_color=args.target_vis_color,
         ) as segmenter:
             logging.info("SingleObjectPointCloudSegmenter loaded")
             if bool(args.save_live_debug):
