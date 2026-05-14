@@ -2932,10 +2932,25 @@ class SingleObjectPointCloudSegmenter:
                     labels,
                     normals,
                 )
+                target_mask = labels > 0
+                if np.any(target_mask):
+                    write_ply_with_normals(
+                        self.frame_output_dir / f"{frame_stem}_target_only.ply",
+                        points_xyz[target_mask],
+                        vis_colors[target_mask],
+                        normals[target_mask],
+                    )
             else:
                 write_ply(self.frame_output_dir / f"{frame_stem}_scene_rgb.ply", points_xyz, raw_colors)
                 write_ply(self.frame_output_dir / f"{frame_stem}_instance_rgb.ply", points_xyz, vis_colors)
                 write_label_ply(self.frame_output_dir / f"{frame_stem}_instance_label.ply", points_xyz, labels)
+                target_mask = labels > 0
+                if np.any(target_mask):
+                    write_ply(
+                        self.frame_output_dir / f"{frame_stem}_target_only.ply",
+                        points_xyz[target_mask],
+                        vis_colors[target_mask],
+                    )
             meta = {
                 "frame_name": frame_name,
                 "target_name": self.target_name,

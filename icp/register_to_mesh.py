@@ -190,6 +190,19 @@ def transform_world_to_camera(points_world: np.ndarray, cam2world: np.ndarray) -
     return points_world @ world2cam[:3, :3].T + world2cam[:3, 3][None, :]
 
 
+def gl_to_opencv_cam2world(gl_cam2world: np.ndarray) -> np.ndarray:
+    """将 single_seg GL 约定的 cam2world 转为 OpenCV 约定。
+
+    GL: Y-up, 相机看向 -Z
+    OpenCV: Y-down, 相机看向 +Z
+    转换: 旋转矩阵的第2、3列取反, 平移不变
+    """
+    cv = gl_cam2world.copy()
+    cv[:3, 1] *= -1.0
+    cv[:3, 2] *= -1.0
+    return cv
+
+
 def compute_angle(T: np.ndarray) -> float:
     trace = np.trace(T[:3, :3])
     return float(np.rad2deg(np.arccos(np.clip((trace - 1) / 2, -1, 1))))
@@ -223,12 +236,13 @@ def merge_point_clouds(
 # ──────────────────────────────────────────────
 
 
-def auto_discover(data_dir: Path, camera_ids: list[str]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """自动从 data_dir/live_rgbd_debug/frame_*/cam_id/ 加载点云和外参。
+def auto_discover(data_dir: Path, camera_ids: list[str]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict]:
+    """自动从 data_dir/live_rgbd_debug/frame_*/cam_id/ 加载点云、外参和相机信息。
 
-    返回: (world_clouds, extrinsics)
+    返回: (world_clouds, extrinsics, camera_info)
       world_clouds[cam_id] = (N, 3) 世界坐标点云
       extrinsics[cam_id]   = (4, 4) cam2world
+      camera_info[cam_id]  = {"serial_number": str, "color_intrinsics": dict}
     """
     live_debug_dir = data_dir / "live_rgbd_debug"
     frame_dirs = sorted(live_debug_dir.glob("frame_*"))
@@ -237,19 +251,18 @@ def auto_discover(data_dir: Path, camera_ids: list[str]) -> tuple[dict[str, np.n
 
     world_clouds: dict[str, np.ndarray] = {}
     extrinsics: dict[str, np.ndarray] = {}
+    camera_info: dict = {}
     for cam_id in camera_ids:
         pts_list: list[np.ndarray] = []
-        cols_list: list[np.ndarray] = []
         frame_count = 0
         for frame_dir in frame_dirs:
             ply_path = frame_dir / cam_id / "target_object_rgb.ply"
             if not ply_path.is_file():
                 continue
-            pts, cols = read_ply(ply_path)
+            pts, _ = read_ply(ply_path)
             if pts.shape[0] == 0:
                 continue
             pts_list.append(pts)
-            cols_list.append(cols)
             frame_count += 1
 
         if not pts_list:
@@ -261,18 +274,31 @@ def auto_discover(data_dir: Path, camera_ids: list[str]) -> tuple[dict[str, np.n
         world_clouds[cam_id] = np.concatenate(pts_list, axis=0)
         print(f"  [{cam_id}] {world_clouds[cam_id].shape[0]} 点, {frame_count} 帧")
 
-    # 从第一帧加载外参（所有相机都有数据的第一帧）
+    # 从第一帧加载外参和相机信息（所有相机都有数据的第一帧）
     for frame_dir in frame_dirs:
-        partial = load_extrinsics_from_payload(frame_dir, camera_ids)
-        if len(partial) == len(camera_ids):
-            extrinsics = partial
+        partial_ext = {}
+        partial_info = {}
+        for cam_id in camera_ids:
+            payload_path = frame_dir / cam_id / "camera_payload.json"
+            if not payload_path.is_file():
+                continue
+            with open(payload_path) as f:
+                payload = json.load(f)
+            partial_ext[cam_id] = np.array(payload["pose_record"]["cam2world_4x4"], dtype=np.float64)
+            partial_info[cam_id] = {
+                "serial_number": str(payload.get("serial_number", cam_id)),
+                "color_intrinsics": dict(payload.get("color_intrinsics", {})),
+            }
+        if len(partial_ext) == len(camera_ids):
+            extrinsics = partial_ext
+            camera_info = partial_info
             for cam_id in camera_ids:
-                print(f"  [{cam_id}] 外参: {frame_dir / cam_id / 'camera_payload.json'}")
+                print(f"  [{cam_id}] 外参+序列号: {frame_dir / cam_id / 'camera_payload.json'}")
             break
     else:
         raise FileNotFoundError(f"无法找到所有相机的外参")
 
-    return world_clouds, extrinsics
+    return world_clouds, extrinsics, camera_info
 
 
 # ──────────────────────────────────────────────
@@ -626,38 +652,41 @@ def save_results(
     camera_ids: list[str],
     extrinsics: dict[str, np.ndarray],
     adj_results: dict,
-    t_elapsed: float,
+    camera_info: dict | None = None,
+    t_elapsed: float = 0.0,
 ) -> None:
-    """保存 refined_extrinsics.json。"""
-    refined_data = {
-        "master_camera": master_camera,
-        "method": "camera_to_mesh_icp_with_master_prior",
-        "description": "主相机(Go-ICP)配准定义mesh位姿T_MW; 非主相机(camera→mesh Open3D ICP)以predicted_T_MC为初值做局部微调",
-    }
+    """保存为 camera_poses_apriltag.json 格式，与其他脚本兼容。"""
+    cameras_list = []
     for cam_id in camera_ids:
         cam2world_orig = extrinsics[cam_id]
-        entry = {
-            "original_cam2world_4x4": cam2world_orig.tolist(),
-        }
+
         if cam_id == master_camera:
-            entry["refined_cam2world_4x4"] = cam2world_orig.tolist()
-            entry["is_master"] = True
+            refined_c2w = cam2world_orig.copy()
         elif cam_id in adj_results:
-            adj = adj_results[cam_id]
-            entry["refined_cam2world_4x4"] = adj["new_cam2world"]
-            entry["is_master"] = False
-            entry["adjustment_4x4"] = adj["adjustment_4x4"]
-            entry["adjustment_rotation_deg"] = adj["adjustment_rotation_deg"]
-            entry["adjustment_translation_m"] = adj["adjustment_translation_m"]
-            entry["icp_fitness"] = adj["icp_fitness"]
-            entry["icp_inlier_rmse"] = adj["icp_inlier_rmse"]
-            entry["verify_vs_master_fitness"] = adj.get("verify_vs_master_fitness")
-            entry["verify_vs_master_rmse"] = adj.get("verify_vs_master_rmse")
-        refined_data[cam_id] = entry
+            refined_c2w = np.array(adj_results[cam_id]["new_cam2world"], dtype=np.float64)
+        else:
+            refined_c2w = cam2world_orig.copy()
+
+        world2refined = np.linalg.inv(refined_c2w)
+        opencv_c2w = gl_to_opencv_cam2world(refined_c2w)
+
+        info = (camera_info or {}).get(cam_id, {})
+        cam_entry = {
+            "camera_id": cam_id,
+            "serial_number": str(info.get("serial_number", cam_id)),
+            "cam2world_4x4": refined_c2w.tolist(),
+            "world2cam_4x4": world2refined.tolist(),
+            "opencv_cv_cam2world_4x4": opencv_c2w.tolist(),
+            "single_seg_gl_cam2world_4x4": refined_c2w.tolist(),
+            "color_intrinsics": info.get("color_intrinsics", {}),
+        }
+        cameras_list.append(cam_entry)
+
+    output_data = {"cameras": cameras_list}
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
-        json.dump(refined_data, f, indent=2, ensure_ascii=False)
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
     print(f"  优化外参: {output_path}")
 
     print()
@@ -806,12 +835,13 @@ def main() -> None:
         print("  模式: 自动检测")
         data_dir = Path(args.data_dir).expanduser().resolve()
         print(f"  数据目录: {data_dir}")
-        world_clouds, extrinsics = auto_discover(data_dir, camera_ids)
+        world_clouds, extrinsics, camera_info = auto_discover(data_dir, camera_ids)
     else:
         print("  模式: 显式传入")
         extrinsics_path = Path(args.extrinsics).expanduser().resolve()
         print(f"  外参: {extrinsics_path}")
         world_clouds, extrinsics = load_explicit(extrinsics_path, args.point_cloud, camera_ids)
+        camera_info = {}
     print()
 
     # ════════════════════════════════════════════
@@ -833,7 +863,8 @@ def main() -> None:
     # 4. 保存结果
     # ════════════════════════════════════════════
     elapsed = time.perf_counter() - t0
-    save_results(output_path, master_camera, camera_ids, extrinsics, adj_results, elapsed)
+    save_results(output_path, master_camera, camera_ids, extrinsics, adj_results,
+                 camera_info=camera_info, t_elapsed=elapsed)
 
     # ════════════════════════════════════════════
     # 5. 保存融合场景点云（可选）
