@@ -35,6 +35,7 @@ FAST_STEREO_DEFAULT_MODEL = (
 DEPTH_SOURCE_CHOICES = ("fast", "native")
 STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
 DEPTH_EDGE_FILTER_STAGE_CHOICES = ("rectified", "aligned")
+FAST_ALIGN_BACKEND_CHOICES = ("torch", "librealsense")
 _RECTIFIED_RAY_GRID_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 if str(FAST_STEREO_ROOT) not in sys.path:
@@ -130,6 +131,24 @@ def intrinsics_to_payload(intr: rs.intrinsics) -> dict[str, float]:
     }
 
 
+def intrinsics_payload_to_rs_intrinsics(
+    intrinsics: dict[str, float],
+    *,
+    width: int,
+    height: int,
+) -> rs.intrinsics:
+    intr = rs.intrinsics()
+    intr.width = int(width)
+    intr.height = int(height)
+    intr.fx = float(intrinsics["fx"])
+    intr.fy = float(intrinsics["fy"])
+    intr.ppx = float(intrinsics["cx"])
+    intr.ppy = float(intrinsics["cy"])
+    intr.model = rs.distortion.none
+    intr.coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
+    return intr
+
+
 def intrinsics_to_distortion(intr: rs.intrinsics) -> np.ndarray:
     coeffs = np.array(intr.coeffs[:5], dtype=np.float64)
     if intr.model in DISTORTION_TO_OPENCV:
@@ -144,6 +163,17 @@ def extrinsics_to_matrix(extr: rs.extrinsics) -> np.ndarray:
     mat[:3, :3] = np.asarray(extr.rotation, dtype=np.float64).reshape(3, 3)
     mat[:3, 3] = np.asarray(extr.translation, dtype=np.float64)
     return mat
+
+
+def matrix_to_rs_extrinsics(mat: np.ndarray | torch.Tensor) -> rs.extrinsics:
+    if torch.is_tensor(mat):
+        matrix = mat.detach().cpu().numpy().astype(np.float32, copy=False)
+    else:
+        matrix = np.asarray(mat, dtype=np.float32)
+    extr = rs.extrinsics()
+    extr.rotation = matrix[:3, :3].T.reshape(-1).tolist()
+    extr.translation = matrix[:3, 3].tolist()
+    return extr
 
 
 def latest_frames(pipeline: rs.pipeline, timeout_ms: int) -> rs.composite_frame:
@@ -210,6 +240,13 @@ def normalize_depth_edge_filter_stage(stage: object) -> str:
     normalized = str(stage).strip().lower()
     if normalized not in DEPTH_EDGE_FILTER_STAGE_CHOICES:
         raise ValueError(f"depth_edge_filter_stage must be one of {DEPTH_EDGE_FILTER_STAGE_CHOICES}, got {stage!r}")
+    return normalized
+
+
+def normalize_fast_align_backend(backend: object) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in FAST_ALIGN_BACKEND_CHOICES:
+        raise ValueError(f"fast_align_backend must be one of {FAST_ALIGN_BACKEND_CHOICES}, got {backend!r}")
     return normalized
 
 
@@ -467,6 +504,157 @@ def align_rectified_depth_to_color_torch(
     return depth_out.reshape(out_height, out_width)
 
 
+class LibrealsenseSoftwareAligner:
+    """Depth-to-color aligner using librealsense software frames."""
+
+    def __init__(
+        self,
+        *,
+        rectified_intrinsics: dict[str, float],
+        rectified_to_color: np.ndarray | torch.Tensor,
+        color_intrinsics: dict[str, float],
+        depth_shape: tuple[int, int],
+        color_shape: tuple[int, int],
+        depth_units: float = 0.0001,
+        fps: int = 30,
+    ) -> None:
+        self.depth_units = float(depth_units)
+        self.depth_height, self.depth_width = (int(depth_shape[0]), int(depth_shape[1]))
+        self.color_height, self.color_width = (int(color_shape[0]), int(color_shape[1]))
+        self.frame_number = 0
+        self._pixel_refs: list[np.ndarray] = []
+
+        self.device = rs.software_device()
+        self.depth_sensor = self.device.add_sensor("Depth")
+        self.color_sensor = self.device.add_sensor("Color")
+
+        option_range = rs.option_range()
+        option_range.min = 0.00001
+        option_range.max = 0.1
+        option_range.step = 0.00001
+        option_range.default = self.depth_units
+        self.depth_sensor.add_option(rs.option.depth_units, option_range, False)
+
+        depth_intrinsics = intrinsics_payload_to_rs_intrinsics(
+            rectified_intrinsics,
+            width=self.depth_width,
+            height=self.depth_height,
+        )
+        depth_stream = rs.video_stream()
+        depth_stream.type = rs.stream.depth
+        depth_stream.width = self.depth_width
+        depth_stream.height = self.depth_height
+        depth_stream.fps = int(fps)
+        depth_stream.bpp = 2
+        depth_stream.fmt = rs.format.z16
+        depth_stream.intrinsics = depth_intrinsics
+        depth_stream.index = 0
+        depth_stream.uid = 1
+        self.depth_profile = self.depth_sensor.add_video_stream(depth_stream)
+
+        color_intrinsics_rs = intrinsics_payload_to_rs_intrinsics(
+            color_intrinsics,
+            width=self.color_width,
+            height=self.color_height,
+        )
+        color_stream = rs.video_stream()
+        color_stream.type = rs.stream.color
+        color_stream.width = self.color_width
+        color_stream.height = self.color_height
+        color_stream.fps = int(fps)
+        color_stream.bpp = 3
+        color_stream.fmt = rs.format.rgb8
+        color_stream.intrinsics = color_intrinsics_rs
+        color_stream.index = 0
+        color_stream.uid = 2
+        self.color_profile = self.color_sensor.add_video_stream(color_stream)
+
+        depth_to_color = matrix_to_rs_extrinsics(rectified_to_color)
+        self.depth_profile.register_extrinsics_to(self.color_profile, depth_to_color)
+
+        self.syncer = rs.syncer()
+        self.depth_sensor.open(self.depth_profile)
+        self.color_sensor.open(self.color_profile)
+        self.depth_sensor.start(self.syncer)
+        self.color_sensor.start(self.syncer)
+        self.rs_align = rs.align(rs.stream.color)
+        self._prime_syncer()
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.depth_sensor.stop()
+        with contextlib.suppress(Exception):
+            self.color_sensor.stop()
+        with contextlib.suppress(Exception):
+            self.depth_sensor.close()
+        with contextlib.suppress(Exception):
+            self.color_sensor.close()
+
+    def _depth_to_z16(self, depth_m: np.ndarray) -> np.ndarray:
+        depth = np.asarray(depth_m, dtype=np.float32)
+        valid = np.isfinite(depth) & (depth > 0.0)
+        z16 = np.zeros(depth.shape, dtype=np.uint16)
+        scaled = np.rint(depth[valid] / self.depth_units)
+        z16[valid] = np.clip(scaled, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+        return np.ascontiguousarray(z16)
+
+    def _push_frames(self, depth_z16: np.ndarray, color_rgb: np.ndarray) -> None:
+        frame_number = int(self.frame_number)
+        self.frame_number += 1
+        timestamp_ms = frame_number * (1000.0 / 30.0)
+        depth_pixels = np.ascontiguousarray(depth_z16)
+        color_pixels = np.ascontiguousarray(color_rgb)
+        self._pixel_refs.extend([depth_pixels, color_pixels])
+        if len(self._pixel_refs) > 12:
+            del self._pixel_refs[:-12]
+
+        depth_frame = rs.software_video_frame()
+        depth_frame.stride = self.depth_width * 2
+        depth_frame.bpp = 2
+        depth_frame.timestamp = timestamp_ms
+        depth_frame.pixels = depth_pixels
+        depth_frame.domain = rs.timestamp_domain.hardware_clock
+        depth_frame.frame_number = frame_number
+        depth_frame.profile = self.depth_profile.as_video_stream_profile()
+        depth_frame.depth_units = self.depth_units
+        self.depth_sensor.on_video_frame(depth_frame)
+
+        color_frame = rs.software_video_frame()
+        color_frame.stride = self.color_width * 3
+        color_frame.bpp = 3
+        color_frame.timestamp = timestamp_ms
+        color_frame.pixels = color_pixels
+        color_frame.domain = rs.timestamp_domain.hardware_clock
+        color_frame.frame_number = frame_number
+        color_frame.profile = self.color_profile.as_video_stream_profile()
+        self.color_sensor.on_video_frame(color_frame)
+
+    def _wait_for_frameset(self, timeout_ms: int = 1000) -> rs.composite_frame:
+        for _ in range(4):
+            frames = self.syncer.wait_for_frames(timeout_ms)
+            if frames.get_depth_frame() and frames.get_color_frame():
+                return frames
+        raise RuntimeError("librealsense software aligner did not receive a synchronized depth/color frameset")
+
+    def _prime_syncer(self) -> None:
+        depth = np.zeros((self.depth_height, self.depth_width), dtype=np.uint16)
+        color = np.zeros((self.color_height, self.color_width, 3), dtype=np.uint8)
+        self._push_frames(depth, color)
+        with contextlib.suppress(Exception):
+            self.syncer.wait_for_frames(100)
+
+    def align(self, depth_m: np.ndarray, color_rgb: np.ndarray) -> np.ndarray:
+        depth_z16 = self._depth_to_z16(depth_m)
+        self._push_frames(depth_z16, color_rgb)
+        frames = self._wait_for_frameset()
+        aligned_frames = self.rs_align.process(frames)
+        aligned_depth = aligned_frames.get_depth_frame()
+        if not aligned_depth:
+            raise RuntimeError("librealsense align did not produce an aligned depth frame")
+        aligned_z16 = np.asanyarray(aligned_depth.get_data()).astype(np.float32, copy=False)
+        return aligned_z16 * self.depth_units
+
+
 def filter_depth_edges_torch(depth_m: torch.Tensor, *, threshold_m: float) -> torch.Tensor:
     """Remove depth pixels around strong local depth jumps with a Sobel filter."""
     threshold = float(threshold_m)
@@ -543,6 +731,7 @@ def build_live_debug_camera_payload(
         debug_payload.update(
             {
                 "stereo_rectification_mode": str(payload.get("stereo_rectification_mode", "opencv")),
+                "fast_align_backend": str(payload.get("fast_align_backend", "torch")),
                 "ir_left_raw_file": "ir_left_raw.png",
                 "ir_right_raw_file": "ir_right_raw.png",
                 "ir_left_rect_file": "ir_left_rect.png",
@@ -648,6 +837,7 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "depth_edge_filter_enabled": bool(args.fast_depth_edge_filter_enabled),
         "depth_edge_filter_threshold_m": float(args.fast_depth_edge_filter_threshold_m),
         "depth_edge_filter_stage": normalize_depth_edge_filter_stage(args.fast_depth_edge_filter_stage),
+        "align_backend": normalize_fast_align_backend(args.fast_align_backend),
         "hiera": bool(args.fast_hiera),
         "optimize_build_volume": str(args.fast_optimize_build_volume),
     }
@@ -1258,6 +1448,10 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             "depth_edge_filter_stage",
             fast_cfg.get("fast_depth_edge_filter_stage"),
         ),
+        "fast_align_backend": fast_cfg.get(
+            "align_backend",
+            fast_cfg.get("fast_align_backend"),
+        ),
         "fast_hiera": fast_cfg.get("hiera", fast_cfg.get("fast_hiera")),
         "fast_optimize_build_volume": fast_cfg.get(
             "optimize_build_volume",
@@ -1271,6 +1465,8 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults[key] = resolve_repo_path(value)
         elif key == "fast_depth_edge_filter_stage":
             defaults[key] = normalize_depth_edge_filter_stage(value)
+        elif key == "fast_align_backend":
+            defaults[key] = normalize_fast_align_backend(value)
         elif key in {"fast_remove_invisible", "fast_hiera", "fast_depth_edge_filter_enabled"}:
             defaults[key] = int(bool(value))
         else:
@@ -1352,6 +1548,7 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--fast-depth-edge-filter-enabled", type=int, default=0)
     parser.add_argument("--fast-depth-edge-filter-threshold-m", type=float, default=0.5)
     parser.add_argument("--fast-depth-edge-filter-stage", choices=DEPTH_EDGE_FILTER_STAGE_CHOICES, default="rectified")
+    parser.add_argument("--fast-align-backend", choices=FAST_ALIGN_BACKEND_CHOICES, default="torch")
     parser.add_argument("--fast-hiera", type=int, default=0)
     parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     parser.add_argument("--save-live-debug", type=int, default=1)
@@ -1388,15 +1585,20 @@ def build_camera_inputs_from_live_frames(
     write_debug_images: bool,
     sync_timing: bool = False,
     timing: dict[str, object] | None = None,
+    fast_align_backend: str = "torch",
+    fast_aligners: dict[str, LibrealsenseSoftwareAligner] | None = None,
 ) -> dict[str, dict[str, object]]:
     total_t0 = time.perf_counter()
     camera_inputs: dict[str, dict[str, object]] = {}
     per_camera_timing: list[dict[str, object]] = []
     stereo_infer_total = 0.0
     depth_align_total = 0.0
+    depth_to_cpu_total = 0.0
+    librealsense_align_total = 0.0
     depth_filter_total = 0.0
     debug_write_total = 0.0
     edge_filter_stage = normalize_depth_edge_filter_stage(fast_depth_edge_filter_stage)
+    align_backend = normalize_fast_align_backend(fast_align_backend)
     for payload in captured_frames:
         camera_t0 = time.perf_counter()
         camera_id = str(payload["camera_id"])
@@ -1409,6 +1611,8 @@ def build_camera_inputs_from_live_frames(
         stereo_time_sec = 0.0
         rectified_edge_filter_time_sec = 0.0
         depth_align_time_sec = 0.0
+        depth_to_cpu_time_sec = 0.0
+        librealsense_align_time_sec = 0.0
         depth_range_filter_time_sec = 0.0
         aligned_edge_filter_time_sec = 0.0
         depth_valid_ratio_time_sec = 0.0
@@ -1457,17 +1661,40 @@ def build_camera_inputs_from_live_frames(
                     "valid_pixels_after": valid_after,
                     "removed_pixels": int(max(valid_before - valid_after, 0)),
                 }
-            sync_cuda_if_needed(sync_timing)
-            align_t0 = time.perf_counter()
-            depth_aligned_m = align_rectified_depth_to_color_torch(
-                rectified_depth_m,
-                rectified_intrinsics=stereo_output["rectified_intrinsics"],
-                rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
-                color_intrinsics=dict(payload["color_intrinsics"]),
-                color_shape=rgb.shape[:2],
-            )
-            sync_cuda_if_needed(sync_timing)
-            depth_align_time_sec = time.perf_counter() - align_t0
+            if align_backend == "librealsense":
+                if fast_aligners is None:
+                    raise RuntimeError("fast_align_backend='librealsense' requires a fast_aligners cache")
+                sync_cuda_if_needed(sync_timing)
+                align_total_t0 = time.perf_counter()
+                cpu_t0 = time.perf_counter()
+                rectified_depth_np = rectified_depth_m.detach().cpu().numpy().astype(np.float32, copy=False)
+                depth_to_cpu_time_sec = time.perf_counter() - cpu_t0
+                aligner = fast_aligners.get(camera_id)
+                if aligner is None:
+                    aligner = LibrealsenseSoftwareAligner(
+                        rectified_intrinsics=dict(stereo_output["rectified_intrinsics"]),
+                        rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                        color_intrinsics=dict(payload["color_intrinsics"]),
+                        depth_shape=rectified_depth_np.shape,
+                        color_shape=rgb.shape[:2],
+                    )
+                    fast_aligners[camera_id] = aligner
+                librealsense_t0 = time.perf_counter()
+                depth_aligned_m = aligner.align(rectified_depth_np, rgb)
+                librealsense_align_time_sec = time.perf_counter() - librealsense_t0
+                depth_align_time_sec = time.perf_counter() - align_total_t0
+            else:
+                sync_cuda_if_needed(sync_timing)
+                align_t0 = time.perf_counter()
+                depth_aligned_m = align_rectified_depth_to_color_torch(
+                    rectified_depth_m,
+                    rectified_intrinsics=stereo_output["rectified_intrinsics"],
+                    rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                    color_intrinsics=dict(payload["color_intrinsics"]),
+                    color_shape=rgb.shape[:2],
+                )
+                sync_cuda_if_needed(sync_timing)
+                depth_align_time_sec = time.perf_counter() - align_t0
         if torch.is_tensor(depth_aligned_m):
             sync_cuda_if_needed(sync_timing)
             range_t0 = time.perf_counter()
@@ -1541,12 +1768,13 @@ def build_camera_inputs_from_live_frames(
         }
         if depth_source == "fast":
             camera_inputs[camera_id]["stereo_time_sec"] = stereo_time_sec
+            camera_inputs[camera_id]["fast_align_backend"] = align_backend
         if edge_filter_summary is not None:
             camera_inputs[camera_id]["fast_depth_edge_filter"] = edge_filter_summary
         if write_debug_images:
             debug_t0 = time.perf_counter()
             camera_payload = build_live_debug_camera_payload(
-                payload=payload,
+                payload={**payload, "fast_align_backend": align_backend},
                 depth_source=depth_source,
                 depth_min=float(depth_min),
                 depth_max=float(depth_max),
@@ -1571,9 +1799,12 @@ def build_camera_inputs_from_live_frames(
             "camera_id": camera_id,
             "depth_source": depth_source,
             "total_time_sec": time.perf_counter() - camera_t0,
+            "depth_align_backend": align_backend if depth_source == "fast" else "native",
             "stereo_infer_time_sec": stereo_time_sec,
             "rectified_edge_filter_time_sec": rectified_edge_filter_time_sec,
             "depth_align_time_sec": depth_align_time_sec,
+            "depth_to_cpu_time_sec": depth_to_cpu_time_sec,
+            "librealsense_align_time_sec": librealsense_align_time_sec,
             "depth_range_filter_time_sec": depth_range_filter_time_sec,
             "aligned_edge_filter_time_sec": aligned_edge_filter_time_sec,
             "depth_valid_ratio_time_sec": depth_valid_ratio_time_sec,
@@ -1584,6 +1815,8 @@ def build_camera_inputs_from_live_frames(
         per_camera_timing.append(camera_timing)
         stereo_infer_total += stereo_time_sec
         depth_align_total += depth_align_time_sec
+        depth_to_cpu_total += depth_to_cpu_time_sec
+        librealsense_align_total += librealsense_align_time_sec
         depth_filter_total += (
             rectified_edge_filter_time_sec
             + depth_range_filter_time_sec
@@ -1602,8 +1835,11 @@ def build_camera_inputs_from_live_frames(
                 "total_time_sec": time.perf_counter() - total_t0,
                 "sync_timing": bool(sync_timing),
                 "camera_count": len(per_camera_timing),
+                "fast_align_backend": align_backend,
                 "stereo_infer_time_sec": stereo_infer_total,
                 "depth_align_time_sec": depth_align_total,
+                "depth_to_cpu_time_sec": depth_to_cpu_total,
+                "librealsense_align_time_sec": librealsense_align_total,
                 "depth_filter_time_sec": depth_filter_total,
                 "live_debug_write_time_sec": debug_write_total,
                 "per_camera": per_camera_timing,
@@ -1624,6 +1860,7 @@ def run_live(args: argparse.Namespace) -> None:
     serials = select_serials(requested_serials=requested_serials, camera_count=int(args.camera_count))
     pose_map = load_live_camera_pose_map(args.camera_poses_json)
     cameras: list[RealSenseRgbdCamera] = []
+    fast_aligners: dict[str, LibrealsenseSoftwareAligner] = {}
     try:
         for index, serial in enumerate(serials):
             pose = resolve_live_pose(
@@ -1749,6 +1986,8 @@ def run_live(args: argparse.Namespace) -> None:
                     write_debug_images=bool(args.save_live_debug),
                     sync_timing=bool(args.sync_timing),
                     timing=rgbd_build_timing,
+                    fast_align_backend=str(args.fast_align_backend),
+                    fast_aligners=fast_aligners,
                 )
                 build_camera_inputs_time = time.perf_counter() - build_t0
                 frame_name = f"frame_{frame_index:05d}.png"
@@ -1787,6 +2026,8 @@ def run_live(args: argparse.Namespace) -> None:
                 )
                 frame_index += 1
     finally:
+        for aligner in fast_aligners.values():
+            aligner.close()
         for camera in cameras:
             camera.stop()
 

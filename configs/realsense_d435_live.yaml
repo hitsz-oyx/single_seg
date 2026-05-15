@@ -248,6 +248,10 @@ fast_stereo:
   # triton: 也可用，但首次运行会有编译开销
   optimize_build_volume: pytorch1
 
+  # Fast depth 对齐到 RGB 的后端
+  # torch: 当前 CUDA 投影实现；librealsense: 实验性软件帧 + rs.align 路径
+  align_backend: torch
+
   # 输入图像缩放比例
   # 1.0: 原始分辨率
   # <1.0: 缩小图像以加速
