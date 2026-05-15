@@ -35,6 +35,7 @@ FAST_STEREO_DEFAULT_MODEL = (
 DEPTH_SOURCE_CHOICES = ("fast", "native")
 STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
 DEPTH_EDGE_FILTER_STAGE_CHOICES = ("rectified", "aligned")
+_RECTIFIED_RAY_GRID_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 if str(FAST_STEREO_ROOT) not in sys.path:
     sys.path.insert(0, str(FAST_STEREO_ROOT))
@@ -44,6 +45,41 @@ def sync_cuda_if_needed(enabled: bool) -> None:
     """Synchronize CUDA so wall-clock timing reflects queued GPU work."""
     if bool(enabled) and torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def get_rectified_ray_grid(
+    *,
+    height: int,
+    width: int,
+    intrinsics: dict[str, float],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached per-pixel x/z and y/z factors for a rectified depth image."""
+    fx = float(intrinsics["fx"])
+    fy = float(intrinsics["fy"])
+    cx = float(intrinsics["cx"])
+    cy = float(intrinsics["cy"])
+    key = (
+        int(height),
+        int(width),
+        round(fx, 6),
+        round(fy, 6),
+        round(cx, 6),
+        round(cy, 6),
+        device.type,
+        device.index,
+    )
+    cached = _RECTIFIED_RAY_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    v = torch.arange(int(height), dtype=torch.float32, device=device)
+    u = torch.arange(int(width), dtype=torch.float32, device=device)
+    vv, uu = torch.meshgrid(v, u, indexing="ij")
+    x_over_z = ((uu - cx) / fx).reshape(-1)
+    y_over_z = ((vv - cy) / fy).reshape(-1)
+    cached = (x_over_z, y_over_z)
+    _RECTIFIED_RAY_GRID_CACHE[key] = cached
+    return cached
 
 try:  # noqa: E402
     from Utils import set_logging_format, set_seed
@@ -374,27 +410,61 @@ def align_rectified_depth_to_color_torch(
     depth = depth_rect_m.to(dtype=torch.float32)
     height, width = depth.shape
     device = depth.device
-    valid = torch.isfinite(depth) & (depth > 0)
+    out_height, out_width = (int(color_shape[0]), int(color_shape[1]))
+    depth_out = torch.full(
+        (out_height * out_width,),
+        float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
 
-    fx = float(rectified_intrinsics["fx"])
-    fy = float(rectified_intrinsics["fy"])
-    cx = float(rectified_intrinsics["cx"])
-    cy = float(rectified_intrinsics["cy"])
-    vv, uu = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32, device=device),
-        torch.arange(width, dtype=torch.float32, device=device),
-        indexing="ij",
+    depth_flat = depth.reshape(-1)
+    valid = torch.isfinite(depth_flat) & (depth_flat > 0)
+    depth_valid = depth_flat[valid]
+    if depth_valid.numel() == 0:
+        return torch.zeros((out_height, out_width), dtype=torch.float32, device=device)
+
+    x_over_z, y_over_z = get_rectified_ray_grid(
+        height=int(height),
+        width=int(width),
+        intrinsics=rectified_intrinsics,
+        device=device,
     )
-    depth_valid = depth[valid]
-    x = ((uu[valid] - cx) / fx) * depth_valid
-    y = ((vv[valid] - cy) / fy) * depth_valid
-    points_rect = torch.stack([x, y, depth_valid], dim=1)
-    return project_points_to_depth_image_torch(
-        points_rect,
-        rectified_to_color,
-        color_intrinsics,
-        color_shape,
-    )
+    x_rect = x_over_z[valid] * depth_valid
+    y_rect = y_over_z[valid] * depth_valid
+
+    transform = torch.as_tensor(rectified_to_color, dtype=torch.float32, device=device)
+    rot = transform[:3, :3]
+    trans = transform[:3, 3]
+    x_color = rot[0, 0] * x_rect + rot[0, 1] * y_rect + rot[0, 2] * depth_valid + trans[0]
+    y_color = rot[1, 0] * x_rect + rot[1, 1] * y_rect + rot[1, 2] * depth_valid + trans[1]
+    z_color = rot[2, 0] * x_rect + rot[2, 1] * y_rect + rot[2, 2] * depth_valid + trans[2]
+
+    valid_z = torch.isfinite(z_color) & (z_color > 0)
+    x_color = x_color[valid_z]
+    y_color = y_color[valid_z]
+    z_color = z_color[valid_z]
+    if z_color.numel() == 0:
+        return torch.zeros((out_height, out_width), dtype=torch.float32, device=device)
+
+    fx = float(color_intrinsics["fx"])
+    fy = float(color_intrinsics["fy"])
+    cx = float(color_intrinsics["cx"])
+    cy = float(color_intrinsics["cy"])
+    u = torch.round((x_color * fx / z_color) + cx).to(torch.int64)
+    v = torch.round((y_color * fy / z_color) + cy).to(torch.int64)
+    in_bounds = (u >= 0) & (u < out_width) & (v >= 0) & (v < out_height)
+    linear = (v[in_bounds] * out_width) + u[in_bounds]
+    if linear.numel() > 0:
+        depth_out.scatter_reduce_(
+            0,
+            linear,
+            z_color[in_bounds].to(torch.float32),
+            reduce="amin",
+            include_self=True,
+        )
+    depth_out[~torch.isfinite(depth_out)] = 0.0
+    return depth_out.reshape(out_height, out_width)
 
 
 def filter_depth_edges_torch(depth_m: torch.Tensor, *, threshold_m: float) -> torch.Tensor:
