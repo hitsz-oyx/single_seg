@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""多相机外参微调：以主相机定义mesh位姿，其他相机在camera→mesh空间做ICP。
+"""多相机外参微调：以主相机定义 mesh 位姿，其他相机配准到同一个 mesh。
 
 算法（用户设计）：
   1. 主相机世界点云 → ICP → mesh → T_MW (world→mesh)
-  2. 主相机的 T_MW 定义了 mesh 在世界坐标系中的位姿
+  2. 主相机的 T_MW 定义 mesh 在世界坐标系中的位姿
   3. 对每个非主相机：
      a. predicted_T_MC = T_MW @ original_cam2world (camera→mesh 空间的初始值)
-     b. 相机坐标系点云 → Open3D ICP → mesh (以 predicted_T_MC 为初值，局部微调)
+     b. 相机坐标系点云 → mesh
+        - Open3D ICP：以 predicted_T_MC 为初值做局部微调
+        - Go-ICP：全局匹配，不使用 predicted_T_MC 作为初值
      c. 得到 refined_T_MC
      d. new_cam2world = inv(T_MW) @ refined_T_MC
 
-主相机配准支持两种后端：
+主相机和非主相机都支持两种后端：
   - Open3D ICP（默认）：以质心对齐为初值，局部迭代，调整量小
-  - Go-ICP（--use-goicp）：全局搜索最优解，可能找到不同局部最优，调整量可能更大
+  - Go-ICP（--use-goicp / --refine-use-goicp）：全局搜索最优解
 
 两种数据模式：
 
@@ -42,6 +44,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -352,6 +355,30 @@ def load_explicit(
 # ──────────────────────────────────────────────
 
 
+def _make_goicp_config(trim_fraction: float | None = None):
+    """Build a Go-ICP config aligned with icp_ref.py defaults.
+
+    By default this returns GoICPConfig() without overriding max correspondence,
+    min correspondence, or MSE threshold. trim_fraction is the only optional
+    override kept for quick experiments.
+    """
+    cfg = GoICPConfig()
+    if trim_fraction is not None:
+        cfg.goicp_trim_fraction = float(trim_fraction)
+    return cfg
+
+
+def _format_goicp_config(cfg) -> str:
+    return (
+        f"voxel_size_ratio={cfg.voxel_size_ratio}, "
+        f"max_corr_ratio={cfg.goicp_max_corr_ratio:.4f}, "
+        f"min_voxel_size={cfg.min_voxel_size:.4f}, "
+        f"min_corr={cfg.min_goicp_corr:.4f}, "
+        f"trim_fraction={cfg.goicp_trim_fraction:.3f}, "
+        f"mse_thresh={cfg.goicp_mse_thresh:g}"
+    )
+
+
 def run_registration(
     world_clouds: dict[str, np.ndarray],
     extrinsics: dict[str, np.ndarray],
@@ -362,6 +389,9 @@ def run_registration(
     master_icp_dist: float = 0.05,
     refine_icp_dist: float = 0.003,
     use_goicp: bool = False,
+    refine_use_goicp: bool = False,
+    goicp_trim_fraction: float | None = None,
+    refine_goicp_trim_fraction: float | None = None,
 ) -> dict:
     """执行配准流程，返回调整结果。
 
@@ -369,6 +399,8 @@ def run_registration(
     """
     other_cameras = [c for c in camera_ids if c != master_camera]
     mesh_pts = np.asarray(mesh_pcd.points, dtype=np.float64)
+    if refine_goicp_trim_fraction is None:
+        refine_goicp_trim_fraction = goicp_trim_fraction
 
     # ── 下采样 ──
     print("  下采样...")
@@ -397,16 +429,8 @@ def run_registration(
                 "--use-goicp 已指定但 Go-ICP 未安装。请安装: pip install py_goicp\n"
                 "  或用 Open3D ICP（默认，不传 --use-goicp）"
             )
-        goicp_cfg = GoICPConfig(
-            voxel_size_ratio=0.01,
-            goicp_max_corr_ratio=master_icp_dist / max(np.ptp(mesh_pts[:, 0]), np.ptp(mesh_pts[:, 1]), np.ptp(mesh_pts[:, 2]), 1e-6),
-            min_voxel_size=0.001,
-            min_goicp_corr=0.003,
-            goicp_trim_fraction=0.0,
-            goicp_mse_thresh=1e-3,
-        )
-        print(f"  Go-ICP 配准中: voxel_size_ratio={goicp_cfg.voxel_size_ratio}, "
-              f"max_corr_ratio={goicp_cfg.goicp_max_corr_ratio:.4f}")
+        goicp_cfg = _make_goicp_config(goicp_trim_fraction)
+        print(f"  Go-ICP 配准中: {_format_goicp_config(goicp_cfg)}")
         goicp_result, _ = goicp_register(
             moving_points=master_pts_down,
             reference_points=mesh_pts,
@@ -444,11 +468,13 @@ def run_registration(
     print(f"    {np.array2string(T_MW, precision=6, suppress_small=True)}")
     print()
 
-    # ── Step 3: 非主相机微调（Open3D ICP 局部配准） ──
+    # ── Step 3: 非主相机微调 ──
+    refine_backend = "Go-ICP" if refine_use_goicp else "Open3D ICP"
     print("=" * 60)
-    print("3. 非主相机：camera→mesh 空间 ICP 微调（Open3D ICP）")
+    print(f"3. 非主相机：camera→mesh 空间 ICP 微调（{refine_backend}）")
     print("=" * 60)
     adj_results: dict = {}
+    _refine_solver_ctx = None
 
     for cam_id in other_cameras:
         cam2world = extrinsics[cam_id]
@@ -456,7 +482,10 @@ def run_registration(
         predicted_T_MC = T_MW @ cam2world
         predicted_angle = compute_angle(predicted_T_MC)
         print(f"\n  [{cam_id}]")
-        print(f"    predicted_cam_to_mesh: 旋转={predicted_angle:.4f}°")
+        if refine_use_goicp:
+            print(f"    predicted_cam_to_mesh: 旋转={predicted_angle:.4f}°（仅记录；Go-ICP 全局分支不使用初值）")
+        else:
+            print(f"    predicted_cam_to_mesh: 旋转={predicted_angle:.4f}°（Open3D ICP 初值）")
 
         pts_world = world_clouds[cam_id]
         pts_camera = transform_world_to_camera(pts_world, cam2world)
@@ -464,16 +493,36 @@ def run_registration(
         pcd_camera.points = o3d.utility.Vector3dVector(pts_camera)
         if voxel_size > 0 and pts_camera.shape[0] > 0:
             pcd_camera = pcd_camera.voxel_down_sample(voxel_size)
-        print(f"    相机坐标系下: {pts_world.shape[0]} → {len(np.asarray(pcd_camera.points))} 点")
+        pts_camera_down = np.asarray(pcd_camera.points, dtype=np.float64)
+        print(f"    相机坐标系下: {pts_world.shape[0]} → {pts_camera_down.shape[0]} 点")
 
-        result = o3d.pipelines.registration.registration_icp(
-            source=pcd_camera, target=mesh_pcd,
-            max_correspondence_distance=refine_icp_dist,
-            init=predicted_T_MC,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200),
-        )
-        T_MC_refined = result.transformation
+        if refine_use_goicp:
+            if not _HAS_GOICP:
+                raise RuntimeError(
+                    "--refine-use-goicp 已指定但 Go-ICP 未安装。请安装: pip install py_goicp"
+                )
+            goicp_cfg = _make_goicp_config(refine_goicp_trim_fraction)
+            print(f"    Go-ICP 配准中: {_format_goicp_config(goicp_cfg)}")
+            goicp_result, _refine_solver_ctx = goicp_register(
+                moving_points=pts_camera_down,
+                reference_points=mesh_pts,
+                config=goicp_cfg,
+                solver_ctx=_refine_solver_ctx,
+            )
+            T_MC_refined = goicp_result.transformation
+            refine_fitness = goicp_result.fitness
+            refine_rmse = goicp_result.inlier_rmse
+        else:
+            result = o3d.pipelines.registration.registration_icp(
+                source=pcd_camera, target=mesh_pcd,
+                max_correspondence_distance=refine_icp_dist,
+                init=predicted_T_MC,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200),
+            )
+            T_MC_refined = result.transformation
+            refine_fitness = float(result.fitness)
+            refine_rmse = float(result.inlier_rmse)
 
         T_MW_inv = np.linalg.inv(T_MW)
         new_cam2world = T_MW_inv @ T_MC_refined
@@ -488,10 +537,10 @@ def run_registration(
             "adjustment_4x4": adj.tolist(),
             "adjustment_rotation_deg": adj_angle,
             "adjustment_translation_m": adj_trans,
-            "icp_fitness": float(result.fitness),
-            "icp_inlier_rmse": float(result.inlier_rmse),
+            "icp_fitness": refine_fitness,
+            "icp_inlier_rmse": refine_rmse,
         }
-        print(f"    ICP: fitness={result.fitness:.4f}, rmse={result.inlier_rmse:.4f}")
+        print(f"    ICP ({refine_backend}): fitness={refine_fitness:.4f}, rmse={refine_rmse:.4f}")
         print(f"    外参调整: 旋转={adj_angle:.4f}°, 平移={adj_trans:.4f}m")
 
     print()
@@ -531,6 +580,7 @@ def run_registration(
         print(f"  [{cam_id}] 新外参下与主相机重叠: fitness={rv.fitness:.4f}, rmse={rv.inlier_rmse:.4f}")
     print()
 
+    adj_results["_world_to_mesh_4x4"] = T_MW.tolist()
     return adj_results
 
 
@@ -642,6 +692,126 @@ def _write_ply_binary(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
 
 
 # ──────────────────────────────────────────────
+# 保存默认输出目录内容
+# ──────────────────────────────────────────────
+
+
+def _camera_pose_entries(
+    camera_ids: list[str],
+    extrinsics: dict[str, np.ndarray],
+    camera_info: dict | None = None,
+) -> list[dict]:
+    entries = []
+    for cam_id in camera_ids:
+        cam2world = np.asarray(extrinsics[cam_id], dtype=np.float64)
+        world2cam = np.linalg.inv(cam2world)
+        opencv_c2w = gl_to_opencv_cam2world(cam2world)
+        info = (camera_info or {}).get(cam_id, {})
+        entries.append(
+            {
+                "camera_id": cam_id,
+                "serial_number": str(info.get("serial_number", cam_id)),
+                "cam2world_4x4": cam2world.tolist(),
+                "world2cam_4x4": world2cam.tolist(),
+                "opencv_cv_cam2world_4x4": opencv_c2w.tolist(),
+                "single_seg_gl_cam2world_4x4": cam2world.tolist(),
+                "color_intrinsics": info.get("color_intrinsics", {}),
+            }
+        )
+    return entries
+
+
+def build_refined_extrinsics(
+    master_camera: str,
+    camera_ids: list[str],
+    extrinsics: dict[str, np.ndarray],
+    adj_results: dict,
+) -> dict[str, np.ndarray]:
+    refined = {}
+    for cam_id in camera_ids:
+        if cam_id == master_camera or cam_id not in adj_results:
+            refined[cam_id] = np.asarray(extrinsics[cam_id], dtype=np.float64).copy()
+        else:
+            refined[cam_id] = np.asarray(adj_results[cam_id]["new_cam2world"], dtype=np.float64)
+    return refined
+
+
+def transform_clouds_to_refined_world(
+    world_clouds: dict[str, np.ndarray],
+    original_extrinsics: dict[str, np.ndarray],
+    refined_extrinsics: dict[str, np.ndarray],
+    camera_ids: list[str],
+) -> dict[str, np.ndarray]:
+    refined_clouds = {}
+    for cam_id in camera_ids:
+        pts = world_clouds[cam_id]
+        if pts.shape[0] == 0:
+            refined_clouds[cam_id] = pts.copy()
+            continue
+        pts_camera = transform_world_to_camera(pts, original_extrinsics[cam_id])
+        new_t = refined_extrinsics[cam_id]
+        refined_clouds[cam_id] = pts_camera @ new_t[:3, :3].T + new_t[:3, 3][None, :]
+    return refined_clouds
+
+
+def save_default_output_artifacts(
+    output_dir: Path,
+    mesh_path: Path,
+    world_clouds: dict[str, np.ndarray],
+    original_extrinsics: dict[str, np.ndarray],
+    refined_extrinsics: dict[str, np.ndarray],
+    master_camera: str,
+    camera_ids: list[str],
+    camera_info: dict | None = None,
+    voxel_size: float = 0.003,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    mesh_dst = output_dir / mesh_path.name
+    if mesh_path.resolve() != mesh_dst.resolve():
+        shutil.copy2(mesh_path, mesh_dst)
+
+    original_data = {
+        "cameras": _camera_pose_entries(camera_ids, original_extrinsics, camera_info),
+    }
+    with (output_dir / "original_extrinsics.json").open("w") as f:
+        json.dump(original_data, f, indent=2, ensure_ascii=False)
+
+    refined_clouds = transform_clouds_to_refined_world(
+        world_clouds=world_clouds,
+        original_extrinsics=original_extrinsics,
+        refined_extrinsics=refined_extrinsics,
+        camera_ids=camera_ids,
+    )
+
+    cam_colors = {
+        "cam_00": np.array([40, 130, 255], dtype=np.uint8),
+        "cam_01": np.array([255, 128, 40], dtype=np.uint8),
+        "cam_02": np.array([40, 210, 90], dtype=np.uint8),
+    }
+    for cam_id in camera_ids:
+        pts = refined_clouds[cam_id]
+        if pts.shape[0] == 0:
+            continue
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        if voxel_size > 0:
+            pcd = pcd.voxel_down_sample(voxel_size)
+        pts_down = np.asarray(pcd.points, dtype=np.float32)
+        color = cam_colors.get(cam_id, np.array([230, 230, 230], dtype=np.uint8))
+        colors = np.tile(color[None, :], (pts_down.shape[0], 1))
+        _write_ply_binary(output_dir / f"{cam_id}_registered.ply", pts_down, colors)
+
+    print(f"  默认输出目录: {output_dir}")
+    print(f"    原始 mesh: {mesh_dst}")
+    print(f"    原始外参: {output_dir / 'original_extrinsics.json'}")
+    print(f"    调整后外参: {output_dir / 'refined_extrinsics.json'}")
+    for cam_id in camera_ids:
+        print(f"    [{cam_id}] 配准后点云: {output_dir / f'{cam_id}_registered.ply'}")
+    print()
+
+
+# ──────────────────────────────────────────────
 # 保存结果
 # ──────────────────────────────────────────────
 
@@ -683,6 +853,8 @@ def save_results(
         cameras_list.append(cam_entry)
 
     output_data = {"cameras": cameras_list}
+    if isinstance(adj_results, dict) and "_world_to_mesh_4x4" in adj_results:
+        output_data["world_to_mesh_4x4"] = adj_results["_world_to_mesh_4x4"]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
@@ -737,7 +909,7 @@ def visualize(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="多相机外参微调：主相机(Go-ICP) + 非主相机(Open3D ICP)",
+        description="多相机外参微调：相机点云配准到 mesh，支持 Open3D ICP 和 Go-ICP",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 两种模式（二选一）:
@@ -759,7 +931,9 @@ def main() -> None:
     parser.add_argument("--camera-ids", type=str, nargs="+", default=["cam_00", "cam_01", "cam_02"],
                         help="所有相机 ID 列表")
     parser.add_argument("--output", type=Path, default=None,
-                        help="输出 JSON 路径（默认: 自动生成）")
+                        help="输出 JSON 路径（默认: icp/output/<mesh名>/refined_extrinsics.json）")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="默认输出目录（默认: icp/output/<mesh名>）")
 
     # 模式1: 自动检测
     parser.add_argument("--data-dir", type=Path, default=None,
@@ -774,6 +948,12 @@ def main() -> None:
     # 配准参数
     parser.add_argument("--use-goicp", action="store_true",
                         help="主相机使用 Go-ICP 全局配准（默认用 Open3D ICP 局部配准）")
+    parser.add_argument("--refine-use-goicp", action="store_true",
+                        help="从相机微调也使用 Go-ICP 全局配准（默认用 Open3D ICP 局部微调）")
+    parser.add_argument("--goicp-trim-fraction", type=float, default=None,
+                        help="主相机 Go-ICP TrimFraction（默认使用 GoICPConfig 默认值 0.05）")
+    parser.add_argument("--refine-goicp-trim-fraction", type=float, default=None,
+                        help="从相机 Go-ICP TrimFraction（默认同 --goicp-trim-fraction；未传则使用 GoICPConfig 默认值 0.05）")
     parser.add_argument("--voxel-size", type=float, default=0.003,
                         help="体素下采样大小")
     parser.add_argument("--master-icp-dist", type=float, default=0.05,
@@ -809,10 +989,18 @@ def main() -> None:
     # ── 输出路径 ──
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
-    elif auto_mode:
-        output_path = REPO_ROOT / "configs" / "refined_extrinsics.json"
+        default_output_dir = (
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else output_path.parent
+        )
     else:
-        raise ValueError("显式模式需要指定 --output")
+        default_output_dir = (
+            Path(args.output_dir).expanduser().resolve()
+            if args.output_dir
+            else REPO_ROOT / "icp" / "output" / mesh_path.stem
+        )
+        output_path = default_output_dir / "refined_extrinsics.json"
 
     t0 = time.perf_counter()
 
@@ -857,6 +1045,17 @@ def main() -> None:
         master_icp_dist=args.master_icp_dist,
         refine_icp_dist=args.refine_icp_dist,
         use_goicp=bool(args.use_goicp),
+        refine_use_goicp=bool(args.refine_use_goicp),
+        goicp_trim_fraction=(
+            None
+            if args.goicp_trim_fraction is None
+            else float(args.goicp_trim_fraction)
+        ),
+        refine_goicp_trim_fraction=(
+            None
+            if args.refine_goicp_trim_fraction is None
+            else float(args.refine_goicp_trim_fraction)
+        ),
     )
 
     # ════════════════════════════════════════════
@@ -865,6 +1064,24 @@ def main() -> None:
     elapsed = time.perf_counter() - t0
     save_results(output_path, master_camera, camera_ids, extrinsics, adj_results,
                  camera_info=camera_info, t_elapsed=elapsed)
+
+    refined_extrinsics = build_refined_extrinsics(
+        master_camera=master_camera,
+        camera_ids=camera_ids,
+        extrinsics=extrinsics,
+        adj_results=adj_results,
+    )
+    save_default_output_artifacts(
+        output_dir=default_output_dir,
+        mesh_path=mesh_path,
+        world_clouds=world_clouds,
+        original_extrinsics=extrinsics,
+        refined_extrinsics=refined_extrinsics,
+        master_camera=master_camera,
+        camera_ids=camera_ids,
+        camera_info=camera_info,
+        voxel_size=args.voxel_size,
+    )
 
     # ════════════════════════════════════════════
     # 5. 保存融合场景点云（可选）
@@ -900,7 +1117,7 @@ def main() -> None:
         if args.use_goicp:
             if not _HAS_GOICP:
                 raise RuntimeError("--use-goicp 已指定但 Go-ICP 未安装")
-            goicp_cfg = GoICPConfig(voxel_size_ratio=0.01, min_voxel_size=0.001, goicp_trim_fraction=0.0, goicp_mse_thresh=1e-3)
+            goicp_cfg = _make_goicp_config(args.goicp_trim_fraction)
             goicp_res, _ = goicp_register(moving_points=master_down, reference_points=mesh_pts, config=goicp_cfg)
             T_MW_viz = goicp_res.transformation
         else:

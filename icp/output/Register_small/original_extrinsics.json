@@ -1,16 +1,4 @@
 {
-  "world_frame": "apriltag_layout",
-  "output_convention": "single_seg_gl",
-  "tag_layout": {
-    "name": "furniture_base",
-    "tag_size_m": 0.048,
-    "tag_ids": [
-      0,
-      1,
-      2,
-      3
-    ]
-  },
   "cameras": [
     {
       "camera_id": "cam_00",
@@ -126,17 +114,7 @@
         "cy": 359.2901306152344,
         "width": 1280,
         "height": 720
-      },
-      "num_frames_used": 30,
-      "num_tag_observations": 120,
-      "tag_counts": {
-        "0": 30,
-        "1": 30,
-        "2": 30,
-        "3": 30
-      },
-      "mean_pose_error": 5.0207581095192525e-08,
-      "mean_decision_margin": 53.87643607457479
+      }
     },
     {
       "camera_id": "cam_01",
@@ -252,17 +230,7 @@
         "cy": 365.0004577636719,
         "width": 1280,
         "height": 720
-      },
-      "num_frames_used": 30,
-      "num_tag_observations": 120,
-      "tag_counts": {
-        "0": 30,
-        "1": 30,
-        "2": 30,
-        "3": 30
-      },
-      "mean_pose_error": 3.770596563822235e-08,
-      "mean_decision_margin": 56.31480878194173
+      }
     },
     {
       "camera_id": "cam_02",
@@ -378,17 +346,7 @@
         "cy": 370.5958557128906,
         "width": 1280,
         "height": 720
-      },
-      "num_frames_used": 30,
-      "num_tag_observations": 120,
-      "tag_counts": {
-        "0": 30,
-        "1": 30,
-        "2": 30,
-        "3": 30
-      },
-      "mean_pose_error": 4.2906904704966236e-08,
-      "mean_decision_margin": 29.227670907974243
+      }
     }
   ]
 }

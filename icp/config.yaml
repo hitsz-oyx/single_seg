@@ -1,63 +1,49 @@
-# =============================================================================
-# 多相机外参微调 — 配准参数配置
-# =============================================================================
-# register_to_mesh.py 的默认参数集中在此文件。
-# 命令行传参优先级高于此文件，例如 --refine-icp-dist 0.005 会覆盖此配置。
-# 用法:
-#   python icp/register_to_mesh.py --config icp/config.yaml \
-#     --data-dir tests/outputs/xxx --mesh icp/Register.STL
-# =============================================================================
+# 多相机 mesh 配准参数记录
+#
+# 注意：当前 register_to_mesh.py 以命令行参数为准，不会自动读取本 YAML。
+# 这个文件用于记录当前验证效果较好的参数组合，运行命令见 README.md。
 
-# ── 数据模式（二选一）───────────────────────────────────────────────────────
-# 自动检测模式: 只需 data_dir，脚本自动在 live_rgbd_debug/frame_* 下找点云外参
-# data_dir: null
-# 显式模式: 需要 extrinsics + point_cloud 列表
-# extrinsics: null
-# point_cloud:
-#   - cam_00=/path/to/cam00.ply
-#   - cam_01=/path/to/cam01.ply
-#   - cam_02=/path/to/cam02.ply
+# 数据
+data_dir: tests/outputs/realsense_live_small_three_cam_fast
+mesh: icp/Register_small.STL
+master_camera: cam_00
+camera_ids:
+  - cam_00
+  - cam_01
+  - cam_02
 
-# ── 必须参数（通常通过命令行传入）──────────────────────────────────────────
-# mesh: icp/Register.STL            # 标定物体 .stl 文件
-# master_camera: cam_00              # 主相机 ID
-# camera_ids:                        # 所有相机 ID 列表
-#   - cam_00
-#   - cam_01
-#   - cam_02
+# 输出
+output_dir: icp/output/Register_small
+output: icp/output/Register_small/refined_extrinsics.json
 
-# ── 输出路径 ────────────────────────────────────────────────────────────────
-# output: null                       # 输出 refined_extrinsics.json 路径
-                                     # 自动模式默认: configs/refined_extrinsics.json
+# 当前推荐配准方式
+use_goicp: true
+refine_use_goicp: true
 
-# ── 主相机配准后端 ──────────────────────────────────────────────────────────
-# use_goicp: false                   # true=Go-ICP全局搜索(需pip install py_goicp)
-                                     # false=Open3D ICP局部迭代(默认,调整量小)
+# Go-ICP 参数
+# 这里保持 GoICPConfig() 默认值；只有显式传 CLI 参数时才覆盖 TrimFraction。
+goicp_trim_fraction: null
+refine_goicp_trim_fraction: null
+goicp_defaults:
+  voxel_size_ratio: 0.01
+  goicp_max_corr_ratio: 0.05
+  min_voxel_size: 0.001
+  min_goicp_corr: 0.005
+  goicp_module: ""
+  goicp_quiet: true
+  goicp_dt_size: 300
+  goicp_dt_factor: 2.0
+  goicp_trim_fraction: 0.05
+  goicp_mse_thresh: 0.0003
+  goicp_epsilon: null
+  rotation_only_output: false
 
-# ── 预处理参数 ──────────────────────────────────────────────────────────────
-voxel_size: 0.003                    # 体素下采样大小(米), 越大点越少越快
-                                     # 建议: 0.003(3mm) 适合小物体, 0.005 适合大物体
-num_mesh_points: 100000              # mesh 均匀采样点数, 越多越准但越慢
-                                     # 建议: 50000~200000
+# 预处理与 Open3D ICP 兜底参数
+voxel_size: 0.003
+num_mesh_points: 30000
+master_icp_dist: 0.05
+refine_icp_dist: 0.003
 
-# ── 主相机配准参数 ──────────────────────────────────────────────────────────
-# 主相机(世界坐标点云) -> ICP -> mesh, 得到 T_MW (world→mesh)
-master_icp_dist: 0.05                # 主相机配准最大对应距离(米)
-                                     # Open3D ICP模式: 值越大收敛越全局
-                                     # 建议: 0.03~0.10, 视物体尺寸而定
-
-# ── 非主相机微调参数 ─────────────────────────────────────────────────────────
-# 非主相机(相机坐标系点云) -> ICP -> mesh, 以 predicted_T_MC 为初值局部微调
-refine_icp_dist: 0.003               # 非主相机微调最大对应距离(米)
-                                     # 值越小调整越精细, 太大可能导致错误收敛
-                                     # 建议: 0.002~0.005, 初始外参质量好则用0.003
-
-# ── 输出选项 ────────────────────────────────────────────────────────────────
-# save_fused: false                   # 同时保存原始/新外参的融合场景点云(.ply)
-                                     # 保存到输出JSON同级的 fused/ 目录中
-                                     # 含 original_fused.ply / refined_fused.ply
-                                     # 和 comparison_colored.ply(蓝=新 橙=旧)
-
-# ── 可视化 ──────────────────────────────────────────────────────────────────
-# visualize: false                    # 配准完成后弹出 Open3D 可视化窗口
-                                     # 需要桌面显示环境, 无GUI时设为false
+# 其他输出选项
+save_fused: false
+visualize: false
