@@ -1322,6 +1322,7 @@ def build_camera_inputs_from_live_frames(
                 raise RuntimeError("depth_source='fast' requires a Fast-FoundationStereo runner")
             ir_left_rect = np.asarray(payload["ir_left_rect"], dtype=np.uint8)
             ir_right_rect = np.asarray(payload["ir_right_rect"], dtype=np.uint8)
+            stereo_t0 = time.perf_counter()
             stereo_output = stereo_runner.infer_depth(
                 left_image=ir_left_rect,
                 right_image=ir_right_rect,
@@ -1330,6 +1331,7 @@ def build_camera_inputs_from_live_frames(
                 return_torch=True,
                 include_input_images=False,
             )
+            stereo_time_sec = time.perf_counter() - stereo_t0
             rectified_depth_m = stereo_output["depth_m"]
             if bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "rectified":
                 if not torch.is_tensor(rectified_depth_m):
@@ -1410,6 +1412,8 @@ def build_camera_inputs_from_live_frames(
             "pose_record": dict(payload["pose_record"]),
             "fovy_deg": None,
         }
+        if depth_source == "fast":
+            camera_inputs[camera_id]["stereo_time_sec"] = stereo_time_sec
         if edge_filter_summary is not None:
             camera_inputs[camera_id]["fast_depth_edge_filter"] = edge_filter_summary
         if write_debug_images:

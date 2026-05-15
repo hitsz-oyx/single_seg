@@ -2574,6 +2574,7 @@ class SingleObjectPointCloudSegmenter:
         cpu_transfer_time = 0.0
         colorize_time = 0.0
         normal_time = 0.0
+        stereo_time = 0.0
         masks_by_camera: dict[str, torch.Tensor] = {}
         scores_by_camera: dict[str, float | None] = {}
         try:
@@ -2643,6 +2644,7 @@ class SingleObjectPointCloudSegmenter:
         for camera_id in self.active_camera_ids:
             camera_prepare_t0 = time.perf_counter()
             payload = camera_inputs[camera_id]
+            stereo_time += float(payload.get("stereo_time_sec", 0.0))
             rgb = np.asarray(payload["rgb"], dtype=np.uint8)
             mask_value = masks_by_camera.get(camera_id)
             if torch.is_tensor(mask_value):
@@ -2825,6 +2827,7 @@ class SingleObjectPointCloudSegmenter:
                 "num_points_backprojected": int(points.shape[0]),
                 "num_target_points_backprojected": target_points_count,
                 "backproject_time_sec": camera_backproject_time,
+                "stereo_time_sec": float(payload.get("stereo_time_sec", 0.0)),
                 "target_3d_mask_erode": target_mask_erode_summary,
                 "target_depth_band_filter": target_depth_band_summary,
                 "target_plane_filter": target_plane_filter_summary,
@@ -2998,6 +3001,7 @@ class SingleObjectPointCloudSegmenter:
                     "cpu_transfer_time_sec": cpu_transfer_time,
                     "colorize_time_sec": colorize_time,
                     "normal_time_sec": normal_time,
+                    "stereo_time_sec": stereo_time,
                 },
             }
         )

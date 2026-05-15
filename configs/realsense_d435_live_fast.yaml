@@ -8,33 +8,33 @@
 segmenter:
   # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
   # 例如: plate, bowl, cup 等
-  target_name: small
-
-  # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/small/task_info.json
-
-  # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/small/
-
-  # SAM3 模型权重路径
-  checkpoint_path: checkpoints/sam3.pt
-
-  # 输出目录
-  output_dir: tests/outputs/realsense_live_small_three_cam_fast_icp
-
-  # target_name: redcup
+  # target_name: small
 
   # # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  # prompt_task_info: assets/prompts/redcup/task_info.json
+  # prompt_task_info: assets/prompts/small/task_info.json
 
   # # Prompt 图片目录，存放参考图片
-  # prompt_image_root: assets/prompts/redcup/
+  # prompt_image_root: assets/prompts/small/
 
   # # SAM3 模型权重路径
   # checkpoint_path: checkpoints/sam3.pt
 
   # # 输出目录
-  # output_dir: tests/outputs/realsense_live_redcup_three_cam_fast
+  # output_dir: tests/outputs/realsense_live_small_three_cam_fast_icp
+
+  target_name: redcup
+
+  # Prompt 标注文件路径，包含目标物体的参考图片和边界框
+  prompt_task_info: assets/prompts/redcup/task_info.json
+
+  # Prompt 图片目录，存放参考图片
+  prompt_image_root: assets/prompts/redcup/
+
+  # SAM3 模型权重路径
+  checkpoint_path: checkpoints/sam3.pt
+
+  # 输出目录
+  output_dir: tests/outputs/realsense_live_redcup_three_cam_fast_icp
 
   
 
@@ -141,11 +141,11 @@ segmenter:
   # ---------------------------------------------------------------------------
 
   # 是否保存点云文件 (PLY 格式)
-  save_ply: true
+  save_ply: false
   # 是否保存法线文件 
-  save_normal: true
+  save_normal: false
   # 是否保存 2D 调试图 (分割 overlay)
-  save_debug_2d: true
+  save_debug_2d: false
 
   # SAM3 tracker 输入图像尺寸
   # 值越大精度越高，但速度越慢
@@ -173,7 +173,7 @@ realsense:
   camera_poses_json: null
 
   # 最大处理帧数，0 表示无限制
-  max_frames: 2
+  max_frames: 10
 
   # 相机预热帧数，启动后等待 N 帧稳定
   camera_warmup_frames: 5
@@ -229,7 +229,7 @@ realsense:
 
   # 是否保存实时调试图片
   # 包括: RGB, IR 左/右, 深度可视化
-  save_live_debug: true
+  save_live_debug: false
 
 # =============================================================================
 # Fast-FoundationStereo 深度估计配置
