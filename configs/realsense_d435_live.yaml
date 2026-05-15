@@ -154,7 +154,7 @@ realsense:
   # 多相机位姿文件路径 (JSON 格式)
   # 包含每台相机的 cam2world_4x4 变换矩阵
   # 默认路径与 AprilTag 外参标定脚本的输出一致
-  camera_poses_json: tests/outputs/camera_poses_apriltag.json
+  camera_poses_json: configs/camera_poses_apriltag.json
 
   # 最大处理帧数，0 表示无限制
   max_frames: 30

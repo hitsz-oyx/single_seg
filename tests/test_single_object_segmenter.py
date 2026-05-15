@@ -57,9 +57,11 @@ from single_seg.realsense_rgbd_segmenter import (
     build_arg_parser,
     build_camera_inputs_from_live_frames,
     build_effective_live_config,
+    extrinsics_to_matrix,
     filter_depth_edges_torch,
     LibrealsenseSoftwareAligner,
     load_live_arg_defaults,
+    matrix_to_rs_extrinsics,
     project_points_to_depth_image,
 )
 from utils.calibrate_realsense_apriltag_extrinsics import (
@@ -1009,6 +1011,23 @@ def test_align_rectified_depth_to_color_torch_matches_identity_projection() -> N
         color_shape=(2, 2),
     )
     assert torch.allclose(aligned, depth_rect, atol=1e-6)
+
+
+def test_realsense_extrinsics_matrix_conversion_uses_column_major_rotation() -> None:
+    angle = np.deg2rad(15.0)
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    transform[:3, 3] = np.array([0.01, -0.02, 0.03], dtype=np.float32)
+    extrinsics = matrix_to_rs_extrinsics(transform)
+    assert np.allclose(np.asarray(extrinsics.rotation), transform[:3, :3].T.reshape(-1))
+    assert np.allclose(extrinsics_to_matrix(extrinsics), transform)
 
 
 def test_librealsense_software_aligner_matches_identity_projection() -> None:

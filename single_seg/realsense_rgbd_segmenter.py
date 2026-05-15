@@ -160,7 +160,7 @@ def intrinsics_to_distortion(intr: rs.intrinsics) -> np.ndarray:
 
 def extrinsics_to_matrix(extr: rs.extrinsics) -> np.ndarray:
     mat = np.eye(4, dtype=np.float64)
-    mat[:3, :3] = np.asarray(extr.rotation, dtype=np.float64).reshape(3, 3)
+    mat[:3, :3] = np.asarray(extr.rotation, dtype=np.float64).reshape(3, 3).T
     mat[:3, 3] = np.asarray(extr.translation, dtype=np.float64)
     return mat
 
