@@ -598,7 +598,7 @@ fast_stereo:
   max_disp: 128
   scale: 0.75
   optimize_build_volume: pytorch1
-  align_backend: torch
+  align_backend: open3d
   depth_edge_filter_enabled: false
   depth_edge_filter_threshold_m: 0.5
   depth_edge_filter_stage: rectified
@@ -651,6 +651,7 @@ live_debug_write_time_sec
 per_camera[].stereo_infer_time_sec
 per_camera[].depth_align_time_sec
 per_camera[].depth_to_cpu_time_sec
+per_camera[].open3d_align_time_sec
 per_camera[].librealsense_align_time_sec
 per_camera[].live_debug_write_time_sec
 ```
@@ -680,6 +681,7 @@ single-seg-realsense \
 - `live_timing_sec.rgbd_build.stereo_infer_time_sec`：Fast-FoundationStereo 推理耗时，三相机时通常是最大项。
 - `live_timing_sec.rgbd_build.depth_align_time_sec`：Fast depth 对齐到 RGB 的总耗时。
 - `live_timing_sec.rgbd_build.depth_to_cpu_time_sec`：仅 `align_backend=librealsense` 时有效，表示 CUDA depth 拷回 CPU 的耗时。
+- `live_timing_sec.rgbd_build.open3d_align_time_sec`：仅 `align_backend=open3d` 时有效，表示 Open3D tensor 投影耗时。
 - `live_timing_sec.rgbd_build.librealsense_align_time_sec`：仅 `align_backend=librealsense` 时有效，表示 `rs.align` 本身耗时。
 - `propagate_time_sec`：SAM3 tracker 当前帧传播耗时。
 - `initialize_sessions_time_sec`：首帧 prompt 和 tracker session 初始化耗时。
@@ -714,7 +716,7 @@ single-seg-realsense \
 - `--fast-valid-iters`: Fast refine 迭代次数；越小越快
 - `--fast-max-disp`: Fast 最大视差；当前低带宽 D435 数据默认 `192`
 - `--fast-optimize-build-volume`: Fast cost-volume 后端，支持 `pytorch1` 或 `triton`
-- `--fast-align-backend`: Fast depth 对齐到 RGB 的后端，`torch` 为默认 CUDA 投影，`librealsense` 为实验性软件帧 + `rs.align`
+- `--fast-align-backend`: Fast depth 对齐到 RGB 的后端，`torch` 为默认 CUDA 投影，`open3d` 为 tensor 点云投影，`librealsense` 为实验性软件帧 + `rs.align`
 - `--fast-depth-edge-filter-enabled`: 是否启用 Fast 深度边缘过滤
 - `--fast-depth-edge-filter-threshold-m`: 深度边缘过滤阈值，默认 `0.5`
 - `--fast-depth-edge-filter-stage`: 深度边缘过滤位置，推荐 `rectified`

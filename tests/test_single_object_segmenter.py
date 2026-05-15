@@ -52,6 +52,7 @@ from single_seg.single_object_segmenter import (
 )
 from single_seg.realsense_rgbd_segmenter import (
     align_rectified_depth_to_color,
+    align_rectified_depth_to_color_open3d,
     align_rectified_depth_to_color_torch,
     build_arg_parser,
     build_camera_inputs_from_live_frames,
@@ -1065,6 +1066,39 @@ def test_librealsense_software_aligner_uses_same_rotation_convention_as_torch() 
     assert np.allclose(aligned[aligned > 0.0], torch_aligned[torch_aligned > 0.0], atol=1e-2)
 
 
+def test_align_rectified_depth_to_color_open3d_matches_torch_projection() -> None:
+    pytest.importorskip("open3d")
+    depth_rect = np.zeros((48, 48), dtype=np.float32)
+    depth_rect[16:32, 16:32] = 1.0
+    intrinsics = {"fx": 70.0, "fy": 70.0, "cx": 24.0, "cy": 24.0}
+    angle = np.deg2rad(3.0)
+    rectified_to_color = np.eye(4, dtype=np.float32)
+    rectified_to_color[:3, :3] = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ],
+        dtype=np.float32,
+    )
+    open3d_aligned = align_rectified_depth_to_color_open3d(
+        torch.from_numpy(depth_rect),
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=rectified_to_color,
+        color_intrinsics=intrinsics,
+        color_shape=depth_rect.shape,
+    )
+    torch_aligned = align_rectified_depth_to_color_torch(
+        torch.from_numpy(depth_rect),
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=rectified_to_color,
+        color_intrinsics=intrinsics,
+        color_shape=depth_rect.shape,
+    )
+    assert torch.equal(open3d_aligned > 0.0, torch_aligned > 0.0)
+    assert torch.allclose(open3d_aligned, torch_aligned, atol=1e-3)
+
+
 def test_build_camera_inputs_can_use_native_realsense_depth_without_fast(tmp_path: Path) -> None:
     rgb = np.array(
         [
@@ -1201,3 +1235,52 @@ def test_build_camera_inputs_can_use_librealsense_fast_align_backend(tmp_path: P
     assert timing["fast_align_backend"] == "librealsense"
     assert timing["depth_to_cpu_time_sec"] >= 0.0
     assert timing["librealsense_align_time_sec"] >= 0.0
+
+
+def test_build_camera_inputs_can_use_open3d_fast_align_backend(tmp_path: Path) -> None:
+    pytest.importorskip("open3d")
+
+    class FakeStereoRunner:
+        def infer_depth(self, **kwargs):
+            assert kwargs["return_torch"] is True
+            depth = torch.zeros((16, 16), dtype=torch.float32)
+            depth[4:12, 5:13] = 1.25
+            return {
+                "depth_m": depth,
+                "rectified_intrinsics": {"fx": 20.0, "fy": 20.0, "cx": 8.0, "cy": 8.0},
+            }
+
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    intrinsics = {"fx": 20.0, "fy": 20.0, "cx": 8.0, "cy": 8.0, "width": 16, "height": 16}
+    timing: dict[str, object] = {}
+    camera_inputs = build_camera_inputs_from_live_frames(
+        captured_frames=[
+            {
+                "camera_id": "cam_00",
+                "depth_source": "fast",
+                "rgb": rgb,
+                "ir_left_rect": np.zeros((16, 16), dtype=np.uint8),
+                "ir_right_rect": np.zeros((16, 16), dtype=np.uint8),
+                "rectified_k": np.eye(3, dtype=np.float32),
+                "rectified_to_color": np.eye(4, dtype=np.float32),
+                "baseline_m": 0.05,
+                "color_intrinsics": intrinsics,
+                "pose_record": {"camera_id": "cam_00"},
+            }
+        ],
+        stereo_runner=FakeStereoRunner(),
+        depth_min=0.1,
+        depth_max=3.0,
+        output_dir=tmp_path,
+        frame_index=0,
+        write_debug_images=False,
+        timing=timing,
+        fast_align_backend="open3d",
+    )
+    depth_out = camera_inputs["cam_00"]["depth_m"]
+    assert torch.is_tensor(depth_out)
+    assert torch.allclose(depth_out[4:12, 5:13], torch.full((8, 8), 1.25), atol=1e-3)
+    assert camera_inputs["cam_00"]["fast_align_backend"] == "open3d"
+    assert timing["fast_align_backend"] == "open3d"
+    assert timing["open3d_align_time_sec"] >= 0.0
+    assert timing["depth_to_cpu_time_sec"] == 0.0

@@ -35,7 +35,7 @@ FAST_STEREO_DEFAULT_MODEL = (
 DEPTH_SOURCE_CHOICES = ("fast", "native")
 STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
 DEPTH_EDGE_FILTER_STAGE_CHOICES = ("rectified", "aligned")
-FAST_ALIGN_BACKEND_CHOICES = ("torch", "librealsense")
+FAST_ALIGN_BACKEND_CHOICES = ("torch", "open3d", "librealsense")
 _RECTIFIED_RAY_GRID_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 if str(FAST_STEREO_ROOT) not in sys.path:
@@ -502,6 +502,90 @@ def align_rectified_depth_to_color_torch(
         )
     depth_out[~torch.isfinite(depth_out)] = 0.0
     return depth_out.reshape(out_height, out_width)
+
+
+def align_rectified_depth_to_color_open3d(
+    depth_rect_m: torch.Tensor,
+    *,
+    rectified_intrinsics: dict[str, float],
+    rectified_to_color: np.ndarray | torch.Tensor,
+    color_intrinsics: dict[str, float],
+    color_shape: tuple[int, int],
+    depth_scale: float = 10000.0,
+    depth_max_m: float = 3.0,
+) -> torch.Tensor:
+    """Depth-to-color alignment via Open3D tensor point projection."""
+    try:
+        import open3d as o3d  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - depends on optional Open3D install
+        raise RuntimeError("fast_align_backend='open3d' requires open3d") from exc
+
+    depth = depth_rect_m.to(dtype=torch.float32)
+    if depth.ndim != 2:
+        raise ValueError(f"depth_rect_m must be HxW, got {tuple(depth.shape)}")
+    height, width = (int(depth.shape[0]), int(depth.shape[1]))
+    out_height, out_width = (int(color_shape[0]), int(color_shape[1]))
+    device = depth.device
+    if device.type == "cuda":
+        if not o3d.core.cuda.is_available():
+            raise RuntimeError("fast_align_backend='open3d' requires an Open3D build with CUDA support")
+        cuda_index = device.index if device.index is not None else torch.cuda.current_device()
+        o3d_device = o3d.core.Device(f"CUDA:{int(cuda_index)}")
+    else:
+        o3d_device = o3d.core.Device("CPU:0")
+
+    valid_depth = torch.where(
+        torch.isfinite(depth) & (depth > 0.0),
+        depth,
+        torch.zeros((), dtype=torch.float32, device=device),
+    )
+    depth_u16 = torch.clamp(torch.round(valid_depth * float(depth_scale)), 0, 65535).to(torch.uint16).contiguous()
+    depth_tensor = o3d.core.Tensor.from_dlpack(
+        torch.utils.dlpack.to_dlpack(depth_u16.reshape(height, width, 1))
+    )
+    depth_image = o3d.t.geometry.Image(depth_tensor)
+    rectified_k = o3d.core.Tensor(
+        [
+            [float(rectified_intrinsics["fx"]), 0.0, float(rectified_intrinsics["cx"])],
+            [0.0, float(rectified_intrinsics["fy"]), float(rectified_intrinsics["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=o3d.core.Dtype.Float32,
+        device=o3d_device,
+    )
+    color_k = o3d.core.Tensor(
+        [
+            [float(color_intrinsics["fx"]), 0.0, float(color_intrinsics["cx"])],
+            [0.0, float(color_intrinsics["fy"]), float(color_intrinsics["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=o3d.core.Dtype.Float32,
+        device=o3d_device,
+    )
+    if torch.is_tensor(rectified_to_color):
+        transform_np = rectified_to_color.detach().cpu().numpy().astype(np.float32, copy=False)
+    else:
+        transform_np = np.asarray(rectified_to_color, dtype=np.float32)
+    transform = o3d.core.Tensor(transform_np, dtype=o3d.core.Dtype.Float32, device=o3d_device)
+
+    pointcloud = o3d.t.geometry.PointCloud.create_from_depth_image(
+        depth_image,
+        rectified_k,
+        depth_scale=float(depth_scale),
+        depth_max=float(depth_max_m),
+        stride=1,
+        with_normals=False,
+    )
+    pointcloud.transform(transform)
+    projected = pointcloud.project_to_depth_image(
+        out_width,
+        out_height,
+        color_k,
+        depth_scale=float(depth_scale),
+        depth_max=float(depth_max_m),
+    )
+    projected_t = torch.utils.dlpack.from_dlpack(projected.as_tensor().to_dlpack()).reshape(out_height, out_width)
+    return projected_t.to(device=device, dtype=torch.float32) / float(depth_scale)
 
 
 class LibrealsenseSoftwareAligner:
@@ -1594,6 +1678,7 @@ def build_camera_inputs_from_live_frames(
     stereo_infer_total = 0.0
     depth_align_total = 0.0
     depth_to_cpu_total = 0.0
+    open3d_align_total = 0.0
     librealsense_align_total = 0.0
     depth_filter_total = 0.0
     debug_write_total = 0.0
@@ -1612,6 +1697,7 @@ def build_camera_inputs_from_live_frames(
         rectified_edge_filter_time_sec = 0.0
         depth_align_time_sec = 0.0
         depth_to_cpu_time_sec = 0.0
+        open3d_align_time_sec = 0.0
         librealsense_align_time_sec = 0.0
         depth_range_filter_time_sec = 0.0
         aligned_edge_filter_time_sec = 0.0
@@ -1683,6 +1769,20 @@ def build_camera_inputs_from_live_frames(
                 depth_aligned_m = aligner.align(rectified_depth_np, rgb)
                 librealsense_align_time_sec = time.perf_counter() - librealsense_t0
                 depth_align_time_sec = time.perf_counter() - align_total_t0
+            elif align_backend == "open3d":
+                sync_cuda_if_needed(sync_timing)
+                align_t0 = time.perf_counter()
+                depth_aligned_m = align_rectified_depth_to_color_open3d(
+                    rectified_depth_m,
+                    rectified_intrinsics=stereo_output["rectified_intrinsics"],
+                    rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                    color_intrinsics=dict(payload["color_intrinsics"]),
+                    color_shape=rgb.shape[:2],
+                    depth_max_m=float(depth_max),
+                )
+                sync_cuda_if_needed(sync_timing)
+                open3d_align_time_sec = time.perf_counter() - align_t0
+                depth_align_time_sec = open3d_align_time_sec
             else:
                 sync_cuda_if_needed(sync_timing)
                 align_t0 = time.perf_counter()
@@ -1804,6 +1904,7 @@ def build_camera_inputs_from_live_frames(
             "rectified_edge_filter_time_sec": rectified_edge_filter_time_sec,
             "depth_align_time_sec": depth_align_time_sec,
             "depth_to_cpu_time_sec": depth_to_cpu_time_sec,
+            "open3d_align_time_sec": open3d_align_time_sec,
             "librealsense_align_time_sec": librealsense_align_time_sec,
             "depth_range_filter_time_sec": depth_range_filter_time_sec,
             "aligned_edge_filter_time_sec": aligned_edge_filter_time_sec,
@@ -1816,6 +1917,7 @@ def build_camera_inputs_from_live_frames(
         stereo_infer_total += stereo_time_sec
         depth_align_total += depth_align_time_sec
         depth_to_cpu_total += depth_to_cpu_time_sec
+        open3d_align_total += open3d_align_time_sec
         librealsense_align_total += librealsense_align_time_sec
         depth_filter_total += (
             rectified_edge_filter_time_sec
@@ -1839,6 +1941,7 @@ def build_camera_inputs_from_live_frames(
                 "stereo_infer_time_sec": stereo_infer_total,
                 "depth_align_time_sec": depth_align_total,
                 "depth_to_cpu_time_sec": depth_to_cpu_total,
+                "open3d_align_time_sec": open3d_align_total,
                 "librealsense_align_time_sec": librealsense_align_total,
                 "depth_filter_time_sec": depth_filter_total,
                 "live_debug_write_time_sec": debug_write_total,

@@ -215,7 +215,7 @@ realsense:
 
   # 是否保存实时调试图片
   # 包括: RGB, IR 左/右, 深度可视化
-  save_live_debug: true
+  save_live_debug: false
 
 # =============================================================================
 # Fast-FoundationStereo 深度估计配置
@@ -249,8 +249,10 @@ fast_stereo:
   optimize_build_volume: pytorch1
 
   # Fast depth 对齐到 RGB 的后端
-  # torch: 当前 CUDA 投影实现；librealsense: 实验性软件帧 + rs.align 路径
-  align_backend: torch
+  # torch: 当前 CUDA 投影实现
+  # open3d: Open3D tensor 点云投影，避免 librealsense 路径的 GPU->CPU depth 拷贝
+  # librealsense: 实验性软件帧 + rs.align 路径
+  align_backend: open3d
 
   # 输入图像缩放比例
   # 1.0: 原始分辨率
