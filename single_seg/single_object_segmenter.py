@@ -2373,6 +2373,7 @@ class SingleObjectPointCloudSegmenter:
         self.startup_time_before_streaming: float | None = None
         self.first_frame_ready_time: float | None = None
         self.timeline: list[dict[str, object]] = []
+        self._last_initialize_timing: dict[str, object] = {}
 
     def _build_frame_resources(self, camera_inputs: dict[str, dict[str, object]]) -> dict[str, list[Image.Image]]:
         resources: dict[str, list[Image.Image]] = {}
@@ -2434,11 +2435,19 @@ class SingleObjectPointCloudSegmenter:
         frame_resources: dict[str, list[Image.Image]],
     ) -> None:
         """初始化每个相机的追踪会话，并根据正负提示框设置种子掩码。"""
+        init_t0 = time.perf_counter()
+        seed_query_time = 0.0
+        compose_time = 0.0
+        start_session_time = 0.0
+        add_prompt_time = 0.0
+        per_camera_timing: list[dict[str, object]] = []
         seed_masks_by_camera: dict[str, np.ndarray] = {}
         active_camera_ids: list[str] = []
         for camera_id, payload in camera_inputs.items():
             image = frame_resources[camera_id][0]
             debug_dir = self.output_dir / "prompt_debug" / camera_id if self.save_debug_2d else None
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            prompt_t0 = time.perf_counter()
             boxes, scores, masks = run_single_object_prompt_query(
                 image=image,
                 camera_source_path=Path(f"{camera_id}/{frame_name}"),
@@ -2453,6 +2462,7 @@ class SingleObjectPointCloudSegmenter:
                 debug_canvas_path=(debug_dir / "concat_canvas.png") if debug_dir is not None else None,
                 debug_prompt_path=(debug_dir / "prompt_boxes.png") if debug_dir is not None else None,
             )
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             selection = select_best_seed_mask(
                 boxes=boxes,
                 scores=scores,
@@ -2475,6 +2485,7 @@ class SingleObjectPointCloudSegmenter:
                     debug_canvas_path=(debug_dir / "concat_canvas_pos_only.png") if debug_dir is not None else None,
                     debug_prompt_path=(debug_dir / "prompt_boxes_pos_only.png") if debug_dir is not None else None,
                 )
+                maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
                 selection = select_best_seed_mask(
                     boxes=boxes,
                     scores=scores,
@@ -2482,7 +2493,16 @@ class SingleObjectPointCloudSegmenter:
                     min_pixels=self.seed_min_pixels,
                 )
                 seed_source = "pos_only_fallback"
+            prompt_time = time.perf_counter() - prompt_t0
+            seed_query_time += prompt_time
+            per_camera_item: dict[str, object] = {
+                "camera_id": camera_id,
+                "seed_prompt_time_sec": prompt_time,
+                "seed_source": seed_source,
+                "usable_seed": selection is not None,
+            }
             if selection is None:
+                per_camera_timing.append(per_camera_item)
                 continue
             seed_mask, seed_score, seed_box = selection
             seed_mask, seed_shape_mode = refine_seed_mask(
@@ -2502,6 +2522,14 @@ class SingleObjectPointCloudSegmenter:
                 "seed_source": seed_source,
                 "seed_shape_mode": seed_shape_mode,
             }
+            per_camera_item.update(
+                {
+                    "seed_score": float(seed_score),
+                    "seed_pixels": int(np.count_nonzero(seed_mask)),
+                    "seed_shape_mode": seed_shape_mode,
+                }
+            )
+            per_camera_timing.append(per_camera_item)
             if self.save_debug_2d:
                 save_binary_mask_debug(
                     output_dir=self.output_dir,
@@ -2519,6 +2547,7 @@ class SingleObjectPointCloudSegmenter:
         except ImportError:
             from tracker_only_backend import compose_camera_rgb_frame_resources, stitch_camera_binary_masks
 
+        compose_t0 = time.perf_counter()
         composite_resources, self.stitched_layout = compose_camera_rgb_frame_resources(
             rgb_by_camera={
                 camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
@@ -2527,16 +2556,32 @@ class SingleObjectPointCloudSegmenter:
             camera_order=self.active_camera_ids,
         )
         composite_mask = stitch_camera_binary_masks(seed_masks_by_camera, self.stitched_layout)
+        compose_time = time.perf_counter() - compose_t0
         with autocast_context():
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            start_t0 = time.perf_counter()
             session_id = self.video_predictor.start_session(composite_resources)["session_id"]
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            start_session_time = time.perf_counter() - start_t0
+            add_prompt_t0 = time.perf_counter()
             self.video_predictor.add_prompt(
                 session_id=session_id,
                 frame_idx=0,
                 mask=np.asarray(composite_mask, dtype=np.uint8),
                 obj_id=1,
             )
+            maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
+            add_prompt_time = time.perf_counter() - add_prompt_t0
             self.session_ids["__stitched__"] = session_id
         self.startup_time_before_streaming = time.perf_counter() - self.pipeline_t0
+        self._last_initialize_timing = {
+            "total_time_sec": time.perf_counter() - init_t0,
+            "seed_query_time_sec": seed_query_time,
+            "compose_seed_time_sec": compose_time,
+            "tracker_start_session_time_sec": start_session_time,
+            "tracker_add_prompt_time_sec": add_prompt_time,
+            "per_camera": per_camera_timing,
+        }
         self.initialized = True
 
     def process_frame(
@@ -2556,8 +2601,13 @@ class SingleObjectPointCloudSegmenter:
         frame_resource_t0 = time.perf_counter()
         frame_resources = self._build_frame_resources(camera_inputs)
         frame_resource_build_time = time.perf_counter() - frame_resource_t0
+        initialize_sessions_time = 0.0
+        initialize_sessions_breakdown: dict[str, object] | None = None
         if not self.initialized:
+            initialize_t0 = time.perf_counter()
             self._initialize_sessions(frame_name, camera_inputs, frame_resources)
+            initialize_sessions_time = time.perf_counter() - initialize_t0
+            initialize_sessions_breakdown = dict(self._last_initialize_timing)
 
         append_frame_time = 0.0
         backproject_time = 0.0
@@ -2982,6 +3032,7 @@ class SingleObjectPointCloudSegmenter:
                 "target_cluster_filter": target_cluster_summary,
                 "camera_summaries": camera_summaries,
                 "append_frame_time_sec": append_frame_time,
+                "initialize_sessions_time_sec": initialize_sessions_time,
                 "propagate_time_sec": propagate_time,
                 "backproject_time_sec": backproject_time,
                 "fuse_time_sec": fuse_time,
@@ -2989,6 +3040,7 @@ class SingleObjectPointCloudSegmenter:
                 "frame_runtime_sec": frame_runtime,
                 "residual_breakdown_sec": {
                     "frame_resource_build_time_sec": frame_resource_build_time,
+                    "initialize_sessions_time_sec": initialize_sessions_time,
                     "compose_inputs_time_sec": compose_inputs_time,
                     "mask_postprocess_time_sec": mask_postprocess_time,
                     "target_mask_erode_time_sec": target_mask_erode_time,
@@ -3003,6 +3055,7 @@ class SingleObjectPointCloudSegmenter:
                     "normal_time_sec": normal_time,
                     "stereo_time_sec": stereo_time,
                 },
+                "initialize_sessions_breakdown_sec": initialize_sessions_breakdown,
             }
         )
         result = {
@@ -3041,6 +3094,17 @@ class SingleObjectPointCloudSegmenter:
             if later
             else None
         )
+
+        def optional_later_mean(key: str) -> float | None:
+            values = [float(item[key]) for item in later if key in item and item[key] is not None]
+            if not values:
+                return None
+            return float(sum(values) / len(values))
+
+        later_loop_mean = optional_later_mean("loop_runtime_sec")
+        later_capture_mean = optional_later_mean("capture_time_sec")
+        later_rgbd_mean = optional_later_mean("build_camera_inputs_time_sec")
+        later_process_wall_mean = optional_later_mean("process_frame_wall_time_sec")
         summary = {
             "target_name": self.target_name,
             "prompt_task_info": str(self.prompt_task_info),
@@ -3075,6 +3139,11 @@ class SingleObjectPointCloudSegmenter:
             "first_frame_ready_sec": self.first_frame_ready_time,
             "later_frame_runtime_sec_mean": later_mean,
             "later_frame_fps": None if later_mean in {None, 0.0} else float(1.0 / later_mean),
+            "later_loop_runtime_sec_mean": later_loop_mean,
+            "later_loop_fps": None if later_loop_mean in {None, 0.0} else float(1.0 / later_loop_mean),
+            "later_capture_time_sec_mean": later_capture_mean,
+            "later_build_camera_inputs_time_sec_mean": later_rgbd_mean,
+            "later_process_frame_wall_time_sec_mean": later_process_wall_mean,
             "timeline": self.timeline,
         }
         (self.output_dir / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

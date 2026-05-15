@@ -617,6 +617,85 @@ single-seg-realsense \
 
 不建议在当前 `480x270` IR 输入上直接降 `scale`。`scale=0.75/0.5` 在这组数据中没有明显加速，反而让投影到 RGB 后的有效深度覆盖下降明显。
 
+### 时间线与性能定位
+
+live 入口会在输出目录根部写：
+
+```text
+single_object_timeline.json
+```
+
+这个文件现在同时记录两类时间：
+
+- `frame_runtime_sec`：只统计 `SingleObjectPointCloudSegmenter.process_frame()` 内部耗时。
+- `loop_runtime_sec`：统计 live 主循环一帧端到端耗时，包含相机采集、RGBD 构建、FastStereo、SAM3/点云处理。
+
+新增的 live 级字段：
+
+```text
+capture_time_sec
+build_camera_inputs_time_sec
+process_frame_wall_time_sec
+loop_runtime_sec
+live_timing_sec
+```
+
+其中 `live_timing_sec.rgbd_build` 会继续拆分：
+
+```text
+stereo_infer_time_sec
+depth_align_time_sec
+depth_filter_time_sec
+live_debug_write_time_sec
+per_camera[].stereo_infer_time_sec
+per_camera[].depth_align_time_sec
+per_camera[].live_debug_write_time_sec
+```
+
+首帧还会额外记录 tracker 初始化：
+
+```text
+initialize_sessions_time_sec
+initialize_sessions_breakdown_sec
+```
+
+`initialize_sessions_breakdown_sec` 里包含 prompt query、seed 拼接、tracker `start_session`、`add_prompt` 的耗时，用来解释第一帧为什么通常明显慢于后续帧。
+
+默认 live 路径不强制 CUDA 同步，吞吐更好，但 GPU kernel 是异步排队的，某些前处理的等待时间可能被算进后面的 SAM3 `propagate_time_sec`。如果要做准确归因，用：
+
+```bash
+single-seg-realsense \
+  --config configs/realsense_d435_live.yaml \
+  --sync-timing 1
+```
+
+`--sync-timing 1` 会在关键计时点调用 `torch.cuda.synchronize()`，所以时间归因更清楚，但正式跑速度时建议仍保持默认 `0`。
+
+看瓶颈时优先看这些字段：
+
+- `loop_runtime_sec`：真实端到端每帧耗时。
+- `live_timing_sec.rgbd_build.stereo_infer_time_sec`：Fast-FoundationStereo 推理耗时，三相机时通常是最大项。
+- `propagate_time_sec`：SAM3 tracker 当前帧传播耗时。
+- `initialize_sessions_time_sec`：首帧 prompt 和 tracker session 初始化耗时。
+- `live_timing_sec.rgbd_build.live_debug_write_time_sec`：保存 live debug 图和 depth 文件的写盘耗时。
+
+如果 `stereo_infer_time_sec` 最大，优先考虑：
+
+- 改用 `--depth-source native`，直接绕过 FastStereo。
+- 降低 `--fast-valid-iters`。
+- 调小 `--fast-max-disp`，但要保证覆盖实际深度范围。
+- 后续再考虑把多相机 FastStereo 从串行改成 batch 或多 CUDA stream。
+
+如果 `propagate_time_sec` 最大，优先考虑降低 `--tracker-image-size`，例如 `784` 或 `672`；这个值必须是 `14` 的倍数。
+
+如果 `live_debug_write_time_sec` 明显，正式跑时关掉：
+
+```bash
+single-seg-realsense \
+  --config configs/realsense_d435_live.yaml \
+  --save-live-debug 0
+```
+
 ### 多相机参数
 
 - `--camera-count`: 使用多少个 D435 逻辑相机
@@ -634,6 +713,7 @@ single-seg-realsense \
 - `--fast-depth-edge-filter-stage`: 深度边缘过滤位置，推荐 `rectified`
 - `--target-3d-mask-erode-kernel`: 仅用于 3D 取点的目标 mask 腐蚀核大小，`0/1` 关闭
 - `--save-ply`: 保存融合后的点云输出
+- `--sync-timing`: 调试性能时同步 CUDA 计时，`1` 更准但更慢，正式运行保持 `0`
 
 当前代码内部的相机数量已经是动态的，不再假设固定 3 相机。  
 不过目前只对“单台 D435 先把真 RGBD 预处理链跑通”做过实机验证；多 D435 融合接口已经接入，但还没有做完整现场联调。
