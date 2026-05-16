@@ -452,16 +452,18 @@ single_seg/realsense_rgbd_segmenter.py
 
 1. 每个 D435 采集 `color + IR1 + IR2`
 2. 用 `IR1/IR2` 经过 `Fast-FoundationStereo` 估计深度
-3. 把深度从 rectified-left IR 坐标系重投影到 RGB 坐标系
-4. 再把对齐后的 `RGBD` 送进现有 `SingleObjectPointCloudSegmenter`
+3. 保留 rectified-left IR 深度网格，把 RGB 采样到这个深度网格
+4. 再把 depth-grid `RGBD` 送进现有 `SingleObjectPointCloudSegmenter`
 5. 多个 D435 的点云最后再做融合
+
+这样点云反投影使用的是 FastStereo 原始 rectified depth 像素和 `depth_cam2world_4x4`，不再先把 depth scatter 到 RGB 平面后再反投影。`fast_align_backend=torch` 和 `fast_align_backend=librealsense` 都是 RGB→depth；`open3d` 后端仍保留旧的 depth→RGB tensor 投影，主要用于对比。
 
 融合后的目标点可以再做一层轻量 3D 聚类过滤，用来去掉深度估计导致的孤立散点。相关参数在 `configs/realsense_d435_live.yaml` 的 `segmenter` 里：
 
 ```yaml
 target_cluster_filter_enabled: true
-target_cluster_radius_m: 0.013
-target_cluster_min_points: 45
+target_cluster_radius_m: 0.025
+target_cluster_min_points: 35
 target_cluster_keep_largest: true
 target_plane_filter_enabled: false
 target_plane_filter_distance_m: 0.004
@@ -470,8 +472,8 @@ target_plane_filter_min_inlier_ratio: 0.25
 target_plane_filter_max_inlier_ratio: 0.85
 target_plane_filter_max_planes: 1
 target_plane_filter_ransac_iterations: 256
-target_depth_band_filter_enabled: false
-target_depth_band_filter_range_m: 0.015
+target_depth_band_filter_enabled: true
+target_depth_band_filter_range_m: 0.08
 target_depth_band_filter_min_valid_pixels: 50
 target_depth_band_filter_min_keep_pixels: 20
 target_3d_mask_erode_kernel: 0
@@ -484,7 +486,7 @@ target_3d_mask_erode_kernel: 0
 
 也就是说，这里输出的是“真 RGBD”，不是把 IR 灰度图简单伪装成 RGB。
 
-如果要和 D435 原生深度对比，可以改成 `--depth-source native`。这个模式只开 `color + depth`，用 RealSense SDK 把原生 depth 对齐到 color，不加载 `Fast-FoundationStereo` 模型。
+如果要和 D435 原生深度对比，可以改成 `--depth-source native`。这个模式只开 `color + depth`，用 RealSense SDK 把 color 对齐到 depth，不加载 `Fast-FoundationStereo` 模型；点云同样走 depth 坐标系外参。
 
 ### 单相机最小运行
 
@@ -558,7 +560,7 @@ tests/outputs/realsense_live/live_rgbd_debug/
 - `depth_aligned_m.npy`
 - `depth_aligned_vis.png`
 - `depth_source.txt`
-- `camera_payload.json`：保存离线重跑所需的相机内外参；`fast` 模式还包含 `rectified_k`、`baseline_m`、`rectified_to_color`
+- `camera_payload.json`：保存离线重跑所需的相机内外参；其中 `pose_record`、`depth_intrinsics` 和 `pointcloud_frame` 对应实际写盘的 `rgb.png + depth_aligned_m.npy` 这份 RGBD。`fast` 模式还包含 `rectified_k`、`baseline_m`、`rectified_to_color`、`depth_pose_record`
 
 如果需要用 debug dump 离线 profile，不输出 `debug2d/ply`：
 
@@ -575,6 +577,31 @@ tests/outputs/realsense_live/live_rgbd_debug/
   --input-dir tests/outputs/realsense_live/live_rgbd_debug \
   --depth-source fast
 ```
+
+如果要直接把离线帧目录按“旧版 depth 已投到 RGB 平面”的方式跑成一份 live-debug 样式输出，可以用：
+
+```bash
+conda run -n sam3 python utils/replay_rgb_aligned_depth_frame.py \
+  --frame-dir /home/oyx/wm_ws/demo0_frame_360 \
+  --realsense-para-dir /home/oyx/wm_ws/realsense_para \
+  --extrinsics /home/oyx/wm_ws/single_seg/configs/refined_extrinsics.json \
+  --camera-map 1:cam_00:cam1,2:cam_02:cam2,3:cam_01:cam3 \
+  --target-name redcup \
+  --output-dir tests/outputs/demo0_frame_360_redcup_rgb_aligned
+```
+
+这条离线脚本做的是：
+
+- 读取 `demo0_frame_360/observations/rgb|depth`
+- 按 `1->cam_00, 2->cam_02, 3->cam_01` 绑定相机，避免按自然顺序错位
+- 从 `realsense_para/cam1|cam2|cam3/camera_payload.json` 取 `color_intrinsics`
+- 从 `configs/refined_extrinsics.json` 取 RGB 外参
+- 把深度视为“已经投到 RGB 平面”的旧版输入，因此 live debug 里会写 `pointcloud_frame=color`、`alignment_direction=depth_to_color`
+- 最终输出：
+  - `live_rgbd_debug/frame_00360/cam_xx/{rgb.png,depth_aligned_m.npy,camera_payload.json,target_object_rgb.ply,...}`
+  - `masks_2d/frame_00360/cam_xx/...`
+  - `frame_outputs/frame_00360_{scene,instance,target_only}.ply`
+  - `offline_rgb_aligned_replay.json`
 
 ### Fast 深度速度调参
 
@@ -598,7 +625,7 @@ fast_stereo:
   max_disp: 128
   scale: 0.75
   optimize_build_volume: pytorch1
-  align_backend: open3d
+  align_backend: torch
   depth_edge_filter_enabled: false
   depth_edge_filter_threshold_m: 0.5
   depth_edge_filter_stage: rectified
@@ -679,10 +706,10 @@ single-seg-realsense \
 
 - `loop_runtime_sec`：真实端到端每帧耗时。
 - `live_timing_sec.rgbd_build.stereo_infer_time_sec`：Fast-FoundationStereo 推理耗时，三相机时通常是最大项。
-- `live_timing_sec.rgbd_build.depth_align_time_sec`：Fast depth 对齐到 RGB 的总耗时。
-- `live_timing_sec.rgbd_build.depth_to_cpu_time_sec`：仅 `align_backend=librealsense` 时有效，表示 CUDA depth 拷回 CPU 的耗时。
-- `live_timing_sec.rgbd_build.open3d_align_time_sec`：仅 `align_backend=open3d` 时有效，表示 Open3D tensor 投影耗时。
-- `live_timing_sec.rgbd_build.librealsense_align_time_sec`：仅 `align_backend=librealsense` 时有效，表示 `rs.align` 本身耗时。
+- `live_timing_sec.rgbd_build.depth_align_time_sec`：Fast RGB/depth 对齐耗时；默认 torch/librealsense 表示 RGB→depth，open3d 表示旧的 depth→RGB。
+- `live_timing_sec.rgbd_build.depth_to_cpu_time_sec`：仅 `align_backend=librealsense` 时有效，表示 CUDA depth 拷回 CPU 后交给 `rs.align` 的耗时。
+- `live_timing_sec.rgbd_build.open3d_align_time_sec`：仅 `align_backend=open3d` 时有效，表示 Open3D tensor depth→RGB 投影耗时。
+- `live_timing_sec.rgbd_build.librealsense_align_time_sec`：仅 `align_backend=librealsense` 时有效，表示 `rs.align(rs.stream.depth)` 本身耗时。
 - `propagate_time_sec`：SAM3 tracker 当前帧传播耗时。
 - `initialize_sessions_time_sec`：首帧 prompt 和 tracker session 初始化耗时。
 - `live_timing_sec.rgbd_build.live_debug_write_time_sec`：保存 live debug 图和 depth 文件的写盘耗时。
@@ -708,7 +735,7 @@ single-seg-realsense \
 
 - `--camera-count`: 使用多少个 D435 逻辑相机
 - `--camera-serials`: 指定串号列表，逗号分隔；不传时默认按枚举顺序取前 `N` 台
-- `--camera-poses-json`: 多相机融合时提供每台 D435 的 `cam2world_4x4`
+- `--camera-poses-json`: 多相机融合时提供每台 D435 的外参；RGB 外参用 `cam2world_4x4`，depth-grid 点云优先用 `depth_cam2world_4x4`
 - `--depth-source`: `fast` 使用 `IR1/IR2 + Fast-FoundationStereo`；`native` 使用 D435 原生 depth
 - `--stereo-rectification-mode`: Fast 路径的 IR 校正模式，`opencv` 为历史默认，`passthrough` 直接使用 RealSense 输出的 IR1/IR2
 - `--emitter-enabled`: 设置 RealSense IR 投影器，`0` 关闭、`1` 开启；不传则保持相机当前设置
@@ -716,7 +743,7 @@ single-seg-realsense \
 - `--fast-valid-iters`: Fast refine 迭代次数；越小越快
 - `--fast-max-disp`: Fast 最大视差；当前低带宽 D435 数据默认 `192`
 - `--fast-optimize-build-volume`: Fast cost-volume 后端，支持 `pytorch1` 或 `triton`
-- `--fast-align-backend`: Fast depth 对齐到 RGB 的后端，`torch` 为默认 CUDA 投影，`open3d` 为 tensor 点云投影，`librealsense` 为实验性软件帧 + `rs.align`
+- `--fast-align-backend`: Fast RGB/depth 对齐后端；`torch` 默认用 CUDA 把 RGB 采样到 rectified depth，`librealsense` 用软件帧 + `rs.align(rs.stream.depth)`，`open3d` 保留旧的 depth→RGB tensor 投影用于对比
 - `--fast-depth-edge-filter-enabled`: 是否启用 Fast 深度边缘过滤
 - `--fast-depth-edge-filter-threshold-m`: 深度边缘过滤阈值，默认 `0.5`
 - `--fast-depth-edge-filter-stage`: 深度边缘过滤位置，推荐 `rectified`
@@ -733,7 +760,7 @@ single-seg-realsense \
 
 ```yaml
 realsense:
-  camera_poses_json: tests/outputs/camera_poses_apriltag.json
+  camera_poses_json: configs/camera_poses_apriltag.json
 ```
 
 如果这个文件还没有生成，单相机运行会回退到单位位姿；多相机运行会报错，避免多相机点云在没有外参时被错误融合。格式示例：
@@ -745,6 +772,12 @@ realsense:
       "camera_id": "cam_00",
       "serial_number": "243122075507",
       "cam2world_4x4": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "depth_cam2world_4x4": [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
@@ -765,6 +798,8 @@ realsense:
 }
 ```
 
+`cam2world_4x4` 是 AprilTag 基于 RGB/color 图像估计出的 color 相机外参；`depth_cam2world_4x4` 是 depth/rectified-left 坐标系到世界的外参。当前 fast torch/librealsense 和 native 点云都使用 depth 坐标系；如果 JSON 没有 depth 字段，live 入口会用当前 RealSense profile 的 `depth_to_color/rectified_to_color` 从 color 外参临时推导。
+
 单相机场景如果没有这个文件，默认使用单位位姿。
 
 ### AprilTag 外参标定
@@ -783,8 +818,11 @@ realsense:
 ```bash
 /home/oyx/miniconda3/envs/sam3/bin/python utils/calibrate_realsense_apriltag_extrinsics.py \
   --serials 243122075507,SECOND_SERIAL \
+  --stereo-width 1280 \
+  --stereo-height 720 \
+  --stereo-rectification-mode opencv \
   --num-frames 30 \
-  --output tests/outputs/camera_poses_apriltag.json \
+  --output configs/camera_poses_apriltag.json \
   --debug-dir tests/outputs/apriltag_calibration_debug
 ```
 
@@ -798,7 +836,7 @@ single-seg-realsense \
 
 如果某台相机视野里完全没有 AprilTag，或者看到的 tag id 不在当前 layout 里，标定脚本会直接报错并打印该相机的 `camera_id/serial`、期望的 tag id、实际检测到的 tag id；如果传了 `--debug-dir`，还会保存最后一帧检测可视化图。
 
-输出里的 `cam2world_4x4` 默认是 `single_seg` 点云反投影使用的 OpenGL 相机坐标约定；文件里也会额外写入 `opencv_cv_cam2world_4x4`，方便排查 AprilTag/RealSense 原始坐标。
+输出里的 `cam2world_4x4` 默认是 RGB/color 相机的 `single_seg` OpenGL 坐标约定；文件里也会额外写入 `depth_cam2world_4x4`、`opencv_cv_cam2world_4x4`、`opencv_cv_depth_cam2world_4x4`、`depth_to_color_4x4` 和 `depth_intrinsics`。`depth_cam2world_4x4` 对应标定时的 `--stereo-width/height`、`--stereo-alpha` 和 `--stereo-rectification-mode`，这些参数应和 live 重建时保持一致。
 
 ## 3D 可视化
 
@@ -906,13 +944,13 @@ python icp/register_to_mesh.py \
 
 ### 输出
 
-输出 `refined_extrinsics.json`，包含每个相机的：
+`register_to_mesh.py` 内部优先使用 `depth_cam2world_4x4` / `rectified_depth_cam2world_4x4` 做配准；如果输入 JSON 没有 depth 外参，才回退到 `cam2world_4x4`。输出的 `refined_extrinsics.json` 也会保留这套结构：
 
-- `original_cam2world_4x4`：原始外参
-- `refined_cam2world_4x4`：微调后的外参
-- `adjustment_rotation_deg` / `adjustment_translation_m`：相对原始外参的调整量
-- `icp_fitness` / `icp_inlier_rmse`：点云重叠质量指标
-- `verify_vs_master_fitness` / `verify_vs_master_rmse`：微调后与主相机点云的重叠验证
+- `depth_cam2world_4x4`：ICP 实际优化的左深度 / rectified-depth 外参
+- `cam2world_4x4`：根据 `depth_to_color_4x4` 从 depth 外参反推出来的 RGB/color 外参，保留给旧接口兼容
+- `world2depth_4x4` / `world2cam_4x4`：对应逆变换
+- `depth_to_color_4x4`、`color_intrinsics`、`depth_intrinsics`、`pointcloud_frame`：从输入外参里保留下来的相机信息
+- `world_to_mesh_4x4`：本次 ICP 求出来的 world→mesh 变换
 
 输出目录结构：
 

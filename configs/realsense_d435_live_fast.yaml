@@ -262,11 +262,11 @@ fast_stereo:
   # triton: 也可用，但首次运行会有编译开销
   optimize_build_volume: pytorch1
 
-  # Fast depth 对齐到 RGB 的后端
-  # torch: 当前 CUDA 投影实现
-  # open3d: Open3D tensor 点云投影，避免 librealsense 路径的 GPU->CPU depth 拷贝
-  # librealsense: 实验性软件帧 + rs.align 路径
-  align_backend: open3d
+  # Fast RGB/depth 对齐后端
+  # torch: 默认 CUDA 路径，把 RGB 采样到 rectified depth 网格
+  # open3d: 保留旧的 depth->RGB tensor 投影，主要用于对比
+  # librealsense: 实验性软件帧 + rs.align(rs.stream.depth)，把 RGB 对齐到 depth
+  align_backend: torch
 
   # 输入图像缩放比例
   # 1.0: 原始分辨率

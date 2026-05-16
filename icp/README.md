@@ -1,6 +1,6 @@
 # ICP 配准说明
 
-这个目录里的脚本用于把三路相机分割出来的目标点云配准到 STL mesh，并输出调整后的相机外参。
+这个目录里的脚本用于把三路相机分割出来的目标点云配准到 STL mesh，并输出调整后的相机外参。现在 ICP 内部优先使用左深度 / rectified-depth 外参（`depth_cam2world_4x4`）；如果输入里没有 depth 外参，才回退到 `cam2world_4x4`。
 
 ## 脚本
 
@@ -47,8 +47,8 @@ icp/output/Register_small/
 ```
 
 - `Register_small.STL`：原始 mesh 的拷贝。
-- `original_extrinsics.json`：从数据里读到的原始外参。
-- `refined_extrinsics.json`：调整后的外参，里面也包含 `world_to_mesh_4x4`。
+- `original_extrinsics.json`：从数据里读到的原始外参；如果输入有 `depth_cam2world_4x4`，这里会一起保留。
+- `refined_extrinsics.json`：调整后的外参，里面也包含 `world_to_mesh_4x4`；其中 `depth_cam2world_4x4` 是 ICP 实际优化的主外参，`cam2world_4x4` 是按 `depth_to_color_4x4` 反推出来的 RGB 外参。
 - `cam_XX_registered.ply`：对应相机用调整后外参变换到世界坐标系的点云。
 
 ## 可视化

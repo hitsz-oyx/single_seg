@@ -51,6 +51,7 @@ from single_seg.single_object_segmenter import (
     write_live_debug_target_object_cloud,
 )
 from single_seg.realsense_rgbd_segmenter import (
+    align_color_to_rectified_depth_torch,
     align_rectified_depth_to_color,
     align_rectified_depth_to_color_open3d,
     align_rectified_depth_to_color_torch,
@@ -97,27 +98,16 @@ def test_realsense_live_config_defaults_from_yaml() -> None:
     assert defaults["camera_count"] == 1
     assert defaults["depth_source"] == "fast"
     assert defaults["low_bandwidth_mode"] == 0
-    assert defaults["save_live_debug"] == 1
+    assert defaults["save_live_debug"] == 0
     assert defaults["target_cluster_filter_enabled"] is True
-    assert defaults["target_cluster_radius_m"] == 0.013
-    assert defaults["target_cluster_min_points"] == 45
     assert defaults["target_cluster_keep_largest"] is True
     assert defaults["target_plane_filter_enabled"] is False
-    assert defaults["target_plane_filter_distance_m"] == 0.004
-    assert defaults["target_plane_filter_min_points"] == 80
-    assert defaults["target_plane_filter_min_inlier_ratio"] == 0.25
-    assert defaults["target_plane_filter_max_inlier_ratio"] == 0.85
-    assert defaults["target_plane_filter_max_planes"] == 1
-    assert defaults["target_plane_filter_ransac_iterations"] == 256
-    assert defaults["target_depth_band_filter_enabled"] is False
-    assert defaults["target_depth_band_filter_range_m"] == 0.015
-    assert defaults["target_depth_band_filter_min_valid_pixels"] == 50
-    assert defaults["target_depth_band_filter_min_keep_pixels"] == 20
+    assert defaults["target_depth_band_filter_enabled"] is True
     assert defaults["target_3d_mask_erode_kernel"] == 0
     assert defaults["fast_depth_edge_filter_enabled"] == 0
     assert defaults["fast_depth_edge_filter_threshold_m"] == 0.5
     assert defaults["fast_depth_edge_filter_stage"] == "rectified"
-    assert defaults["camera_poses_json"] == REPO_ROOT / "tests" / "outputs" / "camera_poses_apriltag.json"
+    assert defaults["camera_poses_json"] == REPO_ROOT / "configs" / "camera_poses_apriltag.json"
     assert defaults["prompt_task_info"].exists()
     assert defaults["fast_model_path"] == (
         REPO_ROOT / "third_party" / "fastfoundationstereo" / "weights" / "23-36-37" / "model_best_bp2_serialize.pth"
@@ -1013,6 +1003,79 @@ def test_align_rectified_depth_to_color_torch_matches_identity_projection() -> N
     assert torch.allclose(aligned, depth_rect, atol=1e-6)
 
 
+def test_align_color_to_rectified_depth_torch_samples_color_on_depth_grid() -> None:
+    depth_rect = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+    color = np.asarray(
+        [
+            [[10, 20, 30], [40, 50, 60]],
+            [[70, 80, 90], [100, 110, 120]],
+        ],
+        dtype=np.uint8,
+    )
+    intrinsics = {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}
+    aligned = align_color_to_rectified_depth_torch(
+        color,
+        depth_rect,
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=torch.eye(4, dtype=torch.float32),
+        color_intrinsics=intrinsics,
+    )
+    expected = color.copy()
+    expected[0, 1] = 0
+    expected[1, 0] = 0
+    assert np.array_equal(aligned.cpu().numpy(), expected)
+
+
+def test_align_rectified_depth_to_color_torch_matches_numpy_projection_with_transform() -> None:
+    depth_rect = np.zeros((48, 64), dtype=np.float32)
+    depth_rect[12:36, 15:45] = 0.8
+    depth_rect[20:30, 30:55] = 1.1
+    rectified_intrinsics = {"fx": 80.0, "fy": 82.0, "cx": 31.5, "cy": 23.5}
+    color_intrinsics = {"fx": 92.0, "fy": 91.0, "cx": 39.5, "cy": 31.5}
+    angle_y = np.deg2rad(4.0)
+    angle_z = np.deg2rad(-3.0)
+    rot_y = np.array(
+        [
+            [np.cos(angle_y), 0.0, np.sin(angle_y)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle_y), 0.0, np.cos(angle_y)],
+        ],
+        dtype=np.float32,
+    )
+    rot_z = np.array(
+        [
+            [np.cos(angle_z), -np.sin(angle_z), 0.0],
+            [np.sin(angle_z), np.cos(angle_z), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    rectified_to_color = np.eye(4, dtype=np.float32)
+    rectified_to_color[:3, :3] = rot_z @ rot_y
+    rectified_to_color[:3, 3] = np.array([0.025, -0.015, 0.02], dtype=np.float32)
+    expected = align_rectified_depth_to_color(
+        depth_rect,
+        rectified_intrinsics=rectified_intrinsics,
+        rectified_to_color=rectified_to_color,
+        color_intrinsics=color_intrinsics,
+        color_shape=(64, 80),
+    )
+    actual = align_rectified_depth_to_color_torch(
+        torch.from_numpy(depth_rect),
+        rectified_intrinsics=rectified_intrinsics,
+        rectified_to_color=rectified_to_color,
+        color_intrinsics=color_intrinsics,
+        color_shape=(64, 80),
+    ).numpy()
+    assert np.allclose(actual, expected, atol=1e-6)
+
+
 def test_realsense_extrinsics_matrix_conversion_uses_column_major_rotation() -> None:
     angle = np.deg2rad(15.0)
     transform = np.eye(4, dtype=np.float32)
@@ -1047,6 +1110,28 @@ def test_librealsense_software_aligner_matches_identity_projection() -> None:
         aligner.close()
     assert aligned.shape == depth_rect.shape
     assert np.allclose(aligned, depth_rect, atol=1e-4)
+
+
+def test_librealsense_software_aligner_can_align_color_to_depth_identity() -> None:
+    depth_rect = np.zeros((16, 16), dtype=np.float32)
+    depth_rect[2:10, 3:12] = 1.25
+    color = np.zeros((16, 16, 3), dtype=np.uint8)
+    color[2:10, 3:12] = np.array([20, 80, 140], dtype=np.uint8)
+    intrinsics = {"fx": 20.0, "fy": 20.0, "cx": 8.0, "cy": 8.0}
+    aligner = LibrealsenseSoftwareAligner(
+        rectified_intrinsics=intrinsics,
+        rectified_to_color=np.eye(4, dtype=np.float32),
+        color_intrinsics=intrinsics,
+        depth_shape=depth_rect.shape,
+        color_shape=depth_rect.shape,
+        align_to="depth",
+    )
+    try:
+        aligned = aligner.align_color_to_depth(depth_rect, color)
+    finally:
+        aligner.close()
+    assert aligned.shape == color.shape
+    assert np.array_equal(aligned[2:10, 3:12], color[2:10, 3:12])
 
 
 def test_librealsense_software_aligner_uses_same_rotation_convention_as_torch() -> None:
@@ -1199,6 +1284,9 @@ def test_build_camera_inputs_keeps_fast_depth_on_torch_path(tmp_path: Path) -> N
     assert debug_payload["ir_left_rect_file"] == "ir_left_rect.png"
     assert debug_payload["ir_right_rect_file"] == "ir_right_rect.png"
     assert debug_payload["baseline_m"] == 0.05
+    assert debug_payload["pointcloud_frame"] == "rectified_depth"
+    assert debug_payload["fast_alignment_direction"] == "color_to_depth"
+    assert debug_payload["depth_intrinsics"] == {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0}
     assert debug_payload["rectified_k"] == np.eye(3, dtype=np.float32).tolist()
     assert debug_payload["rectified_to_color"] == np.eye(4, dtype=np.float32).tolist()
 

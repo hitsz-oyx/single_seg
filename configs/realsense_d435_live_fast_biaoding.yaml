@@ -2,25 +2,50 @@
 # 使用 Fast-FoundationStereo 进行真 RGBD 深度估计
 # 相对路径基于仓库根目录解析
 
+#原始外参
+# single-seg-realsense \
+#   --config configs/realsense_d435_live_fast_biaoding.yaml \
+#   --camera-count 3 \
+#   --camera-serials "148522074762,243122075507,845112070307" \
+#   --camera-poses-json configs/camera_poses_apriltag.json \
+#   --save-ply \
+#   --save-debug-2d \
+#   --save-normal \
+#   --save-live-debug 1 \
+#   --overwrite-output
+
+#icp标定
+# single-seg-realsense \
+#   --config configs/realsense_d435_live_fast_biaoding.yaml \
+#   --camera-count 3 \
+#   --camera-serials "148522074762,243122075507,845112070307" \
+#   --camera-poses-json configs/refined_extrinsics.json \
+#   --save-ply \
+#   --save-debug-2d \
+#   --save-normal \
+#   --save-live-debug 1 \
+#   --overwrite-output
+
+
 # =============================================================================
 # 分割器配置
 # =============================================================================
 segmenter:
   # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
   # 例如: plate, bowl, cup 等
-  target_name: plate
+  target_name: small
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/libero_spatial/semantic_split_parts/task_info.json
+  prompt_task_info: assets/prompts/small/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/libero_spatial/semantic_split_parts
+  prompt_image_root: assets/prompts/small/
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live
+  output_dir: tests/outputs/realsense_live_small_three_cam_fast
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -60,12 +85,12 @@ segmenter:
 
   # 帧内点云体素大小 (米)，用于降采样
   # 值越小点云越精细，但点数更多
-  frame_voxel_size: 0.003
+  frame_voxel_size: 0.002
 
   # 是否启用目标点 3D 聚类去散点
   # true: 在最终 3D 分割结果里过滤由深度估计噪声造成的零散目标点
   # false: 保留所有被 2D mask 标成目标的 3D 点
-  target_cluster_filter_enabled: true
+  target_cluster_filter_enabled: false
 
   # 3D 聚类邻域半径 (米)
   # 半径越大，距离较远的目标点越容易连成同一簇；过大可能把背景误连进目标
@@ -108,13 +133,13 @@ segmenter:
   target_depth_band_filter_enabled: true
 
   # 目标核心深度带半径 (米)，越小越严格；红杯这类小物体可从 0.012-0.015 试起
-  target_depth_band_filter_range_m: 0.08
+  target_depth_band_filter_range_m: 0.070
 
   # 估计深度中位数所需的最少有效像素，低于该值时跳过过滤
   target_depth_band_filter_min_valid_pixels: 50
 
   # 过滤后至少保留的像素数，低于该值时跳过过滤，避免整目标被删空
-  target_depth_band_filter_min_keep_pixels: 20
+  target_depth_band_filter_min_keep_pixels: 30
 
   # 反投影前仅用于 3D 取点的目标 mask 腐蚀核大小（像素）
   # 0/1: 关闭；3/5: 去掉 mask 边界处容易混入背景或深度断层的像素
@@ -126,12 +151,8 @@ segmenter:
 
   # 是否保存点云文件 (PLY 格式)
   save_ply: false
-
-  # 保存 PLY 时是否写入估计法线
-  # true: 在 PLY 中增加 nx/ny/nz，法线会翻转到朝向最近相机
-  # false: 保持原始 PLY 字段
+  # 是否保存法线文件 
   save_normal: false
-
   # 是否保存 2D 调试图 (分割 overlay)
   save_debug_2d: false
 
@@ -140,12 +161,17 @@ segmenter:
   # 推荐: 640, 896, 1024
   tracker_image_size: 896
 
+  # 目标点云高亮颜色 R,G,B
+  # 默认 null = 红色 (255,70,70)
+  # 例如 [30, 60, 180] 为深蓝
+  target_vis_color: [30, 60, 180]
+
 # =============================================================================
 # RealSense 相机配置
 # =============================================================================
 realsense:
   # 相机数量
-  camera_count: 1
+  camera_count: 3
 
   # 相机序列号列表 (逗号分隔)
   # 为 null 时自动选择前 N 台相机
@@ -153,11 +179,10 @@ realsense:
 
   # 多相机位姿文件路径 (JSON 格式)
   # 包含每台相机的 cam2world_4x4 变换矩阵
-  # 默认路径与 AprilTag 外参标定脚本的输出一致
-  camera_poses_json: configs/camera_poses_apriltag.json
+  camera_poses_json: null
 
   # 最大处理帧数，0 表示无限制
-  max_frames: 30
+  max_frames: 2
 
   # 相机预热帧数，启动后等待 N 帧稳定
   camera_warmup_frames: 5
@@ -172,7 +197,7 @@ realsense:
   # 帧率 (FPS)
   # 低带宽模式推荐: 6
   # 正常模式推荐: 15-30
-  fps: 30
+  fps: 6
 
   # RGB 彩色图像分辨率
   color_width: 1280
@@ -188,7 +213,6 @@ realsense:
   # 0: 裁剪到最大有效区域
   # 1: 保留所有原始像素 (可能有黑边)
   stereo_alpha: 0.0
-
   # Fast 深度使用的 IR 校正模式
   # opencv: 用左右 IR 内外参重新 stereoRectify（历史默认）
   # passthrough: 直接使用 RealSense 输出的 IR1/IR2，适合验证 D400 已 rectified 的情况
@@ -197,7 +221,6 @@ realsense:
   # IR 投影器开关；null 表示不改相机当前设置
   # 对 Fast-FoundationStereo 建议分别测试 0/1，散斑可能有帮助也可能带来域差
   emitter_enabled: null
-
   # ---------------------------------------------------------------------------
   # 深度源选择
   # ---------------------------------------------------------------------------
@@ -235,29 +258,29 @@ fast_stereo:
   # - 4: 速度优先
   # - 6: 当前 D435 低带宽数据上的平衡档
   # - 8/12: 质量优先
-  valid_iters: 4
+  valid_iters: 12
 
   # 最大视差范围 (像素)
   # 物体越近需要越大的视差范围
   # 当前 480x270 rectified IR 下，depth_min=0.1m 时 192 已覆盖近距离视差
   # 只有需要小于约 0.1m 的深度时再考虑 256+
-  max_disp: 128
+  max_disp: 192
 
   # cost volume 构建后端
   # pytorch1: 当前数据上稳定且和 triton 速度接近
   # triton: 也可用，但首次运行会有编译开销
   optimize_build_volume: pytorch1
 
-  # Fast RGB/depth 对齐后端
-  # torch: 默认 CUDA 路径，把 RGB 采样到 rectified depth 网格
-  # open3d: 保留旧的 depth->RGB tensor 投影，主要用于对比
-  # librealsense: 实验性软件帧 + rs.align(rs.stream.depth)，把 RGB 对齐到 depth
+  # Fast depth 对齐到 RGB 的后端
+  # torch: 当前 CUDA 投影实现
+  # open3d: Open3D tensor 点云投影，避免 librealsense 路径的 GPU->CPU depth 拷贝
+  # librealsense: 实验性软件帧 + rs.align 路径
   align_backend: torch
 
   # 输入图像缩放比例
   # 1.0: 原始分辨率
   # <1.0: 缩小图像以加速
-  scale: 0.75
+  scale: 1
 
   # 是否移除不可见点 (遮挡区域)
   remove_invisible: true
