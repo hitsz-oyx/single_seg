@@ -11,15 +11,25 @@
 #   --frame-name frame_00000 \
 #   --overwrite
 
+# python utils/convert_hdf5_to_live_debug.py \
+#   --hdf5-path /home/franka-client/oyx_ws/Demo/demo0_1_ds3.hdf5 \
+#   --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
+#   --output-dir tests/outputs/demo0_1_ds3_live \
+#   --overwrite
+
 #   python utils/offline_replay.py --config configs/offline_replay.yaml
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-input_dir: tests/outputs/demo0_frame_360_live   # directory containing live_rgbd_debug/
-output_dir: tests/outputs/demo0_frame_360_offline
+input_dir: tests/outputs/demo0_1_ds3_live   # directory containing live_rgbd_debug/
+output_dir: tests/outputs/demo0_1_ds3_offline
 
-frame_name: frame_00000
+# ---------------------------------------------------------------------------
+# Frame range (None = all frames)
+# ---------------------------------------------------------------------------
+frame_start: 0
+frame_end: null   # null = all frames
 
 # ---------------------------------------------------------------------------
 # External camera poses (extrinsics)

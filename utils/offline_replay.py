@@ -266,15 +266,27 @@ def main() -> None:
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
     input_dir = Path(cfg["input_dir"]).expanduser().resolve()
-    output_dir = Path(cfg["output_dir"]).expanduser().resolve()
-    frame_name = cfg["frame_name"]
+    base_output_dir = Path(cfg["output_dir"]).expanduser().resolve()
 
-    if not (input_dir / "live_rgbd_debug").is_dir():
+    live_debug_dir = input_dir / "live_rgbd_debug"
+    if not live_debug_dir.is_dir():
         raise FileNotFoundError(f"live_rgbd_debug not found under {input_dir}")
 
-    print("=" * 60)
-    print("Step 1: Fast-Stereo depth estimation")
-    print("=" * 60)
+    all_frames = sorted([d.name for d in live_debug_dir.iterdir() if d.is_dir()])
+    frame_start = int(cfg.get("frame_start", 0))
+    frame_end = int(cfg["frame_end"]) if cfg.get("frame_end") is not None else len(all_frames)
+    frames_to_process = all_frames[frame_start:frame_end]
+
+    print(f"Frames to process: {len(frames_to_process)} ({frame_start} to {frame_end})")
+
+    camera_poses_json = cfg.get("camera_poses_json")
+    if camera_poses_json:
+        camera_poses = load_camera_poses(Path(camera_poses_json).expanduser().resolve())
+        print(f"Loaded external camera poses from: {camera_poses_json}")
+    else:
+        camera_poses = {}
+        print("WARNING: No camera_poses_json configured, using payload pose_record")
+
     fs_cfg = cfg.get("fast_stereo", {})
     stereo_runner = FastFoundationStereoRunner(
         model_path=Path(fs_cfg["model_path"]).expanduser().resolve(),
@@ -285,46 +297,48 @@ def main() -> None:
         hiera=bool(fs_cfg.get("hiera", False)),
         optimize_build_volume=str(fs_cfg.get("optimize_build_volume", "pytorch1")),
     )
-    run_fast_stereo(
-        input_dir=input_dir,
-        frame_name=frame_name,
-        stereo_runner=stereo_runner,
-        depth_min=float(cfg["depth_min"]),
-        depth_max=float(cfg["depth_max"]),
-        depth_edge_filter_enabled=bool(fs_cfg.get("depth_edge_filter_enabled", False)),
-        depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
-    )
+
+    for frame_name in frames_to_process:
+        output_dir = base_output_dir / frame_name
+        print()
+        print("=" * 60)
+        print(f"Processing frame: {frame_name}")
+        print("=" * 60)
+
+        print()
+        print("Step 1: Fast-Stereo depth estimation")
+        print("-" * 40)
+        run_fast_stereo(
+            input_dir=input_dir,
+            frame_name=frame_name,
+            stereo_runner=stereo_runner,
+            depth_min=float(cfg["depth_min"]),
+            depth_max=float(cfg["depth_max"]),
+            depth_edge_filter_enabled=bool(fs_cfg.get("depth_edge_filter_enabled", False)),
+            depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
+        )
+
+        print()
+        print("Step 2: SAM3 segmentation")
+        print("-" * 40)
+        frame_dir = live_debug_dir / frame_name
+        camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
+        stereo_intrinsics: dict[str, dict[str, Any]] = {}
+        for cid in camera_ids:
+            with open(frame_dir / cid / "stereo_intrinsics.json") as f:
+                stereo_intrinsics[cid] = json.load(f)
+        run_sam3_segmentation(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            frame_name=frame_name,
+            cfg=cfg,
+            stereo_intrinsics=stereo_intrinsics,
+            camera_poses=camera_poses,
+        )
+        print(f"  -> Output: {output_dir}")
 
     print()
-    print("=" * 60)
-    print("Step 2: SAM3 segmentation")
-    print("=" * 60)
-    frame_dir = input_dir / "live_rgbd_debug" / frame_name
-    camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
-    stereo_intrinsics: dict[str, dict[str, Any]] = {}
-    for cid in camera_ids:
-        with open(frame_dir / cid / "stereo_intrinsics.json") as f:
-            stereo_intrinsics[cid] = json.load(f)
-
-    camera_poses_json = cfg.get("camera_poses_json")
-    if camera_poses_json:
-        camera_poses = load_camera_poses(Path(camera_poses_json).expanduser().resolve())
-        print(f"Loaded external camera poses from: {camera_poses_json}")
-    else:
-        camera_poses = {}
-        print("WARNING: No camera_poses_json configured, using payload pose_record")
-
-    run_sam3_segmentation(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        frame_name=frame_name,
-        cfg=cfg,
-        stereo_intrinsics=stereo_intrinsics,
-        camera_poses=camera_poses,
-    )
-
-    print()
-    print(f"All done. Output: {output_dir}")
+    print(f"All done. Processed {len(frames_to_process)} frames.")
 
 
 if __name__ == "__main__":
