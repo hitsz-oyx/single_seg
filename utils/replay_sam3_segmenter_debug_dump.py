@@ -136,7 +136,7 @@ def load_camera_input(camera_dir: Path, camera_id: str, depth_device: torch.devi
         depth_m = torch.as_tensor(depth_np, dtype=torch.float32, device=depth_device)
     else:
         depth_m = depth_np
-    intrinsics = dict(payload["color_intrinsics"])
+    intrinsics = dict(payload.get("depth_intrinsics") or payload.get("color_intrinsics") or {})
     intrinsics["width"] = int(rgb.shape[1])
     intrinsics["height"] = int(rgb.shape[0])
     pose_record = dict(payload["pose_record"])

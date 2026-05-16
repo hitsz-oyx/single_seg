@@ -60,22 +60,23 @@ def matrix_from_entry(entry: object, prefer: str) -> np.ndarray | None:
     if not isinstance(entry, dict):
         return None
 
+    pointcloud_frame = str(entry.get("pointcloud_frame", entry.get("coordinate_frame", ""))).strip().lower()
+    prefer_depth = pointcloud_frame not in {"color", "rgb", "rgb_color"}
+    depth_keys = (
+        "depth_cam2world_4x4",
+        "rectified_depth_cam2world_4x4",
+        "single_seg_gl_depth_cam2world_4x4",
+    )
+    color_keys = (
+        "cam2world_4x4",
+        "single_seg_gl_cam2world_4x4",
+    )
+    frame_keys = depth_keys + color_keys if prefer_depth else color_keys + depth_keys
+
     if prefer == "original":
-        keys = (
-            "original_cam2world_4x4",
-            "cam2world_4x4",
-            "single_seg_gl_cam2world_4x4",
-            "refined_cam2world_4x4",
-            "new_cam2world",
-        )
+        keys = ("original_cam2world_4x4",) + frame_keys + ("refined_cam2world_4x4", "new_cam2world")
     else:
-        keys = (
-            "refined_cam2world_4x4",
-            "new_cam2world",
-            "cam2world_4x4",
-            "single_seg_gl_cam2world_4x4",
-            "original_cam2world_4x4",
-        )
+        keys = ("refined_cam2world_4x4", "new_cam2world") + frame_keys + ("original_cam2world_4x4",)
 
     for key in keys:
         if key in entry:
@@ -235,9 +236,32 @@ def load_payload_extrinsics(live_debug: Path, camera_ids: list[str]) -> dict[str
                 continue
             with payload_path.open() as f:
                 payload = json.load(f)
-            mat = as_matrix(payload.get("pose_record", {}).get("cam2world_4x4"))
-            if mat is not None:
-                extrinsics[cam_id] = mat
+            pointcloud_frame = str(
+                payload.get(
+                    "pointcloud_frame",
+                    payload.get("pose_record", {}).get("coordinate_frame", ""),
+                )
+            ).strip().lower()
+            records: list[object]
+            if pointcloud_frame in {"rectified_depth", "depth", "native_depth"}:
+                records = [
+                    payload.get("depth_pose_record"),
+                    payload.get("pose_record"),
+                    payload.get("color_pose_record"),
+                ]
+            else:
+                records = [
+                    payload.get("pose_record"),
+                    payload.get("color_pose_record"),
+                    payload.get("depth_pose_record"),
+                ]
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                mat = as_matrix(record.get("cam2world_4x4"))
+                if mat is not None:
+                    extrinsics[cam_id] = mat
+                    break
         if len(extrinsics) == len(camera_ids):
             return extrinsics
     raise FileNotFoundError(f"Could not find camera_payload.json for all cameras under {live_debug}")

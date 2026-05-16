@@ -36,6 +36,7 @@ DEPTH_SOURCE_CHOICES = ("fast", "native")
 STEREO_RECTIFICATION_CHOICES = ("opencv", "passthrough")
 DEPTH_EDGE_FILTER_STAGE_CHOICES = ("rectified", "aligned")
 FAST_ALIGN_BACKEND_CHOICES = ("torch", "open3d", "librealsense")
+CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float64)
 _RECTIFIED_RAY_GRID_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 if str(FAST_STEREO_ROOT) not in sys.path:
@@ -131,6 +132,18 @@ def intrinsics_to_payload(intr: rs.intrinsics) -> dict[str, float]:
     }
 
 
+def intrinsics_payload_from_k(k: np.ndarray, *, width: int, height: int) -> dict[str, float]:
+    matrix = np.asarray(k, dtype=np.float64).reshape(3, 3)
+    return {
+        "fx": float(matrix[0, 0]),
+        "fy": float(matrix[1, 1]),
+        "cx": float(matrix[0, 2]),
+        "cy": float(matrix[1, 2]),
+        "width": int(width),
+        "height": int(height),
+    }
+
+
 def intrinsics_payload_to_rs_intrinsics(
     intrinsics: dict[str, float],
     *,
@@ -174,6 +187,24 @@ def matrix_to_rs_extrinsics(mat: np.ndarray | torch.Tensor) -> rs.extrinsics:
     extr.rotation = matrix[:3, :3].T.reshape(-1).tolist()
     extr.translation = matrix[:3, 3].tolist()
     return extr
+
+
+def depth_gl_to_color_gl_transform(depth_to_color_cv: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Convert an OpenCV depth->color transform into single_seg GL camera coordinates."""
+    if torch.is_tensor(depth_to_color_cv):
+        depth_to_color = depth_to_color_cv.detach().cpu().numpy()
+    else:
+        depth_to_color = np.asarray(depth_to_color_cv, dtype=np.float64)
+    return CV_TO_GL @ depth_to_color.reshape(4, 4) @ CV_TO_GL
+
+
+def depth_cam2world_from_color_pose(
+    color_cam2world_gl: np.ndarray,
+    depth_to_color_cv: np.ndarray | torch.Tensor,
+) -> np.ndarray:
+    """Compose RGB/color cam2world with depth->color to get depth cam2world in GL convention."""
+    color_cam2world = np.asarray(color_cam2world_gl, dtype=np.float64).reshape(4, 4)
+    return color_cam2world @ depth_gl_to_color_gl_transform(depth_to_color_cv)
 
 
 def latest_frames(pipeline: rs.pipeline, timeout_ms: int) -> rs.composite_frame:
@@ -504,6 +535,68 @@ def align_rectified_depth_to_color_torch(
     return depth_out.reshape(out_height, out_width)
 
 
+def align_color_to_rectified_depth_torch(
+    color_image: np.ndarray | torch.Tensor,
+    depth_rect_m: torch.Tensor,
+    *,
+    rectified_intrinsics: dict[str, float],
+    rectified_to_color: np.ndarray | torch.Tensor,
+    color_intrinsics: dict[str, float],
+) -> torch.Tensor:
+    """Sample an RGB image onto the rectified depth grid without resampling depth."""
+    depth = depth_rect_m.to(dtype=torch.float32)
+    height, width = depth.shape
+    device = depth.device
+    if torch.is_tensor(color_image):
+        color = color_image.to(device=device, dtype=torch.uint8, non_blocking=True)
+    else:
+        color = torch.as_tensor(np.ascontiguousarray(color_image), dtype=torch.uint8, device=device)
+    if color.ndim != 3 or color.shape[2] < 3:
+        raise ValueError(f"color_image must be HxWx3, got {tuple(color.shape)}")
+    color = color[:, :, :3]
+    color_height, color_width = int(color.shape[0]), int(color.shape[1])
+    output = torch.zeros((height * width, 3), dtype=torch.uint8, device=device)
+
+    depth_flat = depth.reshape(-1)
+    valid = torch.isfinite(depth_flat) & (depth_flat > 0)
+    depth_valid = depth_flat[valid]
+    if depth_valid.numel() == 0:
+        return output.reshape(height, width, 3)
+
+    x_over_z, y_over_z = get_rectified_ray_grid(
+        height=int(height),
+        width=int(width),
+        intrinsics=rectified_intrinsics,
+        device=device,
+    )
+    x_rect = x_over_z[valid] * depth_valid
+    y_rect = y_over_z[valid] * depth_valid
+
+    transform = torch.as_tensor(rectified_to_color, dtype=torch.float32, device=device)
+    rot = transform[:3, :3]
+    trans = transform[:3, 3]
+    x_color = rot[0, 0] * x_rect + rot[0, 1] * y_rect + rot[0, 2] * depth_valid + trans[0]
+    y_color = rot[1, 0] * x_rect + rot[1, 1] * y_rect + rot[1, 2] * depth_valid + trans[1]
+    z_color = rot[2, 0] * x_rect + rot[2, 1] * y_rect + rot[2, 2] * depth_valid + trans[2]
+    valid_z = torch.isfinite(z_color) & (z_color > 0)
+    if not bool(valid_z.any().item()):
+        return output.reshape(height, width, 3)
+
+    fx = float(color_intrinsics["fx"])
+    fy = float(color_intrinsics["fy"])
+    cx = float(color_intrinsics["cx"])
+    cy = float(color_intrinsics["cy"])
+    u = torch.round((x_color[valid_z] * fx / z_color[valid_z]) + cx).to(torch.int64)
+    v = torch.round((y_color[valid_z] * fy / z_color[valid_z]) + cy).to(torch.int64)
+    in_bounds = (u >= 0) & (u < color_width) & (v >= 0) & (v < color_height)
+    if not bool(in_bounds.any().item()):
+        return output.reshape(height, width, 3)
+
+    depth_indices = torch.nonzero(valid, as_tuple=False).flatten()[valid_z]
+    output[depth_indices[in_bounds]] = color[v[in_bounds], u[in_bounds]]
+    return output.reshape(height, width, 3)
+
+
 def align_rectified_depth_to_color_open3d(
     depth_rect_m: torch.Tensor,
     *,
@@ -589,7 +682,7 @@ def align_rectified_depth_to_color_open3d(
 
 
 class LibrealsenseSoftwareAligner:
-    """Depth-to-color aligner using librealsense software frames."""
+    """Depth/color aligner using librealsense software frames."""
 
     def __init__(
         self,
@@ -601,10 +694,15 @@ class LibrealsenseSoftwareAligner:
         color_shape: tuple[int, int],
         depth_units: float = 0.0001,
         fps: int = 30,
+        align_to: str = "color",
     ) -> None:
         self.depth_units = float(depth_units)
         self.depth_height, self.depth_width = (int(depth_shape[0]), int(depth_shape[1]))
         self.color_height, self.color_width = (int(color_shape[0]), int(color_shape[1]))
+        align_to_normalized = str(align_to).strip().lower()
+        if align_to_normalized not in {"color", "depth"}:
+            raise ValueError("align_to must be 'color' or 'depth'")
+        self.align_to = align_to_normalized
         self.frame_number = 0
         self._pixel_refs: list[np.ndarray] = []
 
@@ -661,7 +759,7 @@ class LibrealsenseSoftwareAligner:
         self.color_sensor.open(self.color_profile)
         self.depth_sensor.start(self.syncer)
         self.color_sensor.start(self.syncer)
-        self.rs_align = rs.align(rs.stream.color)
+        self.rs_align = rs.align(rs.stream.color if self.align_to == "color" else rs.stream.depth)
         self._prime_syncer()
 
     def close(self) -> None:
@@ -727,7 +825,7 @@ class LibrealsenseSoftwareAligner:
         with contextlib.suppress(Exception):
             self.syncer.wait_for_frames(100)
 
-    def align(self, depth_m: np.ndarray, color_rgb: np.ndarray) -> np.ndarray:
+    def align_depth_to_color(self, depth_m: np.ndarray, color_rgb: np.ndarray) -> np.ndarray:
         depth_z16 = self._depth_to_z16(depth_m)
         self._push_frames(depth_z16, color_rgb)
         frames = self._wait_for_frameset()
@@ -737,6 +835,21 @@ class LibrealsenseSoftwareAligner:
             raise RuntimeError("librealsense align did not produce an aligned depth frame")
         aligned_z16 = np.asanyarray(aligned_depth.get_data()).astype(np.float32, copy=False)
         return aligned_z16 * self.depth_units
+
+    def align_color_to_depth(self, depth_m: np.ndarray, color_rgb: np.ndarray) -> np.ndarray:
+        depth_z16 = self._depth_to_z16(depth_m)
+        self._push_frames(depth_z16, color_rgb)
+        frames = self._wait_for_frameset()
+        aligned_frames = self.rs_align.process(frames)
+        aligned_color = aligned_frames.get_color_frame()
+        if not aligned_color:
+            raise RuntimeError("librealsense align did not produce an aligned color frame")
+        return np.ascontiguousarray(np.asanyarray(aligned_color.get_data())[..., :3])
+
+    def align(self, depth_m: np.ndarray, color_rgb: np.ndarray) -> np.ndarray:
+        if self.align_to == "depth":
+            return self.align_color_to_depth(depth_m, color_rgb)
+        return self.align_depth_to_color(depth_m, color_rgb)
 
 
 def filter_depth_edges_torch(depth_m: torch.Tensor, *, threshold_m: float) -> torch.Tensor:
@@ -806,7 +919,11 @@ def build_live_debug_camera_payload(
         "rgb_file": "rgb.png",
         "depth_aligned_file": "depth_aligned_m.npy",
         "color_intrinsics": to_jsonable(payload.get("color_intrinsics")),
+        "depth_intrinsics": to_jsonable(payload.get("depth_intrinsics")),
         "pose_record": to_jsonable(payload.get("pose_record")),
+        "color_pose_record": to_jsonable(payload.get("color_pose_record")),
+        "depth_pose_record": to_jsonable(payload.get("depth_pose_record")),
+        "pointcloud_frame": str(payload.get("pointcloud_frame", "color")),
         "emitter_enabled": to_jsonable(payload.get("emitter_enabled")),
         "depth_min": float(depth_min),
         "depth_max": float(depth_max),
@@ -816,12 +933,14 @@ def build_live_debug_camera_payload(
             {
                 "stereo_rectification_mode": str(payload.get("stereo_rectification_mode", "opencv")),
                 "fast_align_backend": str(payload.get("fast_align_backend", "torch")),
+                "fast_alignment_direction": str(payload.get("fast_alignment_direction", "depth_to_color")),
                 "ir_left_raw_file": "ir_left_raw.png",
                 "ir_right_raw_file": "ir_right_raw.png",
                 "ir_left_rect_file": "ir_left_rect.png",
                 "ir_right_rect_file": "ir_right_rect.png",
                 "rectified_k": to_jsonable(payload["rectified_k"]),
                 "rectified_to_color": to_jsonable(payload["rectified_to_color"]),
+                "depth_to_color_4x4": to_jsonable(payload.get("depth_to_color_4x4")),
                 "baseline_m": float(payload["baseline_m"]),
                 "left_ir_intrinsics": to_jsonable(payload.get("left_ir_intrinsics")),
                 "right_ir_intrinsics": to_jsonable(payload.get("right_ir_intrinsics")),
@@ -955,10 +1074,13 @@ def write_live_debug_config_snapshot(
             "requested_emitter_enabled": camera.emitter_enabled,
             "applied_emitter_enabled": camera.applied_emitter_enabled,
             "color_intrinsics": to_jsonable(camera.color_intrinsics),
+            "depth_intrinsics": to_jsonable(camera.depth_intrinsics),
             "left_ir_intrinsics": to_jsonable(camera.left_ir_intrinsics),
             "right_ir_intrinsics": to_jsonable(camera.right_ir_intrinsics),
             "left_to_right_4x4": to_jsonable(camera.left_to_right_4x4),
+            "depth_to_color_4x4": to_jsonable(camera.depth_to_color_4x4),
             "pose_record": to_jsonable(camera.pose_record),
+            "depth_pose_record": to_jsonable(camera.depth_pose_record),
         }
         for camera in cameras
     ]
@@ -989,6 +1111,8 @@ class LiveCameraPose:
     camera_id: str
     serial_number: str
     cam2world_4x4: np.ndarray
+    depth_cam2world_4x4: np.ndarray | None = None
+    pose_record: dict[str, object] | None = None
 
 
 def load_live_camera_pose_map(pose_path: Path | None) -> dict[str, LiveCameraPose]:
@@ -1011,10 +1135,19 @@ def load_live_camera_pose_map(pose_path: Path | None) -> dict[str, LiveCameraPos
         cam2world = np.asarray(camera.get("cam2world_4x4"), dtype=np.float64)
         if cam2world.shape != (4, 4):
             raise ValueError(f"camera {camera_id} must define cam2world_4x4")
+        depth_payload = camera.get("depth_cam2world_4x4", camera.get("rectified_depth_cam2world_4x4"))
+        depth_cam2world = None
+        if depth_payload is not None:
+            depth_cam2world_arr = np.asarray(depth_payload, dtype=np.float64)
+            if depth_cam2world_arr.shape != (4, 4):
+                raise ValueError(f"camera {camera_id} depth_cam2world_4x4 must be 4x4")
+            depth_cam2world = depth_cam2world_arr
         pose = LiveCameraPose(
             camera_id=camera_id,
             serial_number=serial_number,
             cam2world_4x4=cam2world,
+            depth_cam2world_4x4=depth_cam2world,
+            pose_record=dict(camera),
         )
         pose_map[camera_id] = pose
         pose_map[serial_number] = pose
@@ -1041,16 +1174,57 @@ def resolve_live_pose(
         camera_id=camera_id,
         serial_number=serial_number,
         cam2world_4x4=np.eye(4, dtype=np.float64),
+        depth_cam2world_4x4=None,
+        pose_record=None,
     )
 
 
-def pose_record_from_cam2world(camera_id: str, cam2world_4x4: np.ndarray) -> dict[str, object]:
+def pose_record_from_cam2world(
+    camera_id: str,
+    cam2world_4x4: np.ndarray,
+    *,
+    coordinate_frame: str = "color",
+) -> dict[str, object]:
     world2cam = np.linalg.inv(cam2world_4x4)
     return {
         "camera_id": camera_id,
+        "coordinate_frame": str(coordinate_frame),
         "cam2world_4x4": cam2world_4x4.tolist(),
         "world2cam_4x4": world2cam.tolist(),
     }
+
+
+def resolve_depth_pose_record_from_payload(
+    payload: dict[str, object],
+    *,
+    coordinate_frame: str,
+) -> dict[str, object]:
+    depth_pose = payload.get("depth_pose_record")
+    if isinstance(depth_pose, dict) and depth_pose.get("cam2world_4x4") is not None:
+        return dict(depth_pose)
+    color_pose = payload.get("pose_record")
+    if isinstance(color_pose, dict) and color_pose.get("cam2world_4x4") is not None:
+        depth_to_color = payload.get("depth_to_color_4x4", payload.get("rectified_to_color"))
+        if depth_to_color is not None:
+            depth_cam2world = depth_cam2world_from_color_pose(
+                np.asarray(color_pose["cam2world_4x4"], dtype=np.float64),
+                np.asarray(depth_to_color, dtype=np.float64),
+            )
+            record = pose_record_from_cam2world(
+                str(payload.get("camera_id", color_pose.get("camera_id", "cam_00"))),
+                depth_cam2world,
+                coordinate_frame=coordinate_frame,
+            )
+            record.update(
+                {
+                    "depth_cam2world_4x4": depth_cam2world.tolist(),
+                    "world2depth_4x4": np.linalg.inv(depth_cam2world).tolist(),
+                    "color_cam2world_4x4": np.asarray(color_pose["cam2world_4x4"], dtype=np.float64).tolist(),
+                    "depth_to_color_4x4": np.asarray(depth_to_color, dtype=np.float64).tolist(),
+                }
+            )
+            return record
+    return dict(color_pose) if isinstance(color_pose, dict) else {"camera_id": str(payload.get("camera_id", "cam_00"))}
 
 
 class FastFoundationStereoRunner:
@@ -1184,6 +1358,8 @@ class RealSenseRgbdCamera:
         camera_id: str,
         serial_number: str,
         cam2world_4x4: np.ndarray,
+        depth_cam2world_4x4: np.ndarray | None = None,
+        source_pose_record: dict[str, object] | None = None,
         color_width: int,
         color_height: int,
         stereo_width: int,
@@ -1198,6 +1374,10 @@ class RealSenseRgbdCamera:
         self.camera_id = str(camera_id)
         self.serial_number = str(serial_number)
         self.cam2world_4x4 = np.asarray(cam2world_4x4, dtype=np.float64)
+        self.configured_depth_cam2world_4x4 = (
+            None if depth_cam2world_4x4 is None else np.asarray(depth_cam2world_4x4, dtype=np.float64)
+        )
+        self.source_pose_record = dict(source_pose_record or {})
         self.color_width = int(color_width)
         self.color_height = int(color_height)
         self.stereo_width = int(stereo_width)
@@ -1214,6 +1394,9 @@ class RealSenseRgbdCamera:
         self.left_ir_intrinsics: dict[str, float] | None = None
         self.right_ir_intrinsics: dict[str, float] | None = None
         self.left_to_right_4x4: np.ndarray | None = None
+        self.depth_intrinsics: dict[str, float] | None = None
+        self.depth_to_color_4x4: np.ndarray | None = None
+        self.depth_cam2world_4x4: np.ndarray | None = self.configured_depth_cam2world_4x4
         self.color_map1: np.ndarray | None = None
         self.color_map2: np.ndarray | None = None
         self.rectification: dict[str, object] | None = None
@@ -1221,7 +1404,44 @@ class RealSenseRgbdCamera:
         self.align_to_color: object | None = None
         self.depth_scale = 0.001
         self.applied_emitter_enabled: bool | None = None
-        self.pose_record: dict[str, object] = pose_record_from_cam2world(self.camera_id, self.cam2world_4x4)
+        self.pose_record: dict[str, object] = pose_record_from_cam2world(
+            self.camera_id,
+            self.cam2world_4x4,
+            coordinate_frame="color",
+        )
+        self.depth_pose_record: dict[str, object] | None = None
+
+    def _set_depth_geometry(
+        self,
+        *,
+        depth_intrinsics: dict[str, float],
+        depth_to_color_4x4: np.ndarray,
+        coordinate_frame: str,
+    ) -> None:
+        self.depth_intrinsics = dict(depth_intrinsics)
+        self.depth_to_color_4x4 = np.asarray(depth_to_color_4x4, dtype=np.float64)
+        computed_depth_pose = depth_cam2world_from_color_pose(
+            self.cam2world_4x4,
+            self.depth_to_color_4x4,
+        )
+        self.depth_cam2world_4x4 = (
+            self.configured_depth_cam2world_4x4
+            if self.configured_depth_cam2world_4x4 is not None
+            else computed_depth_pose
+        )
+        self.depth_pose_record = pose_record_from_cam2world(
+            self.camera_id,
+            self.depth_cam2world_4x4,
+            coordinate_frame=coordinate_frame,
+        )
+        self.depth_pose_record.update(
+            {
+                "depth_cam2world_4x4": self.depth_cam2world_4x4.tolist(),
+                "world2depth_4x4": np.linalg.inv(self.depth_cam2world_4x4).tolist(),
+                "color_cam2world_4x4": self.cam2world_4x4.tolist(),
+                "depth_to_color_4x4": self.depth_to_color_4x4.tolist(),
+            }
+        )
 
     def start(self) -> None:
         config = rs.config()
@@ -1248,8 +1468,16 @@ class RealSenseRgbdCamera:
         color_intr = color_profile.get_intrinsics()
         self.color_intrinsics = intrinsics_to_payload(color_intr)
         if self.depth_source == "native":
+            depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            depth_intr = depth_profile.get_intrinsics()
+            depth_to_color = extrinsics_to_matrix(depth_profile.get_extrinsics_to(color_profile))
+            self._set_depth_geometry(
+                depth_intrinsics=intrinsics_to_payload(depth_intr),
+                depth_to_color_4x4=depth_to_color,
+                coordinate_frame="native_depth",
+            )
             self.depth_scale = float(depth_sensor.get_depth_scale())
-            self.align_to_color = rs.align(rs.stream.color)
+            self.align_to_color = rs.align(rs.stream.depth)
             return
 
         left_profile = self.profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
@@ -1277,6 +1505,16 @@ class RealSenseRgbdCamera:
         )
         rectified_to_left = np.asarray(self.rectification["rectified_to_left"], dtype=np.float64)
         self.rectified_to_color = left_to_color @ rectified_to_left
+        rectified_k = np.asarray(self.rectification["rectified_k"], dtype=np.float32)
+        self._set_depth_geometry(
+            depth_intrinsics=intrinsics_payload_from_k(
+                rectified_k,
+                width=self.stereo_width,
+                height=self.stereo_height,
+            ),
+            depth_to_color_4x4=self.rectified_to_color,
+            coordinate_frame="rectified_depth",
+        )
 
     def warmup(self, num_frames: int) -> None:
         for _ in range(max(int(num_frames), 0)):
@@ -1302,7 +1540,11 @@ class RealSenseRgbdCamera:
                 "rgb": cv2.cvtColor(color_raw_bgr, cv2.COLOR_BGR2RGB),
                 "depth_m": depth_m,
                 "color_intrinsics": self.color_intrinsics,
-                "pose_record": self.pose_record,
+                "depth_intrinsics": self.depth_intrinsics,
+                "depth_to_color_4x4": self.depth_to_color_4x4,
+                "color_pose_record": self.pose_record,
+                "depth_pose_record": self.depth_pose_record,
+                "pose_record": self.depth_pose_record or self.pose_record,
             }
 
         if (
@@ -1350,11 +1592,15 @@ class RealSenseRgbdCamera:
             "stereo_rectification_mode": self.stereo_rectification_mode,
             "rectified_k": self.rectification["rectified_k"],
             "rectified_to_color": self.rectified_to_color,
+            "depth_intrinsics": self.depth_intrinsics,
+            "depth_to_color_4x4": self.depth_to_color_4x4,
             "baseline_m": self.rectification["baseline_m"],
             "left_ir_intrinsics": self.left_ir_intrinsics,
             "right_ir_intrinsics": self.right_ir_intrinsics,
             "left_to_right_4x4": self.left_to_right_4x4,
             "color_intrinsics": self.color_intrinsics,
+            "color_pose_record": self.pose_record,
+            "depth_pose_record": self.depth_pose_record,
             "pose_record": self.pose_record,
         }
 
@@ -1690,9 +1936,15 @@ def build_camera_inputs_from_live_frames(
         depth_source = normalize_depth_source(payload.get("depth_source", "fast"))
         logging.info(f"Building RGBD for {camera_id} using depth_source={depth_source}")
         rgb = np.asarray(payload["rgb"], dtype=np.uint8)
+        rgb_for_points = rgb
+        intrinsics_for_points = dict(payload.get("color_intrinsics", {}))
+        pose_record_for_points = dict(payload.get("pose_record", {"camera_id": camera_id}))
+        pointcloud_frame = "color"
+        fast_alignment_direction = "none"
         ir_left_rect: np.ndarray | None = None
         ir_right_rect: np.ndarray | None = None
         edge_filter_summary: dict[str, object] | None = None
+        stereo_intrinsics: dict[str, float] | None = None
         stereo_time_sec = 0.0
         rectified_edge_filter_time_sec = 0.0
         depth_align_time_sec = 0.0
@@ -1706,6 +1958,9 @@ def build_camera_inputs_from_live_frames(
         if depth_source == "native":
             native_depth_t0 = time.perf_counter()
             depth_aligned_m = np.asarray(payload["depth_m"], dtype=np.float32)
+            intrinsics_for_points = dict(payload.get("depth_intrinsics") or payload.get("color_intrinsics", {}))
+            pose_record_for_points = dict(payload.get("depth_pose_record") or payload.get("pose_record", {}))
+            pointcloud_frame = "native_depth"
             depth_align_time_sec = time.perf_counter() - native_depth_t0
         else:
             if stereo_runner is None:
@@ -1725,6 +1980,7 @@ def build_camera_inputs_from_live_frames(
             sync_cuda_if_needed(sync_timing)
             stereo_time_sec = time.perf_counter() - stereo_t0
             rectified_depth_m = stereo_output["depth_m"]
+            stereo_intrinsics = dict(stereo_output["rectified_intrinsics"])
             if bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "rectified":
                 if not torch.is_tensor(rectified_depth_m):
                     raise RuntimeError("Fast rectified depth edge filtering requires torch depth output")
@@ -1747,34 +2003,12 @@ def build_camera_inputs_from_live_frames(
                     "valid_pixels_after": valid_after,
                     "removed_pixels": int(max(valid_before - valid_after, 0)),
                 }
-            if align_backend == "librealsense":
-                if fast_aligners is None:
-                    raise RuntimeError("fast_align_backend='librealsense' requires a fast_aligners cache")
-                sync_cuda_if_needed(sync_timing)
-                align_total_t0 = time.perf_counter()
-                cpu_t0 = time.perf_counter()
-                rectified_depth_np = rectified_depth_m.detach().cpu().numpy().astype(np.float32, copy=False)
-                depth_to_cpu_time_sec = time.perf_counter() - cpu_t0
-                aligner = fast_aligners.get(camera_id)
-                if aligner is None:
-                    aligner = LibrealsenseSoftwareAligner(
-                        rectified_intrinsics=dict(stereo_output["rectified_intrinsics"]),
-                        rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
-                        color_intrinsics=dict(payload["color_intrinsics"]),
-                        depth_shape=rectified_depth_np.shape,
-                        color_shape=rgb.shape[:2],
-                    )
-                    fast_aligners[camera_id] = aligner
-                librealsense_t0 = time.perf_counter()
-                depth_aligned_m = aligner.align(rectified_depth_np, rgb)
-                librealsense_align_time_sec = time.perf_counter() - librealsense_t0
-                depth_align_time_sec = time.perf_counter() - align_total_t0
-            elif align_backend == "open3d":
+            if align_backend == "open3d":
                 sync_cuda_if_needed(sync_timing)
                 align_t0 = time.perf_counter()
                 depth_aligned_m = align_rectified_depth_to_color_open3d(
                     rectified_depth_m,
-                    rectified_intrinsics=stereo_output["rectified_intrinsics"],
+                    rectified_intrinsics=stereo_intrinsics,
                     rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
                     color_intrinsics=dict(payload["color_intrinsics"]),
                     color_shape=rgb.shape[:2],
@@ -1783,18 +2017,16 @@ def build_camera_inputs_from_live_frames(
                 sync_cuda_if_needed(sync_timing)
                 open3d_align_time_sec = time.perf_counter() - align_t0
                 depth_align_time_sec = open3d_align_time_sec
+                fast_alignment_direction = "depth_to_color"
             else:
-                sync_cuda_if_needed(sync_timing)
-                align_t0 = time.perf_counter()
-                depth_aligned_m = align_rectified_depth_to_color_torch(
-                    rectified_depth_m,
-                    rectified_intrinsics=stereo_output["rectified_intrinsics"],
-                    rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
-                    color_intrinsics=dict(payload["color_intrinsics"]),
-                    color_shape=rgb.shape[:2],
+                depth_aligned_m = rectified_depth_m
+                intrinsics_for_points = dict(stereo_intrinsics)
+                pose_record_for_points = resolve_depth_pose_record_from_payload(
+                    payload,
+                    coordinate_frame="rectified_depth",
                 )
-                sync_cuda_if_needed(sync_timing)
-                depth_align_time_sec = time.perf_counter() - align_t0
+                pointcloud_frame = "rectified_depth"
+                fast_alignment_direction = "color_to_depth"
         if torch.is_tensor(depth_aligned_m):
             sync_cuda_if_needed(sync_timing)
             range_t0 = time.perf_counter()
@@ -1859,22 +2091,80 @@ def build_camera_inputs_from_live_frames(
             valid_t0 = time.perf_counter()
             depth_valid_ratio = float((depth_aligned_m > 0).mean())
             depth_valid_ratio_time_sec = time.perf_counter() - valid_t0
+
+        if depth_source == "fast" and align_backend != "open3d":
+            if stereo_intrinsics is None:
+                raise RuntimeError("missing FastStereo rectified intrinsics")
+            if align_backend == "librealsense":
+                if fast_aligners is None:
+                    raise RuntimeError("fast_align_backend='librealsense' requires a fast_aligners cache")
+                sync_cuda_if_needed(sync_timing)
+                align_total_t0 = time.perf_counter()
+                cpu_t0 = time.perf_counter()
+                if torch.is_tensor(depth_aligned_m):
+                    rectified_depth_np = depth_aligned_m.detach().cpu().numpy().astype(np.float32, copy=False)
+                else:
+                    rectified_depth_np = np.asarray(depth_aligned_m, dtype=np.float32)
+                depth_to_cpu_time_sec = time.perf_counter() - cpu_t0
+                aligner = fast_aligners.get(camera_id)
+                if aligner is None:
+                    aligner = LibrealsenseSoftwareAligner(
+                        rectified_intrinsics=stereo_intrinsics,
+                        rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                        color_intrinsics=dict(payload["color_intrinsics"]),
+                        depth_shape=rectified_depth_np.shape,
+                        color_shape=rgb.shape[:2],
+                        align_to="depth",
+                    )
+                    fast_aligners[camera_id] = aligner
+                librealsense_t0 = time.perf_counter()
+                rgb_for_points = aligner.align_color_to_depth(rectified_depth_np, rgb)
+                librealsense_align_time_sec = time.perf_counter() - librealsense_t0
+                depth_align_time_sec = time.perf_counter() - align_total_t0
+                depth_aligned_m = rectified_depth_np
+            else:
+                if not torch.is_tensor(depth_aligned_m):
+                    depth_for_color = torch.as_tensor(np.ascontiguousarray(depth_aligned_m), dtype=torch.float32)
+                else:
+                    depth_for_color = depth_aligned_m
+                sync_cuda_if_needed(sync_timing)
+                align_t0 = time.perf_counter()
+                rgb_depth_t = align_color_to_rectified_depth_torch(
+                    rgb,
+                    depth_for_color,
+                    rectified_intrinsics=stereo_intrinsics,
+                    rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                    color_intrinsics=dict(payload["color_intrinsics"]),
+                )
+                sync_cuda_if_needed(sync_timing)
+                depth_align_time_sec = time.perf_counter() - align_t0
+                rgb_for_points = rgb_depth_t.detach().cpu().numpy()
+
         camera_inputs[camera_id] = {
-            "rgb": rgb,
+            "rgb": rgb_for_points,
             "depth_m": depth_aligned_m,
-            "intrinsics": dict(payload["color_intrinsics"]),
-            "pose_record": dict(payload["pose_record"]),
+            "intrinsics": intrinsics_for_points,
+            "pose_record": pose_record_for_points,
             "fovy_deg": None,
         }
         if depth_source == "fast":
             camera_inputs[camera_id]["stereo_time_sec"] = stereo_time_sec
             camera_inputs[camera_id]["fast_align_backend"] = align_backend
+            camera_inputs[camera_id]["fast_alignment_direction"] = fast_alignment_direction
+            camera_inputs[camera_id]["pointcloud_frame"] = pointcloud_frame
         if edge_filter_summary is not None:
             camera_inputs[camera_id]["fast_depth_edge_filter"] = edge_filter_summary
         if write_debug_images:
             debug_t0 = time.perf_counter()
             camera_payload = build_live_debug_camera_payload(
-                payload={**payload, "fast_align_backend": align_backend},
+                payload={
+                    **payload,
+                    "depth_intrinsics": intrinsics_for_points,
+                    "pose_record": pose_record_for_points,
+                    "pointcloud_frame": pointcloud_frame,
+                    "fast_align_backend": align_backend,
+                    "fast_alignment_direction": fast_alignment_direction,
+                },
                 depth_source=depth_source,
                 depth_min=float(depth_min),
                 depth_max=float(depth_max),
@@ -1886,7 +2176,7 @@ def build_camera_inputs_from_live_frames(
                 frame_index=frame_index,
                 camera_id=camera_id,
                 depth_source=depth_source,
-                rgb=rgb,
+                rgb=rgb_for_points,
                 ir_left=ir_left_rect,
                 ir_right=ir_right_rect,
                 depth_aligned_m=depth_aligned_m,
@@ -1900,6 +2190,8 @@ def build_camera_inputs_from_live_frames(
             "depth_source": depth_source,
             "total_time_sec": time.perf_counter() - camera_t0,
             "depth_align_backend": align_backend if depth_source == "fast" else "native",
+            "alignment_direction": fast_alignment_direction if depth_source == "fast" else "color_to_depth",
+            "pointcloud_frame": pointcloud_frame,
             "stereo_infer_time_sec": stereo_time_sec,
             "rectified_edge_filter_time_sec": rectified_edge_filter_time_sec,
             "depth_align_time_sec": depth_align_time_sec,
@@ -1938,6 +2230,9 @@ def build_camera_inputs_from_live_frames(
                 "sync_timing": bool(sync_timing),
                 "camera_count": len(per_camera_timing),
                 "fast_align_backend": align_backend,
+                "fast_alignment_direction": (
+                    "color_to_depth" if align_backend != "open3d" else "depth_to_color"
+                ),
                 "stereo_infer_time_sec": stereo_infer_total,
                 "depth_align_time_sec": depth_align_total,
                 "depth_to_cpu_time_sec": depth_to_cpu_total,
@@ -1976,6 +2271,8 @@ def run_live(args: argparse.Namespace) -> None:
                 camera_id=pose.camera_id,
                 serial_number=serial,
                 cam2world_4x4=pose.cam2world_4x4,
+                depth_cam2world_4x4=pose.depth_cam2world_4x4,
+                source_pose_record=pose.pose_record,
                 color_width=int(args.color_width),
                 color_height=int(args.color_height),
                 stereo_width=int(args.stereo_width),

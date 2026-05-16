@@ -16,7 +16,7 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_PATH = REPO_ROOT / "tests" / "outputs" / "camera_poses_apriltag.json"
+DEFAULT_OUTPUT_PATH = REPO_ROOT / "configs" / "camera_poses_apriltag.json"
 FURNITURE_BASE_TAG_SIZE_M = 0.048
 FURNITURE_BASE_TAG_POSES: dict[int, np.ndarray] = {
     0: np.array([[-0.03, -0.03, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64),
@@ -46,6 +46,12 @@ class CameraCalibration:
     tag_counts: dict[int, int]
     mean_pose_error: float | None
     mean_decision_margin: float | None
+    depth_intrinsics: dict[str, float] | None = None
+    depth_to_color_4x4: np.ndarray | None = None
+    world_t_depth_cv: np.ndarray | None = None
+    world_t_depth_single_seg: np.ndarray | None = None
+    depth_frame: str | None = None
+    baseline_m: float | None = None
 
 
 def resolve_path(path_like: str | Path) -> Path:
@@ -244,6 +250,73 @@ def single_seg_pose_from_opencv_pose(world_t_camera_cv: np.ndarray) -> np.ndarra
     return np.asarray(world_t_camera_cv, dtype=np.float64) @ CV_TO_GL
 
 
+def extrinsics_to_matrix(extr: Any) -> np.ndarray:
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = np.asarray(extr.rotation, dtype=np.float64).reshape(3, 3).T
+    mat[:3, 3] = np.asarray(extr.translation, dtype=np.float64)
+    return mat
+
+
+def intrinsics_matrix_from_rs(intrinsics: Any) -> np.ndarray:
+    return np.array(
+        [[intrinsics.fx, 0.0, intrinsics.ppx], [0.0, intrinsics.fy, intrinsics.ppy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def intrinsics_payload_from_k(k: np.ndarray, *, width: int, height: int) -> dict[str, float]:
+    matrix = np.asarray(k, dtype=np.float64).reshape(3, 3)
+    return {
+        "fx": float(matrix[0, 0]),
+        "fy": float(matrix[1, 1]),
+        "cx": float(matrix[0, 2]),
+        "cy": float(matrix[1, 2]),
+        "width": int(width),
+        "height": int(height),
+    }
+
+
+def build_rectified_depth_geometry(
+    left_intr: Any,
+    right_intr: Any,
+    left_to_right: np.ndarray,
+    left_to_color: np.ndarray,
+    *,
+    image_size: tuple[int, int],
+    alpha: float,
+    mode: str,
+) -> tuple[dict[str, float], np.ndarray, float]:
+    if str(mode) == "passthrough":
+        rectified_to_left = np.eye(4, dtype=np.float64)
+        rectified_k = intrinsics_matrix_from_rs(left_intr)
+        baseline_m = abs(float(left_to_right[0, 3]))
+        if baseline_m <= 0.0:
+            baseline_m = float(np.linalg.norm(left_to_right[:3, 3]))
+    else:
+        k1 = intrinsics_matrix_from_rs(left_intr)
+        k2 = intrinsics_matrix_from_rs(right_intr)
+        d1 = np.asarray(left_intr.coeffs[:5], dtype=np.float64)
+        d2 = np.asarray(right_intr.coeffs[:5], dtype=np.float64)
+        r1, _, p1, _, _, _, _ = cv2.stereoRectify(
+            k1,
+            d1,
+            k2,
+            d2,
+            image_size,
+            left_to_right[:3, :3],
+            left_to_right[:3, 3:4],
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            alpha=float(alpha),
+        )
+        rectified_to_left = np.eye(4, dtype=np.float64)
+        rectified_to_left[:3, :3] = r1.T
+        rectified_k = p1[:3, :3].astype(np.float64)
+        baseline_m = float(np.linalg.norm(left_to_right[:3, 3]))
+    rectified_to_color = np.asarray(left_to_color, dtype=np.float64) @ rectified_to_left
+    depth_intrinsics = intrinsics_payload_from_k(rectified_k, width=image_size[0], height=image_size[1])
+    return depth_intrinsics, rectified_to_color, baseline_m
+
+
 def intrinsics_payload_from_rs(intrinsics: Any) -> dict[str, float]:
     return {
         "fx": float(intrinsics.fx),
@@ -332,6 +405,10 @@ class RealSenseColorCamera:
         serial_number: str,
         width: int,
         height: int,
+        stereo_width: int,
+        stereo_height: int,
+        stereo_alpha: float,
+        stereo_rectification_mode: str,
         fps: int,
         wait_timeout_ms: int,
         disable_auto_exposure: bool,
@@ -345,20 +422,58 @@ class RealSenseColorCamera:
         self.serial_number = str(serial_number)
         self.width = int(width)
         self.height = int(height)
+        self.stereo_width = int(stereo_width)
+        self.stereo_height = int(stereo_height)
+        self.stereo_alpha = float(stereo_alpha)
+        self.stereo_rectification_mode = str(stereo_rectification_mode)
         self.fps = int(fps)
         self.wait_timeout_ms = int(wait_timeout_ms)
         self.disable_auto_exposure = bool(disable_auto_exposure)
         self.pipeline = rs.pipeline()
         self.profile = None
         self.intrinsics: dict[str, float] | None = None
+        self.depth_intrinsics: dict[str, float] | None = None
+        self.depth_to_color_4x4: np.ndarray | None = None
+        self.depth_frame = "rectified_depth"
+        self.baseline_m: float | None = None
 
     def start(self) -> None:
         config = self.rs.config()
         config.enable_device(self.serial_number)
         config.enable_stream(self.rs.stream.color, self.width, self.height, self.rs.format.bgr8, self.fps)
+        config.enable_stream(
+            self.rs.stream.infrared,
+            1,
+            self.stereo_width,
+            self.stereo_height,
+            self.rs.format.y8,
+            self.fps,
+        )
+        config.enable_stream(
+            self.rs.stream.infrared,
+            2,
+            self.stereo_width,
+            self.stereo_height,
+            self.rs.format.y8,
+            self.fps,
+        )
         self.profile = self.pipeline.start(config)
         color_profile = self.profile.get_stream(self.rs.stream.color).as_video_stream_profile()
         self.intrinsics = intrinsics_payload_from_rs(color_profile.get_intrinsics())
+        left_profile = self.profile.get_stream(self.rs.stream.infrared, 1).as_video_stream_profile()
+        right_profile = self.profile.get_stream(self.rs.stream.infrared, 2).as_video_stream_profile()
+        depth_intrinsics, depth_to_color, baseline_m = build_rectified_depth_geometry(
+            left_profile.get_intrinsics(),
+            right_profile.get_intrinsics(),
+            extrinsics_to_matrix(left_profile.get_extrinsics_to(right_profile)),
+            extrinsics_to_matrix(left_profile.get_extrinsics_to(color_profile)),
+            image_size=(self.stereo_width, self.stereo_height),
+            alpha=self.stereo_alpha,
+            mode=self.stereo_rectification_mode,
+        )
+        self.depth_intrinsics = depth_intrinsics
+        self.depth_to_color_4x4 = depth_to_color
+        self.baseline_m = baseline_m
         if self.disable_auto_exposure:
             sensor = self.profile.get_device().first_color_sensor()
             sensor.set_option(self.rs.option.enable_auto_exposure, False)
@@ -437,6 +552,10 @@ def calibrate_camera_from_frames(
     detector: AprilTagPoseDetector,
     min_tags_per_frame: int,
     debug_dir: Path | None,
+    depth_intrinsics: dict[str, float] | None = None,
+    depth_to_color_4x4: np.ndarray | None = None,
+    depth_frame: str | None = None,
+    baseline_m: float | None = None,
 ) -> CameraCalibration:
     pose_observations: list[np.ndarray] = []
     pose_errors: list[float] = []
@@ -494,6 +613,8 @@ def calibrate_camera_from_frames(
             f"{debug_hint}"
         )
     world_t_camera_cv = average_transforms(pose_observations)
+    depth_to_color = None if depth_to_color_4x4 is None else np.asarray(depth_to_color_4x4, dtype=np.float64)
+    world_t_depth_cv = None if depth_to_color is None else world_t_camera_cv @ depth_to_color
     if debug_dir is not None and last_debug is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(debug_dir / f"{camera_id}_detections.png"), last_debug)
@@ -508,6 +629,12 @@ def calibrate_camera_from_frames(
         tag_counts={int(key): int(value) for key, value in tag_counts.items() if int(value) > 0},
         mean_pose_error=float(np.mean(pose_errors)) if pose_errors else None,
         mean_decision_margin=float(np.mean(margins)) if margins else None,
+        depth_intrinsics=None if depth_intrinsics is None else dict(depth_intrinsics),
+        depth_to_color_4x4=depth_to_color,
+        world_t_depth_cv=world_t_depth_cv,
+        world_t_depth_single_seg=None if world_t_depth_cv is None else single_seg_pose_from_opencv_pose(world_t_depth_cv),
+        depth_frame=depth_frame,
+        baseline_m=None if baseline_m is None else float(baseline_m),
     )
 
 
@@ -519,6 +646,10 @@ def calibrate_live_cameras(args: argparse.Namespace, layout: TagLayout, detector
             serial_number=serial,
             width=int(args.width),
             height=int(args.height),
+            stereo_width=int(args.stereo_width),
+            stereo_height=int(args.stereo_height),
+            stereo_alpha=float(args.stereo_alpha),
+            stereo_rectification_mode=str(args.stereo_rectification_mode),
             fps=int(args.fps),
             wait_timeout_ms=int(args.wait_timeout_ms),
             disable_auto_exposure=bool(args.disable_auto_exposure),
@@ -551,6 +682,10 @@ def calibrate_live_cameras(args: argparse.Namespace, layout: TagLayout, detector
                     detector=detector,
                     min_tags_per_frame=int(args.min_tags_per_frame),
                     debug_dir=resolve_path(args.debug_dir) if args.debug_dir is not None else None,
+                    depth_intrinsics=camera.depth_intrinsics,
+                    depth_to_color_4x4=camera.depth_to_color_4x4,
+                    depth_frame=camera.depth_frame,
+                    baseline_m=camera.baseline_m,
                 )
             )
         return calibrations
@@ -623,7 +758,7 @@ def calibration_to_payload(calibration: CameraCalibration, output_convention: st
         cam2world = calibration.world_t_camera_single_seg
     else:
         raise ValueError(f"unsupported output convention: {output_convention}")
-    return {
+    payload: dict[str, Any] = {
         "camera_id": calibration.camera_id,
         "serial_number": calibration.serial_number,
         "cam2world_4x4": cam2world.tolist(),
@@ -637,6 +772,31 @@ def calibration_to_payload(calibration: CameraCalibration, output_convention: st
         "mean_pose_error": calibration.mean_pose_error,
         "mean_decision_margin": calibration.mean_decision_margin,
     }
+    if calibration.world_t_depth_single_seg is not None and calibration.world_t_depth_cv is not None:
+        depth_cam2world = (
+            calibration.world_t_depth_cv
+            if output_convention == "opencv_cv"
+            else calibration.world_t_depth_single_seg
+        )
+        payload.update(
+            {
+                "depth_frame": calibration.depth_frame or "rectified_depth",
+                "depth_cam2world_4x4": depth_cam2world.tolist(),
+                "rectified_depth_cam2world_4x4": depth_cam2world.tolist(),
+                "world2depth_4x4": np.linalg.inv(depth_cam2world).tolist(),
+                "opencv_cv_depth_cam2world_4x4": calibration.world_t_depth_cv.tolist(),
+                "single_seg_gl_depth_cam2world_4x4": calibration.world_t_depth_single_seg.tolist(),
+                "depth_to_color_4x4": calibration.depth_to_color_4x4.tolist()
+                if calibration.depth_to_color_4x4 is not None
+                else None,
+                "rectified_to_color": calibration.depth_to_color_4x4.tolist()
+                if calibration.depth_to_color_4x4 is not None
+                else None,
+                "depth_intrinsics": calibration.depth_intrinsics or {},
+                "baseline_m": calibration.baseline_m,
+            }
+        )
+    return payload
 
 
 def write_output(
@@ -673,6 +833,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-count", type=int, default=1, help="未指定 serials 时使用的相机数量")
     parser.add_argument("--width", type=int, default=1280, help="RealSense color 宽度")
     parser.add_argument("--height", type=int, default=720, help="RealSense color 高度")
+    parser.add_argument("--stereo-width", type=int, default=1280, help="RealSense IR/fast depth 宽度")
+    parser.add_argument("--stereo-height", type=int, default=720, help="RealSense IR/fast depth 高度")
+    parser.add_argument("--stereo-alpha", type=float, default=0.0, help="OpenCV stereoRectify alpha")
+    parser.add_argument("--stereo-rectification-mode", choices=("opencv", "passthrough"), default="opencv")
     parser.add_argument("--fps", type=int, default=30, help="RealSense color 帧率")
     parser.add_argument("--warmup-frames", type=int, default=10, help="正式采样前预热帧数")
     parser.add_argument("--num-frames", type=int, default=30, help="每台相机用于平均的采样帧数")

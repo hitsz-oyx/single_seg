@@ -56,6 +56,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float64)
+
 # Go-ICP 后端（可选）
 try:
     from icp.goicp import GoICPConfig, register_point_clouds as goicp_register
@@ -118,48 +120,147 @@ def load_mesh_pcd(mesh_path: Path, num_points: int = 100000) -> o3d.geometry.Poi
     return pcd
 
 
-def load_extrinsics_json(path: Path) -> dict[str, np.ndarray]:
-    """加载外参JSON，支持多种格式。"""
+def _matrix_from_record(record: dict, *, prefer_depth: bool = True) -> np.ndarray | None:
+    keys = (
+        ("depth_cam2world_4x4", "rectified_depth_cam2world_4x4", "cam2world_4x4")
+        if prefer_depth
+        else ("cam2world_4x4", "single_seg_gl_cam2world_4x4", "depth_cam2world_4x4")
+    )
+    for key in keys:
+        if key in record:
+            arr = np.array(record[key], dtype=np.float64)
+            if arr.shape == (4, 4):
+                return arr
+    return None
+
+
+def _default_pointcloud_frame(record: dict) -> str:
+    if not isinstance(record, dict):
+        return "depth"
+    pointcloud_frame = record.get("pointcloud_frame")
+    if pointcloud_frame is not None:
+        return str(pointcloud_frame)
+    depth_frame = record.get("depth_frame")
+    if depth_frame is not None:
+        return str(depth_frame)
+    if any(key in record for key in ("depth_cam2world_4x4", "rectified_depth_cam2world_4x4", "depth_to_color_4x4")):
+        return "rectified_depth"
+    return "color"
+
+
+def _camera_info_from_record(camera_id: str, record: object) -> dict:
+    if not isinstance(record, dict):
+        return {
+            "serial_number": str(camera_id),
+            "color_intrinsics": {},
+            "depth_intrinsics": {},
+            "depth_to_color_4x4": None,
+            "pointcloud_frame": "depth",
+        }
+    color_intrinsics = record.get("color_intrinsics")
+    depth_intrinsics = record.get("depth_intrinsics")
+    return {
+        "serial_number": str(record.get("serial_number", camera_id)),
+        "color_intrinsics": dict(color_intrinsics) if isinstance(color_intrinsics, dict) else {},
+        "depth_intrinsics": dict(depth_intrinsics) if isinstance(depth_intrinsics, dict) else {},
+        "depth_to_color_4x4": record.get("depth_to_color_4x4", record.get("rectified_to_color")),
+        "color_pose_record": record.get("color_pose_record"),
+        "depth_pose_record": record.get("depth_pose_record"),
+        "pointcloud_frame": _default_pointcloud_frame(record),
+    }
+
+
+def depth_gl_to_color_gl_transform(depth_to_color_cv: np.ndarray) -> np.ndarray:
+    return CV_TO_GL @ np.asarray(depth_to_color_cv, dtype=np.float64).reshape(4, 4) @ CV_TO_GL
+
+
+def color_cam2world_from_depth_pose(depth_cam2world: np.ndarray, depth_to_color_cv: np.ndarray | None) -> np.ndarray:
+    if depth_to_color_cv is None:
+        return np.asarray(depth_cam2world, dtype=np.float64)
+    return np.asarray(depth_cam2world, dtype=np.float64) @ np.linalg.inv(
+        depth_gl_to_color_gl_transform(depth_to_color_cv)
+    )
+
+
+def load_extrinsics_with_info(path: Path) -> tuple[dict[str, np.ndarray], dict[str, dict]]:
+    """加载外参JSON，并尽量保留 depth/color 相关元信息。"""
     with open(path) as f:
         data = json.load(f)
 
-    candidates = []
+    candidates: list[tuple[str, dict[str, np.ndarray], dict[str, dict]]] = []
+
+    if isinstance(data, dict) and isinstance(data.get("cameras"), list):
+        cameras = {}
+        camera_info = {}
+        for item in data["cameras"]:
+            if not isinstance(item, dict):
+                continue
+            cam_id = str(item.get("camera_id", item.get("id", ""))).strip()
+            if not cam_id:
+                continue
+            arr = _matrix_from_record(item, prefer_depth=True)
+            if arr is None:
+                continue
+            cameras[cam_id] = arr
+            camera_info[cam_id] = _camera_info_from_record(cam_id, item)
+        if len(cameras) >= 1:
+            candidates.append(("cameras 列表格式", cameras, camera_info))
 
     # 格式1: {"cam_00": [[4x4]], "cam_01": [[4x4]], ...}
     if isinstance(data, dict):
         flat = {}
+        flat_info = {}
         for k, v in data.items():
-            arr = np.array(v, dtype=np.float64)
+            try:
+                arr = np.array(v, dtype=np.float64)
+            except (TypeError, ValueError):
+                continue
             if arr.shape == (4, 4) and k.startswith("cam_"):
                 flat[k] = arr
+                flat_info[k] = _camera_info_from_record(k, None)
         if len(flat) >= 1:
-            candidates.append(("直接 cam_xx 格式", flat))
+            candidates.append(("直接 cam_xx 格式", flat, flat_info))
 
         # 格式2: {"extrinsics": {"cam_00": [[4x4]], ...}}
         if "extrinsics" in data and isinstance(data["extrinsics"], dict):
             nested = {}
+            nested_info = {}
             for k, v in data["extrinsics"].items():
-                arr = np.array(v, dtype=np.float64)
-                if arr.shape == (4, 4):
+                if not str(k).startswith("cam_"):
+                    continue
+                arr = _matrix_from_record(v, prefer_depth=True) if isinstance(v, dict) else np.array(v, dtype=np.float64)
+                if arr is not None and arr.shape == (4, 4):
                     nested[k] = arr
+                    nested_info[k] = _camera_info_from_record(k, v)
             if len(nested) >= 1:
-                candidates.append(('extrinsics 嵌套格式', nested))
+                candidates.append(("extrinsics 嵌套格式", nested, nested_info))
 
         # 格式3: {"cam_00": {"cam2world_4x4": [[4x4]], ...}}
+        # 若同时存在 depth_cam2world_4x4，则优先用于 ICP。
         nested2 = {}
+        nested2_info = {}
         for k, v in data.items():
-            if isinstance(v, dict) and "cam2world_4x4" in v:
-                arr = np.array(v["cam2world_4x4"], dtype=np.float64)
-                if arr.shape == (4, 4):
+            if str(k).startswith("cam_") and isinstance(v, dict):
+                arr = _matrix_from_record(v, prefer_depth=True)
+                if arr is not None and arr.shape == (4, 4):
                     nested2[k] = arr
+                    nested2_info[k] = _camera_info_from_record(k, v)
         if len(nested2) >= 1:
-            candidates.append(('cam2world_4x4 嵌套格式', nested2))
+            candidates.append(("cam2world/depth_cam2world 嵌套格式", nested2, nested2_info))
 
         # 格式4: camera_payload.json 格式（单相机）
-        if "pose_record" in data and "cam2world_4x4" in data["pose_record"]:
-            arr = np.array(data["pose_record"]["cam2world_4x4"], dtype=np.float64)
-            if arr.shape == (4, 4):
-                candidates.append(("camera_payload 格式", {"cam_00": arr}))
+        if "pose_record" in data and isinstance(data["pose_record"], dict):
+            arr = _matrix_from_record(data.get("depth_pose_record", {}), prefer_depth=True)
+            if arr is None:
+                arr = _matrix_from_record(data["pose_record"], prefer_depth=True)
+            if arr is not None and arr.shape == (4, 4):
+                candidates.append(
+                    (
+                        "camera_payload 格式",
+                        {"cam_00": arr},
+                        {"cam_00": _camera_info_from_record("cam_00", data)},
+                    )
+                )
 
     if not candidates:
         raise ValueError(
@@ -171,7 +272,13 @@ def load_extrinsics_json(path: Path) -> dict[str, np.ndarray]:
 
     best = candidates[-1]
     print(f"  ✓ 外参格式: {best[0]}")
-    return best[1]
+    return best[1], best[2]
+
+
+def load_extrinsics_json(path: Path) -> dict[str, np.ndarray]:
+    """加载外参JSON，支持多种格式。"""
+    extrinsics, _ = load_extrinsics_with_info(path)
+    return extrinsics
 
 
 def load_extrinsics_from_payload(frame_dir: Path, camera_ids: list[str]) -> dict[str, np.ndarray]:
@@ -183,7 +290,11 @@ def load_extrinsics_from_payload(frame_dir: Path, camera_ids: list[str]) -> dict
             continue
         with open(payload_path) as f:
             payload = json.load(f)
-        cam2world = np.array(payload["pose_record"]["cam2world_4x4"], dtype=np.float64)
+        cam2world = _matrix_from_record(payload.get("depth_pose_record", {}), prefer_depth=True)
+        if cam2world is None:
+            cam2world = _matrix_from_record(payload.get("pose_record", {}), prefer_depth=True)
+        if cam2world is None:
+            raise ValueError(f"{payload_path} 缺少可用 cam2world/depth_cam2world")
         result[cam_id] = cam2world
     return result
 
@@ -287,10 +398,21 @@ def auto_discover(data_dir: Path, camera_ids: list[str]) -> tuple[dict[str, np.n
                 continue
             with open(payload_path) as f:
                 payload = json.load(f)
-            partial_ext[cam_id] = np.array(payload["pose_record"]["cam2world_4x4"], dtype=np.float64)
+            pose_record = payload.get("pose_record", {})
+            pose = _matrix_from_record(payload.get("depth_pose_record", {}), prefer_depth=True)
+            if pose is None:
+                pose = _matrix_from_record(pose_record, prefer_depth=True)
+            if pose is None:
+                raise ValueError(f"{payload_path} 缺少可用 cam2world/depth_cam2world")
+            partial_ext[cam_id] = pose
             partial_info[cam_id] = {
                 "serial_number": str(payload.get("serial_number", cam_id)),
                 "color_intrinsics": dict(payload.get("color_intrinsics", {})),
+                "depth_intrinsics": dict(payload.get("depth_intrinsics", {})),
+                "depth_to_color_4x4": payload.get("depth_to_color_4x4", payload.get("rectified_to_color")),
+                "color_pose_record": payload.get("color_pose_record"),
+                "depth_pose_record": payload.get("depth_pose_record"),
+                "pointcloud_frame": payload.get("pointcloud_frame", pose_record.get("coordinate_frame", "unknown")),
             }
         if len(partial_ext) == len(camera_ids):
             extrinsics = partial_ext
@@ -313,13 +435,13 @@ def load_explicit(
     extrinsics_path: Path,
     point_cloud_specs: list[str],
     camera_ids: list[str],
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict]]:
     """从显式传入的外参JSON和点云路径加载数据。
 
     point_cloud_specs: ["cam_00=/path/to/a.ply", "cam_01=/path/to/b.ply", ...]
-    返回: (world_clouds, extrinsics)
+    返回: (world_clouds, extrinsics, camera_info)
     """
-    extrinsics = load_extrinsics_json(extrinsics_path)
+    extrinsics, camera_info = load_extrinsics_with_info(extrinsics_path)
 
     world_clouds: dict[str, np.ndarray] = {}
     for spec in point_cloud_specs:
@@ -347,7 +469,7 @@ def load_explicit(
         if cam_id not in world_clouds:
             raise ValueError(f"点云中缺少 {cam_id}")
 
-    return world_clouds, extrinsics
+    return world_clouds, extrinsics, camera_info
 
 
 # ──────────────────────────────────────────────
@@ -703,19 +825,31 @@ def _camera_pose_entries(
 ) -> list[dict]:
     entries = []
     for cam_id in camera_ids:
-        cam2world = np.asarray(extrinsics[cam_id], dtype=np.float64)
-        world2cam = np.linalg.inv(cam2world)
-        opencv_c2w = gl_to_opencv_cam2world(cam2world)
         info = (camera_info or {}).get(cam_id, {})
+        depth_cam2world = np.asarray(extrinsics[cam_id], dtype=np.float64)
+        depth_to_color_payload = info.get("depth_to_color_4x4")
+        depth_to_color = None if depth_to_color_payload is None else np.asarray(depth_to_color_payload, dtype=np.float64)
+        color_cam2world = color_cam2world_from_depth_pose(depth_cam2world, depth_to_color)
+        world2cam = np.linalg.inv(color_cam2world)
+        opencv_c2w = gl_to_opencv_cam2world(color_cam2world)
+        opencv_depth_c2w = gl_to_opencv_cam2world(depth_cam2world)
         entries.append(
             {
                 "camera_id": cam_id,
                 "serial_number": str(info.get("serial_number", cam_id)),
-                "cam2world_4x4": cam2world.tolist(),
+                "cam2world_4x4": color_cam2world.tolist(),
                 "world2cam_4x4": world2cam.tolist(),
                 "opencv_cv_cam2world_4x4": opencv_c2w.tolist(),
-                "single_seg_gl_cam2world_4x4": cam2world.tolist(),
+                "single_seg_gl_cam2world_4x4": color_cam2world.tolist(),
+                "depth_cam2world_4x4": depth_cam2world.tolist(),
+                "rectified_depth_cam2world_4x4": depth_cam2world.tolist(),
+                "world2depth_4x4": np.linalg.inv(depth_cam2world).tolist(),
+                "opencv_cv_depth_cam2world_4x4": opencv_depth_c2w.tolist(),
+                "single_seg_gl_depth_cam2world_4x4": depth_cam2world.tolist(),
+                "depth_to_color_4x4": None if depth_to_color is None else depth_to_color.tolist(),
                 "color_intrinsics": info.get("color_intrinsics", {}),
+                "depth_intrinsics": info.get("depth_intrinsics", {}),
+                "pointcloud_frame": info.get("pointcloud_frame", "depth"),
             }
         )
     return entries
@@ -837,18 +971,29 @@ def save_results(
         else:
             refined_c2w = cam2world_orig.copy()
 
-        world2refined = np.linalg.inv(refined_c2w)
-        opencv_c2w = gl_to_opencv_cam2world(refined_c2w)
-
         info = (camera_info or {}).get(cam_id, {})
+        depth_to_color_payload = info.get("depth_to_color_4x4")
+        depth_to_color = None if depth_to_color_payload is None else np.asarray(depth_to_color_payload, dtype=np.float64)
+        color_c2w = color_cam2world_from_depth_pose(refined_c2w, depth_to_color)
+        world2refined = np.linalg.inv(color_c2w)
+        opencv_c2w = gl_to_opencv_cam2world(color_c2w)
+        opencv_depth_c2w = gl_to_opencv_cam2world(refined_c2w)
         cam_entry = {
             "camera_id": cam_id,
             "serial_number": str(info.get("serial_number", cam_id)),
-            "cam2world_4x4": refined_c2w.tolist(),
+            "cam2world_4x4": color_c2w.tolist(),
             "world2cam_4x4": world2refined.tolist(),
             "opencv_cv_cam2world_4x4": opencv_c2w.tolist(),
-            "single_seg_gl_cam2world_4x4": refined_c2w.tolist(),
+            "single_seg_gl_cam2world_4x4": color_c2w.tolist(),
+            "depth_cam2world_4x4": refined_c2w.tolist(),
+            "rectified_depth_cam2world_4x4": refined_c2w.tolist(),
+            "world2depth_4x4": np.linalg.inv(refined_c2w).tolist(),
+            "opencv_cv_depth_cam2world_4x4": opencv_depth_c2w.tolist(),
+            "single_seg_gl_depth_cam2world_4x4": refined_c2w.tolist(),
+            "depth_to_color_4x4": None if depth_to_color is None else depth_to_color.tolist(),
             "color_intrinsics": info.get("color_intrinsics", {}),
+            "depth_intrinsics": info.get("depth_intrinsics", {}),
+            "pointcloud_frame": info.get("pointcloud_frame", "depth"),
         }
         cameras_list.append(cam_entry)
 
@@ -1028,8 +1173,7 @@ def main() -> None:
         print("  模式: 显式传入")
         extrinsics_path = Path(args.extrinsics).expanduser().resolve()
         print(f"  外参: {extrinsics_path}")
-        world_clouds, extrinsics = load_explicit(extrinsics_path, args.point_cloud, camera_ids)
-        camera_info = {}
+        world_clouds, extrinsics, camera_info = load_explicit(extrinsics_path, args.point_cloud, camera_ids)
     print()
 
     # ════════════════════════════════════════════

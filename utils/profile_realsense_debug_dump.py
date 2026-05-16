@@ -124,6 +124,25 @@ def fallback_pose_record(camera_id: str) -> dict[str, object]:
     }
 
 
+def pointcloud_intrinsics_from_payload(
+    camera_payload: dict[str, object] | None,
+    *,
+    rgb_shape: tuple[int, int, int],
+    fallback: dict[str, float],
+) -> dict[str, float]:
+    if camera_payload is not None:
+        intrinsics = camera_payload.get("depth_intrinsics", camera_payload.get("color_intrinsics"))
+        if intrinsics is not None:
+            payload_intrinsics = dict(intrinsics)
+            payload_intrinsics["width"] = int(rgb_shape[1])
+            payload_intrinsics["height"] = int(rgb_shape[0])
+            return payload_intrinsics
+    result = dict(fallback)
+    result["width"] = int(rgb_shape[1])
+    result["height"] = int(rgb_shape[0])
+    return result
+
+
 def resolve_frame_depth_source(
     *,
     requested: str,
@@ -170,13 +189,17 @@ def build_fast_depth_from_payload(
         return_torch=True,
         include_input_images=False,
     )
-    depth = align_rectified_depth_to_color_torch(
-        stereo_output["depth_m"],
-        rectified_intrinsics=stereo_output["rectified_intrinsics"],
-        rectified_to_color=np.asarray(camera_payload["rectified_to_color"], dtype=np.float64),
-        color_intrinsics=dict(camera_payload["color_intrinsics"]),
-        color_shape=color_shape,
-    )
+    pointcloud_frame = str(camera_payload.get("pointcloud_frame", "color"))
+    if pointcloud_frame == "color":
+        depth = align_rectified_depth_to_color_torch(
+            stereo_output["depth_m"],
+            rectified_intrinsics=stereo_output["rectified_intrinsics"],
+            rectified_to_color=np.asarray(camera_payload["rectified_to_color"], dtype=np.float64),
+            color_intrinsics=dict(camera_payload["color_intrinsics"]),
+            color_shape=color_shape,
+        )
+    else:
+        depth = stereo_output["depth_m"].to(dtype=torch.float32)
     return torch.where(
         torch.isfinite(depth) & (depth >= float(depth_min)) & (depth <= float(depth_max)),
         depth.to(dtype=torch.float32),
@@ -272,13 +295,11 @@ def main() -> None:
                     if depth_device.type == "cuda"
                     else depth_np
                 )
-            frame_intrinsics = (
-                dict(camera_payload["color_intrinsics"])
-                if camera_payload is not None and camera_payload.get("color_intrinsics") is not None
-                else fallback_intrinsics(args, rgb)
+            frame_intrinsics = pointcloud_intrinsics_from_payload(
+                camera_payload,
+                rgb_shape=rgb.shape,
+                fallback=fallback_intrinsics(args, rgb),
             )
-            frame_intrinsics["width"] = int(rgb.shape[1])
-            frame_intrinsics["height"] = int(rgb.shape[0])
             pose_record = (
                 dict(camera_payload["pose_record"])
                 if camera_payload is not None and camera_payload.get("pose_record") is not None

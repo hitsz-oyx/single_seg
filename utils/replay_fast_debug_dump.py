@@ -93,6 +93,17 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def pointcloud_intrinsics_from_payload(
+    payload: dict[str, Any],
+    *,
+    rgb_shape: tuple[int, int, int],
+) -> dict[str, float]:
+    intrinsics = dict(payload.get("depth_intrinsics") or payload.get("color_intrinsics") or {})
+    intrinsics["width"] = int(rgb_shape[1])
+    intrinsics["height"] = int(rgb_shape[0])
+    return intrinsics
+
+
 def resolve_debug_roots(input_dir: Path) -> tuple[Path, Path]:
     input_dir = input_dir.expanduser().resolve()
     if (input_dir / "live_rgbd_debug").is_dir():
@@ -249,6 +260,8 @@ def process_frame(
         left_ir, right_ir = read_ir_pair(camera_dir, payload)
         mask = load_mask(source_root, frame_dir.name, camera_id, rgb.shape)
         mask_for_3d = erode_mask(mask, int(target_3d_mask_erode_kernel))
+        pointcloud_frame = str(payload.get("pointcloud_frame", "color"))
+        point_intrinsics = pointcloud_intrinsics_from_payload(payload, rgb_shape=rgb.shape)
         color_intrinsics = dict(payload["color_intrinsics"])
         color_intrinsics["width"] = int(rgb.shape[1])
         color_intrinsics["height"] = int(rgb.shape[0])
@@ -272,45 +285,53 @@ def process_frame(
             depth_rect,
             torch.zeros((), dtype=torch.float32, device=depth_rect.device),
         )
-        depth_color_before_edge: torch.Tensor | None = None
+        depth_before_edge: torch.Tensor | None = None
         if depth_edge_filter_enabled and depth_edge_filter_stage == "rectified":
-            depth_color_before_edge = align_rectified_depth_to_color_torch(
+            if pointcloud_frame == "color":
+                depth_before_edge = align_rectified_depth_to_color_torch(
+                    depth_rect,
+                    rectified_intrinsics=stereo_output["rectified_intrinsics"],
+                    rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
+                    color_intrinsics=color_intrinsics,
+                    color_shape=rgb.shape[:2],
+                )
+                depth_before_edge = torch.where(
+                    torch.isfinite(depth_before_edge)
+                    & (depth_before_edge >= float(depth_min))
+                    & (depth_before_edge <= float(depth_max)),
+                    depth_before_edge.to(dtype=torch.float32),
+                    torch.zeros((), dtype=torch.float32, device=depth_before_edge.device),
+                )
+            else:
+                depth_before_edge = depth_rect
+            depth_rect = filter_depth_edges_torch(depth_rect, threshold_m=float(depth_edge_filter_threshold_m))
+        if pointcloud_frame == "color":
+            depth_for_points = align_rectified_depth_to_color_torch(
                 depth_rect,
                 rectified_intrinsics=stereo_output["rectified_intrinsics"],
                 rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
                 color_intrinsics=color_intrinsics,
                 color_shape=rgb.shape[:2],
             )
-            depth_color_before_edge = torch.where(
-                torch.isfinite(depth_color_before_edge)
-                & (depth_color_before_edge >= float(depth_min))
-                & (depth_color_before_edge <= float(depth_max)),
-                depth_color_before_edge.to(dtype=torch.float32),
-                torch.zeros((), dtype=torch.float32, device=depth_color_before_edge.device),
-            )
-            depth_rect = filter_depth_edges_torch(depth_rect, threshold_m=float(depth_edge_filter_threshold_m))
-        depth_color = align_rectified_depth_to_color_torch(
-            depth_rect,
-            rectified_intrinsics=stereo_output["rectified_intrinsics"],
-            rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
-            color_intrinsics=color_intrinsics,
-            color_shape=rgb.shape[:2],
+        else:
+            depth_for_points = depth_rect
+        depth_for_points = torch.where(
+            torch.isfinite(depth_for_points)
+            & (depth_for_points >= float(depth_min))
+            & (depth_for_points <= float(depth_max)),
+            depth_for_points.to(dtype=torch.float32),
+            torch.zeros((), dtype=torch.float32, device=depth_for_points.device),
         )
-        depth_color = torch.where(
-            torch.isfinite(depth_color) & (depth_color >= float(depth_min)) & (depth_color <= float(depth_max)),
-            depth_color.to(dtype=torch.float32),
-            torch.zeros((), dtype=torch.float32, device=depth_color.device),
-        )
-        stats_depth_before = depth_color if depth_color_before_edge is None else depth_color_before_edge
+        stats_depth_before = depth_for_points if depth_before_edge is None else depth_before_edge
         valid_before_edge = int(torch.count_nonzero(stats_depth_before > 0).item())
-        mask_t = torch.as_tensor(mask > 0, dtype=torch.bool, device=depth_color.device)
+        mask_t = torch.as_tensor(mask > 0, dtype=torch.bool, device=depth_for_points.device)
         target_valid_before_edge = int(torch.count_nonzero((stats_depth_before > 0) & mask_t).item())
         if depth_edge_filter_enabled and depth_edge_filter_stage == "aligned":
-            depth_color = filter_depth_edges_torch(depth_color, threshold_m=float(depth_edge_filter_threshold_m))
-        valid_after_edge = int(torch.count_nonzero(depth_color > 0).item())
-        target_valid_after_edge = int(torch.count_nonzero((depth_color > 0) & mask_t).item())
+            depth_for_points = filter_depth_edges_torch(depth_for_points, threshold_m=float(depth_edge_filter_threshold_m))
+        valid_after_edge = int(torch.count_nonzero(depth_for_points > 0).item())
+        target_valid_after_edge = int(torch.count_nonzero((depth_for_points > 0) & mask_t).item())
 
-        depth_np = depth_color.detach().cpu().numpy().astype(np.float32, copy=False)
+        depth_np = depth_for_points.detach().cpu().numpy().astype(np.float32, copy=False)
         disparity_np = stereo_output["disparity"].detach().cpu().numpy().astype(np.float32, copy=False)
         pose_record = dict(payload["pose_record"])
         camera_center = camera_center_from_pose_record(pose_record)
@@ -329,7 +350,7 @@ def process_frame(
             depth_np,
             mask_for_3d,
             np.asarray(pose_record["cam2world_4x4"], dtype=np.float64),
-            color_intrinsics,
+            point_intrinsics,
             None,
             float(depth_min),
             float(depth_max),
