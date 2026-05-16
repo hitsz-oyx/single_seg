@@ -75,14 +75,6 @@ def main() -> None:
             raise FileExistsError(f"{output_dir} already exists. Use --overwrite to replace.")
 
     observations_dir = demo0_dir / "observations"
-    refined_extrinsics = load_json(demo0_dir / "observations" / "refined_extrinsics.json")
-
-    serial_to_cam_id: dict[str, str] = {v: k for k, v in CAM_ID_TO_SERIAL.items()}
-    cam_id_to_extrinsics: dict[str, dict] = {}
-    for cam in refined_extrinsics["cameras"]:
-        cid = serial_to_cam_id.get(cam["serial_number"])
-        if cid:
-            cam_id_to_extrinsics[cid] = cam
 
     frame_output_dir = output_dir / "live_rgbd_debug" / args.frame_name
     frame_output_dir.mkdir(parents=True, exist_ok=True)
@@ -98,11 +90,6 @@ def main() -> None:
         cam_output_dir = frame_output_dir / cam_id
         cam_output_dir.mkdir(parents=True, exist_ok=True)
 
-        if cam_id not in cam_id_to_extrinsics:
-            print(f"  [{cam_id}] WARNING: no extrinsics found for serial {serial}, skipping")
-            continue
-
-        extrinsics = cam_id_to_extrinsics[cam_id]
         para_payload = load_json(para_dir / para_cam / "camera_payload.json")
 
         img_idx = next(idx for idx, cid in IMAGE_INDEX_TO_CAM_ID.items() if cid == cam_id)
@@ -122,18 +109,14 @@ def main() -> None:
         Image.fromarray(ir_right_npy).save(cam_output_dir / "ir_right_rect.png")
         print(f"  [{cam_id}] IR: left {ir_left_npy.shape}, right {ir_right_npy.shape} -> ir_left/right_rect.png")
 
+        color_intrinsics = dict(para_payload["color_intrinsics"])
         camera_payload: dict = {
             "camera_id": cam_id,
             "serial_number": serial,
             "depth_source": str(args.depth_source),
             "rgb_file": "rgb.png",
             "depth_aligned_file": "depth_aligned_m.npy",
-            "color_intrinsics": dict(extrinsics["color_intrinsics"]),
-            "pose_record": {
-                "camera_id": cam_id,
-                "cam2world_4x4": extrinsics["cam2world_4x4"],
-                "world2cam_4x4": extrinsics["world2cam_4x4"],
-            },
+            "color_intrinsics": color_intrinsics,
             "depth_min": 0.1,
             "depth_max": 3.0,
             "stereo_rectification_mode": "opencv",

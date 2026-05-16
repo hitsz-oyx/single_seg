@@ -39,8 +39,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from single_seg.realsense_rgbd_segmenter import (
     FastFoundationStereoRunner,
-    align_rectified_depth_to_color_torch,
+    align_color_to_rectified_depth_torch,
     filter_depth_edges_torch,
+    resolve_depth_pose_record_from_payload,
 )
 from single_seg.single_object_segmenter import (
     SingleObjectPointCloudSegmenter,
@@ -49,6 +50,13 @@ from single_seg.single_object_segmenter import (
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_camera_poses(poses_json_path: Path) -> dict[str, dict[str, Any]]:
+    raw = load_json(poses_json_path)
+    if "cameras" in raw:
+        return {cam["camera_id"]: cam for cam in raw["cameras"]}
+    return dict(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +71,10 @@ def run_fast_stereo(
     depth_max: float,
     depth_edge_filter_enabled: bool,
     depth_edge_filter_threshold_m: float,
-) -> None:
+) -> dict[str, dict[str, Any]]:
     frame_dir = input_dir / "live_rgbd_debug" / frame_name
     camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
+    all_stereo_intrinsics: dict[str, dict[str, Any]] = {}
 
     for camera_id in camera_ids:
         camera_dir = frame_dir / camera_id
@@ -108,29 +117,31 @@ def run_fast_stereo(
         if depth_edge_filter_enabled:
             depth_rect = filter_depth_edges_torch(depth_rect, threshold_m=depth_edge_filter_threshold_m)
 
-        depth_color = align_rectified_depth_to_color_torch(
+        rgb_aligned_t = align_color_to_rectified_depth_torch(
+            rgb,
             depth_rect,
             rectified_intrinsics=stereo_output["rectified_intrinsics"],
             rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
             color_intrinsics=color_intrinsics,
-            color_shape=rgb.shape[:2],
-        )
-        depth_color = torch.where(
-            torch.isfinite(depth_color)
-            & (depth_color >= depth_min)
-            & (depth_color <= depth_max),
-            depth_color.to(dtype=torch.float32),
-            torch.zeros((), dtype=torch.float32, device=depth_color.device),
         )
 
-        depth_np = depth_color.detach().cpu().numpy().astype(np.float32)
-        np.save(camera_dir / "depth_aligned_m.npy", depth_np)
+        depth_rect_np = depth_rect.detach().cpu().numpy().astype(np.float32)
+        np.save(camera_dir / "depth_aligned_m.npy", depth_rect_np)
 
-        valid = depth_np > 0
+        rgb_aligned_np = rgb_aligned_t.detach().cpu().numpy()
+        Image.fromarray(rgb_aligned_np).save(camera_dir / "rgb_aligned.png")
+
+        all_stereo_intrinsics[camera_id] = stereo_output["rectified_intrinsics"]
+        with open(camera_dir / "stereo_intrinsics.json", "w", encoding="utf-8") as f:
+            json.dump(stereo_output["rectified_intrinsics"], f)
+
+        valid = depth_rect_np > 0
         print(
-            f"  [{camera_id}] Fast depth: range=[{depth_np[valid].min():.3f}, "
-            f"{depth_np[valid].max():.3f}]  infer={infer_time:.2f}s"
+            f"  [{camera_id}] Fast depth: range=[{depth_rect_np[valid].min():.3f}, "
+            f"{depth_rect_np[valid].max():.3f}]  infer={infer_time:.2f}s"
         )
+
+    return all_stereo_intrinsics
 
 
 # ---------------------------------------------------------------------------
@@ -138,21 +149,34 @@ def run_fast_stereo(
 # ---------------------------------------------------------------------------
 
 def load_camera_input(
-    camera_dir: Path, camera_id: str, device: torch.device
+    camera_dir: Path,
+    camera_id: str,
+    device: torch.device,
+    stereo_intrinsics: dict[str, Any],
+    camera_poses: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     payload = load_json(camera_dir / "camera_payload.json")
-    rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
+    rgb_aligned_path = camera_dir / "rgb_aligned.png"
+    if rgb_aligned_path.exists():
+        rgb = np.asarray(Image.open(rgb_aligned_path).convert("RGB"), dtype=np.uint8)
+    else:
+        rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
     depth_np = np.load(camera_dir / "depth_aligned_m.npy").astype(np.float32, copy=False)
     depth_m: np.ndarray | torch.Tensor
     if device.type == "cuda":
         depth_m = torch.as_tensor(depth_np, dtype=torch.float32, device=device)
     else:
         depth_m = depth_np
-    intrinsics = dict(payload["color_intrinsics"])
-    intrinsics["width"] = int(rgb.shape[1])
-    intrinsics["height"] = int(rgb.shape[0])
-    pose_record = dict(payload["pose_record"])
-    pose_record.setdefault("camera_id", str(camera_id))
+    intrinsics = dict(stereo_intrinsics)
+    intrinsics["width"] = int(depth_np.shape[1])
+    intrinsics["height"] = int(depth_np.shape[0])
+    if camera_id in camera_poses:
+        payload = dict(payload)
+        payload["pose_record"] = camera_poses[camera_id]
+    pose_record = resolve_depth_pose_record_from_payload(
+        payload,
+        coordinate_frame="rectified_depth",
+    )
     return {
         "rgb": rgb,
         "depth_m": depth_m,
@@ -167,6 +191,8 @@ def run_sam3_segmentation(
     output_dir: Path,
     frame_name: str,
     cfg: dict[str, Any],
+    stereo_intrinsics: dict[str, dict[str, Any]],
+    camera_poses: dict[str, dict[str, Any]],
 ) -> None:
     frame_dir = input_dir / "live_rgbd_debug" / frame_name
     camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
@@ -179,7 +205,6 @@ def run_sam3_segmentation(
         prompt_image_root=Path(cfg["prompt_image_root"]).expanduser().resolve(),
         checkpoint_path=Path(cfg["checkpoint_path"]).expanduser().resolve(),
         output_dir=output_dir,
-        source_dir=input_dir,
         overwrite_output=bool(cfg.get("overwrite_output")),
         confidence=float(cfg["confidence"]),
         mask_threshold=float(cfg["mask_threshold"]),
@@ -215,7 +240,7 @@ def run_sam3_segmentation(
 
     with segmenter:
         camera_inputs = {
-            cid: load_camera_input(frame_dir / cid, cid, device)
+            cid: load_camera_input(frame_dir / cid, cid, device, stereo_intrinsics[cid], camera_poses)
             for cid in camera_ids
         }
         result = segmenter.process_frame(
@@ -274,11 +299,28 @@ def main() -> None:
     print("=" * 60)
     print("Step 2: SAM3 segmentation")
     print("=" * 60)
+    frame_dir = input_dir / "live_rgbd_debug" / frame_name
+    camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
+    stereo_intrinsics: dict[str, dict[str, Any]] = {}
+    for cid in camera_ids:
+        with open(frame_dir / cid / "stereo_intrinsics.json") as f:
+            stereo_intrinsics[cid] = json.load(f)
+
+    camera_poses_json = cfg.get("camera_poses_json")
+    if camera_poses_json:
+        camera_poses = load_camera_poses(Path(camera_poses_json).expanduser().resolve())
+        print(f"Loaded external camera poses from: {camera_poses_json}")
+    else:
+        camera_poses = {}
+        print("WARNING: No camera_poses_json configured, using payload pose_record")
+
     run_sam3_segmentation(
         input_dir=input_dir,
         output_dir=output_dir,
         frame_name=frame_name,
         cfg=cfg,
+        stereo_intrinsics=stereo_intrinsics,
+        camera_poses=camera_poses,
     )
 
     print()

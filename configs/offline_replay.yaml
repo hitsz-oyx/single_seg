@@ -22,6 +22,14 @@ output_dir: tests/outputs/demo0_frame_360_offline
 frame_name: frame_00000
 
 # ---------------------------------------------------------------------------
+# External camera poses (extrinsics)
+# Supports two formats:
+#   1. Full format:  {"cameras": [{camera_id, serial_number, cam2world_4x4, world2cam_4x4}, ...]}
+#   2. Simple format: {camera_id: {cam2world_4x4, ...}, ...}
+# ---------------------------------------------------------------------------
+camera_poses_json: configs/refined_extrinsics.json
+
+# ---------------------------------------------------------------------------
 # SAM3 segmentation
 # ---------------------------------------------------------------------------
 target_name: redcup
