@@ -1,8 +1,22 @@
 # RealSense D435/D435i 实时分割配置文件
 # 使用 Fast-FoundationStereo 进行真 RGBD 深度估计
 # 相对路径基于仓库根目录解析
+
+#原始外参
 # single-seg-realsense \
-#   --config configs/realsense_d435_live_fast.yaml \
+#   --config configs/realsense_d435_live_fast_biaoding.yaml \
+#   --camera-count 3 \
+#   --camera-serials "148522074762,243122075507,845112070307" \
+#   --camera-poses-json configs/camera_poses_apriltag.json \
+#   --save-ply \
+#   --save-debug-2d \
+#   --save-normal \
+#   --save-live-debug 1 \
+#   --overwrite-output
+
+#icp标定
+# single-seg-realsense \
+#   --config configs/realsense_d435_live_fast_biaoding.yaml \
 #   --camera-count 3 \
 #   --camera-serials "148522074762,243122075507,845112070307" \
 #   --camera-poses-json configs/refined_extrinsics.json \
@@ -12,41 +26,26 @@
 #   --save-live-debug 1 \
 #   --overwrite-output
 
+
 # =============================================================================
 # 分割器配置
 # =============================================================================
 segmenter:
   # 目标物体名称，需要与 task_info.json 中的 asset_name 语义名一致
   # 例如: plate, bowl, cup 等
-  # target_name: small
-
-  # # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  # prompt_task_info: assets/prompts/small/task_info.json
-
-  # # Prompt 图片目录，存放参考图片
-  # prompt_image_root: assets/prompts/small/
-
-  # # SAM3 模型权重路径
-  # checkpoint_path: checkpoints/sam3.pt
-
-  # # 输出目录
-  # output_dir: tests/outputs/realsense_live_small_three_cam_fast_icp
-
-  target_name: redcup
+  target_name: small
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/redcup/task_info.json
+  prompt_task_info: assets/prompts/small/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/redcup/
+  prompt_image_root: assets/prompts/small/
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live_redcup_three_cam_fast_icp
-
-  
+  output_dir: tests/outputs/realsense_live_small_three_cam_fast
 
   # 是否覆盖已有输出
   overwrite_output: true
@@ -180,7 +179,7 @@ realsense:
 
   # 多相机位姿文件路径 (JSON 格式)
   # 包含每台相机的 cam2world_4x4 变换矩阵
-  camera_poses_json: configs/camera_poses_apriltag.json
+  camera_poses_json: null
 
   # 最大处理帧数，0 表示无限制
   max_frames: 2

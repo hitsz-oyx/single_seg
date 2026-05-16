@@ -3,6 +3,19 @@
 # 注意：当前 register_to_mesh.py 以命令行参数为准，不会自动读取本 YAML。
 # 这个文件用于记录当前验证效果较好的参数组合，运行命令见 README.md。
 
+
+# python icp/register_to_mesh.py \
+#   --data-dir tests/outputs/realsense_live_small_three_cam_fast \
+#   --mesh icp/Register_small.STL \
+#   --master-camera cam_00 \
+#   --use-goicp \
+#   --refine-use-goicp \
+#   --num-mesh-points 30000
+
+# DISPLAY=localhost:10.0 
+# python icp/visualize_mesh_registration.py \
+#   --output-dir icp/output
+
 # 数据
 data_dir: tests/outputs/realsense_live_small_three_cam_fast
 mesh: icp/Register_small.STL

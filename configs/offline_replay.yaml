@@ -1,0 +1,91 @@
+# Offline replay config
+# Runs Fast-Stereo + SAM3 on a pre-converted live_rgbd_debug directory.
+# Use convert_demo0_to_live_debug.py (or equivalent) first to produce live_rgbd_debug format.
+#
+# Example:
+
+# python utils/convert_demo0_to_live_debug.py \
+#   --demo0-dir /home/franka-client/oyx_ws/demo0_frame_360 \
+#   --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
+#   --output-dir tests/outputs/demo0_frame_360_live \
+#   --frame-name frame_00000 \
+#   --overwrite
+
+#   python utils/offline_replay.py --config configs/offline_replay.yaml
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+input_dir: tests/outputs/demo0_frame_360_live   # directory containing live_rgbd_debug/
+output_dir: tests/outputs/demo0_frame_360_offline
+
+frame_name: frame_00000
+
+# ---------------------------------------------------------------------------
+# SAM3 segmentation
+# ---------------------------------------------------------------------------
+target_name: redcup
+prompt_task_info: assets/prompts/redcup/task_info.json
+prompt_image_root: assets/prompts/redcup/
+checkpoint_path: checkpoints/sam3.pt
+
+confidence: 0.25
+mask_threshold: 0.6
+prompt_keep_score_threshold: 0.2
+video_mask_prob_threshold: 0.95
+
+# ---------------------------------------------------------------------------
+# Depth and point cloud
+# ---------------------------------------------------------------------------
+depth_min: 0.1
+depth_max: 3.0
+stride: 2
+frame_voxel_size: 0.002
+
+target_cluster_filter_enabled: false
+target_cluster_radius_m: 0.025
+target_cluster_min_points: 35
+target_cluster_keep_largest: true
+
+target_plane_filter_enabled: false
+target_plane_filter_distance_m: 0.004
+target_plane_filter_min_points: 80
+target_plane_filter_min_inlier_ratio: 0.25
+target_plane_filter_max_inlier_ratio: 0.85
+target_plane_filter_max_planes: 1
+target_plane_filter_ransac_iterations: 256
+
+target_depth_band_filter_enabled: true
+target_depth_band_filter_range_m: 0.070
+target_depth_band_filter_min_valid_pixels: 50
+target_depth_band_filter_min_keep_pixels: 30
+
+target_3d_mask_erode_kernel: 0
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+save_ply: true
+save_normal: true
+save_debug_2d: true
+save_live_debug: true
+tracker_image_size: 896
+target_vis_color: [30, 60, 180]
+
+overwrite_output: true
+
+# ---------------------------------------------------------------------------
+# Fast-Stereo (passed to FastFoundationStereoRunner)
+# ---------------------------------------------------------------------------
+fast_stereo:
+  model_path: third_party/fastfoundationstereo/weights/23-36-37/model_best_bp2_serialize.pth
+  valid_iters: 12
+  max_disp: 192
+  scale: 1.0
+  remove_invisible: true
+  hiera: false
+  optimize_build_volume: pytorch1
+  align_backend: torch
+  depth_edge_filter_enabled: false
+  depth_edge_filter_threshold_m: 0.5
+  depth_edge_filter_stage: rectified
