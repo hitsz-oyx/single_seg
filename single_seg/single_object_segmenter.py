@@ -1179,8 +1179,10 @@ def backproject_scene_points_with_labels_torch(
     depth_max: float,
     *,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """根据 RGB 图像、深度图和掩码反投影场景点（PyTorch 实现）。"""
+    target_id: int = 1,
+    camera_score: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """根据 RGB 图像、深度图和掩码反投影场景点（PyTorch 实现）。返回 points, colors, labels, scores。"""
     with no_autocast_context(device):
         if torch.is_tensor(sampled_depth_m):
             depth = sampled_depth_m.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -1196,6 +1198,7 @@ def backproject_scene_points_with_labels_torch(
                 torch.empty((0, 3), dtype=torch.float32, device=device),
                 torch.empty((0, 3), dtype=torch.uint8, device=device),
                 torch.empty((0,), dtype=torch.int32, device=device),
+                torch.empty((0,), dtype=torch.float32, device=device),
             )
         depth_valid = depth[valid]
         x_cv = x_scale.to(torch.float32)[valid] * depth_valid
@@ -1217,8 +1220,9 @@ def backproject_scene_points_with_labels_torch(
         else:
             colors_src = torch.as_tensor(np.ascontiguousarray(sampled_rgb), dtype=torch.uint8, device=device)
         colors = colors_src[valid]
-        labels = mask[valid].to(torch.int32)
-        return pts_world, colors, labels
+        labels = mask[valid].to(torch.int32) * target_id
+        scores = torch.full((labels.shape[0],), camera_score, dtype=torch.float32, device=device)
+        return pts_world, colors, labels, scores
 
 
 def erode_binary_mask_torch(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -1399,17 +1403,18 @@ def fuse_scene_geometry_torch(
     voxel_size: float,
     *,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """融合场景几何信息（PyTorch 实现），生成下采样后的点云、颜色和标签。"""
+    score_chunks: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """融合场景几何信息（PyTorch 实现），生成下采样后的点云、颜色、标签和置信度（求和）。"""
     points = torch.cat(point_chunks, dim=0)
     colors = torch.cat(color_chunks, dim=0)
     labels = torch.cat(label_chunks, dim=0).to(torch.int32)
+    has_scores = score_chunks is not None and len(score_chunks) > 0
+    scores: torch.Tensor | None = torch.cat(score_chunks, dim=0).to(torch.float32) if has_scores else None
     if points.numel() == 0 or float(voxel_size) <= 0.0:
-        return points.to(torch.float32), colors.to(torch.uint8), labels
+        return points.to(torch.float32), colors.to(torch.uint8), labels, scores
 
     with no_autocast_context(device):
-        # Match the historical NumPy path, which promotes float32 points to float64
-        # when dividing by the Python float voxel size before applying floor().
         voxel_keys = torch.floor(points.to(torch.float64) / float(voxel_size)).to(torch.int64)
         voxel_keys = voxel_keys - voxel_keys.min(dim=0, keepdim=True).values
         unique_keys, inverse = torch.unique(voxel_keys, dim=0, return_inverse=True)
@@ -1428,7 +1433,12 @@ def fuse_scene_geometry_torch(
         label_max.scatter_reduce_(0, inverse, labels, reduce="amax", include_self=True)
         down_points = point_sum / counts[:, None]
         down_colors = torch.clamp(torch.round(color_sum / counts[:, None]), 0, 255).to(torch.uint8)
-        return down_points, down_colors, label_max
+        down_scores: torch.Tensor | None = None
+        if scores is not None:
+            score_sum = torch.zeros((num_groups,), dtype=torch.float32, device=device)
+            score_sum.scatter_add_(0, inverse, scores)
+            down_scores = score_sum
+        return down_points, down_colors, label_max, down_scores
 
 
 def dbscan_labels_from_points(points: np.ndarray, radius_m: float, min_points: int) -> np.ndarray:
@@ -2281,8 +2291,10 @@ class SingleObjectPointCloudSegmenter:
         save_debug_2d: bool = False,
         tracker_image_size: int | None = DEFAULT_TRACKER_IMAGE_SIZE,
         target_vis_color: tuple[int, int, int] | None = None,
+        target_id: int = 1,
     ) -> None:
         self.target_name = str(target_name)
+        self.target_id = int(target_id)
         self.prompt_task_info = Path(prompt_task_info).resolve()
         self.prompt_image_root = Path(prompt_image_root).resolve()
         self.checkpoint_path = Path(checkpoint_path).resolve()
@@ -2690,6 +2702,7 @@ class SingleObjectPointCloudSegmenter:
         point_chunks: list[torch.Tensor] = []
         color_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
+        score_chunks: list[torch.Tensor] = []
         camera_summaries: list[dict[str, object]] = []
         for camera_id in self.active_camera_ids:
             camera_prepare_t0 = time.perf_counter()
@@ -2792,7 +2805,7 @@ class SingleObjectPointCloudSegmenter:
                 if torch.is_tensor(depth_m)
                 else np.ascontiguousarray(depth_m[:: self.stride, :: self.stride])
             )
-            points, colors, point_labels = backproject_scene_points_with_labels_torch(
+            points, colors, point_labels, point_scores = backproject_scene_points_with_labels_torch(
                 sampled_rgb=np.ascontiguousarray(rgb[:: self.stride, :: self.stride]),
                 sampled_depth_m=sampled_depth,
                 sampled_mask=mask_3d_t[:: self.stride, :: self.stride],
@@ -2802,6 +2815,8 @@ class SingleObjectPointCloudSegmenter:
                 depth_min=self.depth_min,
                 depth_max=self.depth_max,
                 device=self.tensor_device,
+                target_id=self.target_id,
+                camera_score=score,
             )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             camera_backproject_time = time.perf_counter() - camera_backproject_t0
@@ -2870,6 +2885,7 @@ class SingleObjectPointCloudSegmenter:
                 point_chunks.append(points)
                 color_chunks.append(colors)
                 label_chunks.append(point_labels)
+                score_chunks.append(point_scores)
             camera_summary = {
                 "camera_id": camera_id,
                 "target_pixels": target_pixels,
@@ -2889,18 +2905,22 @@ class SingleObjectPointCloudSegmenter:
 
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_t0 = time.perf_counter()
+        scores_t: torch.Tensor | None = None
         if point_chunks:
-            points_xyz_t, raw_colors_t, labels_t = fuse_scene_geometry_torch(
+            fuse_result = fuse_scene_geometry_torch(
                 point_chunks=point_chunks,
                 color_chunks=color_chunks,
                 label_chunks=label_chunks,
                 voxel_size=self.frame_voxel_size,
                 device=self.tensor_device,
+                score_chunks=score_chunks,
             )
+            points_xyz_t, raw_colors_t, labels_t, scores_t = fuse_result
         else:
             points_xyz_t = torch.empty((0, 3), dtype=torch.float32, device=self.tensor_device)
             raw_colors_t = torch.empty((0, 3), dtype=torch.uint8, device=self.tensor_device)
             labels_t = torch.empty((0,), dtype=torch.int32, device=self.tensor_device)
+            scores_t = torch.empty((0,), dtype=torch.float32, device=self.tensor_device)
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_time = time.perf_counter() - fuse_t0
         target_cluster_summary: dict[str, object] = {
@@ -3004,6 +3024,9 @@ class SingleObjectPointCloudSegmenter:
                         points_xyz[target_mask],
                         vis_colors[target_mask],
                     )
+            if scores_t is not None and scores_t.numel() > 0:
+                confidence_path = self.frame_output_dir / f"{frame_stem}_instance_confidence.npy"
+                np.save(str(confidence_path), scores_t.detach().cpu().numpy().astype(np.float32, copy=False))
             meta = {
                 "frame_name": frame_name,
                 "target_name": self.target_name,
@@ -3068,7 +3091,7 @@ class SingleObjectPointCloudSegmenter:
             "semantic_labels": labels_t,
             "semantic_colors": vis_colors_t,
             "label_names": [self.target_name],
-            "label_values": [0, 1],
+            "label_values": [0, self.target_id],
             "palette": torch.tensor([self.target_vis_color], dtype=torch.uint8, device=self.tensor_device),
             "camera_summaries": camera_summaries,
             "target_cluster_filter": target_cluster_summary,

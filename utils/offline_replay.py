@@ -59,6 +59,10 @@ def load_camera_poses(poses_json_path: Path) -> dict[str, dict[str, Any]]:
     return dict(raw)
 
 
+def load_targets(targets_json_path: Path) -> dict[str, int]:
+    return load_json(targets_json_path)
+
+
 # ---------------------------------------------------------------------------
 # Fast-Stereo depth estimation (overwrites depth_aligned_m.npy in-place)
 # ---------------------------------------------------------------------------
@@ -193,16 +197,21 @@ def run_sam3_segmentation(
     cfg: dict[str, Any],
     stereo_intrinsics: dict[str, dict[str, Any]],
     camera_poses: dict[str, dict[str, Any]],
+    target_name: str,
+    target_id: int,
 ) -> None:
     frame_dir = input_dir / "live_rgbd_debug" / frame_name
     camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     live_debug_root = input_dir / "live_rgbd_debug" if cfg.get("save_live_debug") else None
 
+    prompt_task_info = Path(cfg["prompts_root"]) / target_name / "task_info.json"
+    prompt_image_root = Path(cfg["prompts_root"]) / target_name
+
     segmenter = SingleObjectPointCloudSegmenter(
-        target_name=cfg["target_name"],
-        prompt_task_info=Path(cfg["prompt_task_info"]).expanduser().resolve(),
-        prompt_image_root=Path(cfg["prompt_image_root"]).expanduser().resolve(),
+        target_name=target_name,
+        prompt_task_info=prompt_task_info.expanduser().resolve(),
+        prompt_image_root=prompt_image_root.expanduser().resolve(),
         checkpoint_path=Path(cfg["checkpoint_path"]).expanduser().resolve(),
         output_dir=output_dir,
         overwrite_output=bool(cfg.get("overwrite_output")),
@@ -236,6 +245,7 @@ def run_sam3_segmentation(
         save_debug_2d=bool(cfg.get("save_debug_2d", True)),
         tracker_image_size=int(cfg.get("tracker_image_size", 896)),
         target_vis_color=tuple(cfg["target_vis_color"]) if cfg.get("target_vis_color") else None,
+        target_id=target_id,
     )
 
     with segmenter:
@@ -261,6 +271,8 @@ def run_sam3_segmentation(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unified offline replay: Fast-Stereo + SAM3")
     parser.add_argument("--config", type=Path, required=True, help="YAML config file")
+    parser.add_argument("--target", type=str, default=None,
+                        help="Single target name to process (overrides config targets list)")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -277,6 +289,19 @@ def main() -> None:
     frame_end = int(cfg["frame_end"]) if cfg.get("frame_end") is not None else len(all_frames)
     frames_to_process = all_frames[frame_start:frame_end]
 
+    targets = [args.target] if args.target else cfg.get("targets", [])
+    if isinstance(targets, str):
+        raise TypeError(f"Config 'targets' must be a list (e.g. targets: [redcup]), got a string: {targets!r}")
+    if not targets:
+        raise ValueError("Must provide --target or config 'targets' list")
+    target_name = targets[0]
+    if len(targets) > 1:
+        print(f"WARNING: multiple targets in config, but only processing first: {target_name}. Use --target to specify one.")
+
+    targets_json_path = Path(cfg.get("targets_json", "assets/prompts/targets.json")).expanduser().resolve()
+    target_id_map = load_targets(targets_json_path)
+    target_id = target_id_map[target_name]["id"]
+    print(f"Target: {target_name} (id={target_id})")
     print(f"Frames to process: {len(frames_to_process)} ({frame_start} to {frame_end})")
 
     camera_poses_json = cfg.get("camera_poses_json")
@@ -299,7 +324,6 @@ def main() -> None:
     )
 
     for frame_name in frames_to_process:
-        output_dir = base_output_dir / frame_name
         print()
         print("=" * 60)
         print(f"Processing frame: {frame_name}")
@@ -318,27 +342,32 @@ def main() -> None:
             depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
         )
 
-        print()
-        print("Step 2: SAM3 segmentation")
-        print("-" * 40)
         frame_dir = live_debug_dir / frame_name
         camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
         stereo_intrinsics: dict[str, dict[str, Any]] = {}
         for cid in camera_ids:
             with open(frame_dir / cid / "stereo_intrinsics.json") as f:
                 stereo_intrinsics[cid] = json.load(f)
+
+        print()
+        print("Step 2: SAM3 segmentation")
+        print("-" * 40)
+        target_output_dir = base_output_dir / f"offline_{target_name}" / frame_name
+        print(f"  [{target_name} (id={target_id})]")
         run_sam3_segmentation(
             input_dir=input_dir,
-            output_dir=output_dir,
+            output_dir=target_output_dir,
             frame_name=frame_name,
             cfg=cfg,
             stereo_intrinsics=stereo_intrinsics,
             camera_poses=camera_poses,
+            target_name=target_name,
+            target_id=target_id,
         )
-        print(f"  -> Output: {output_dir}")
+        print(f"    -> Output: {target_output_dir}")
 
     print()
-    print(f"All done. Processed {len(frames_to_process)} frames.")
+    print(f"All done. Processed {len(frames_to_process)} frames for target '{target_name}'.")
 
 
 if __name__ == "__main__":

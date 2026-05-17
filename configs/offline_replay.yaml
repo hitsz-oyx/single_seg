@@ -3,51 +3,50 @@
 # Use convert_demo0_to_live_debug.py (or equivalent) first to produce live_rgbd_debug format.
 #
 # Example:
-
-# python utils/convert_demo0_to_live_debug.py \
-#   --demo0-dir /home/franka-client/oyx_ws/demo0_frame_360 \
-#   --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
-#   --output-dir tests/outputs/demo0_frame_360_live \
-#   --frame-name frame_00000 \
-#   --overwrite
-
-# python utils/convert_hdf5_to_live_debug.py \
-#   --hdf5-path /home/franka-client/oyx_ws/Demo/demo0_1_ds3.hdf5 \
-#   --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
-#   --output-dir tests/outputs/demo0_1_ds3_live \
-#   --overwrite
+#   python utils/convert_demo0_to_live_debug.py \
+#     --demo0-dir /home/franka-client/oyx_ws/demo0_frame_360 \
+#     --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
+#     --output-dir tests/outputs/demo0_frame_360_live \
+#     --frame-name frame_00000 \
+#     --overwrite
 
 #   python utils/offline_replay.py --config configs/offline_replay.yaml
+
+
+  # python utils/aggregate_offline_labels.py \
+  #   --base-output-dir tests/outputs/demo0_1_ds3_offline \
+  #   --targets-json assets/prompts/targets.json \
+  #   --targets redcup book graycup plate porcelain whitecup \
+  #   --voxel-size 0.003 \
+  #   --output-dir tests/outputs/demo0_1_ds3_aggregated
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-input_dir: tests/outputs/demo0_1_ds3_live   # directory containing live_rgbd_debug/
+input_dir: tests/outputs/demo0_1_ds3_live
 output_dir: tests/outputs/demo0_1_ds3_offline
 
-# ---------------------------------------------------------------------------
-# Frame range (None = all frames)
-# ---------------------------------------------------------------------------
 frame_start: 0
-frame_end: null   # null = all frames
+frame_end: 1
 
 # ---------------------------------------------------------------------------
-# External camera poses (extrinsics)
-# Supports two formats:
-#   1. Full format:  {"cameras": [{camera_id, serial_number, cam2world_4x4, world2cam_4x4}, ...]}
-#   2. Simple format: {camera_id: {cam2world_4x4, ...}, ...}
+# Targets (multi-object segmentation)
 # ---------------------------------------------------------------------------
+
+# 写法: 一个个传
+# for t in redcup book graycup plate porcelain whitecup; do
+#   python utils/offline_replay.py --config configs/offline_replay.yaml --target "$t"
+# done
+
+targets: [redcup]
+
+targets_json: assets/prompts/targets.json
+prompts_root: assets/prompts
 camera_poses_json: configs/refined_extrinsics.json
 
-# ---------------------------------------------------------------------------
-# SAM3 segmentation
-# ---------------------------------------------------------------------------
-target_name: redcup
-prompt_task_info: assets/prompts/redcup/task_info.json
-prompt_image_root: assets/prompts/redcup/
 checkpoint_path: checkpoints/sam3.pt
 
-confidence: 0.25
+confidence: 0.7
 mask_threshold: 0.6
 prompt_keep_score_threshold: 0.2
 video_mask_prob_threshold: 0.95
@@ -74,7 +73,7 @@ target_plane_filter_max_planes: 1
 target_plane_filter_ransac_iterations: 256
 
 target_depth_band_filter_enabled: true
-target_depth_band_filter_range_m: 0.070
+target_depth_band_filter_range_m: 0.060
 target_depth_band_filter_min_valid_pixels: 50
 target_depth_band_filter_min_keep_pixels: 30
 
@@ -84,13 +83,18 @@ target_3d_mask_erode_kernel: 0
 # Output
 # ---------------------------------------------------------------------------
 save_ply: true
-save_normal: true
+save_normal: false
 save_debug_2d: true
 save_live_debug: true
 tracker_image_size: 896
 target_vis_color: [30, 60, 180]
 
 overwrite_output: true
+
+confidence: 0.25
+mask_threshold: 0.6
+prompt_keep_score_threshold: 0.2
+video_mask_prob_threshold: 0.95
 
 # ---------------------------------------------------------------------------
 # Fast-Stereo (passed to FastFoundationStereoRunner)
