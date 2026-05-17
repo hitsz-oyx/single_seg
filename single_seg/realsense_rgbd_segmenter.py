@@ -1030,6 +1030,7 @@ def build_effective_live_config(args: argparse.Namespace, *, serials: list[str])
         "depth_source": normalize_depth_source(args.depth_source),
         "low_bandwidth_mode": bool(args.low_bandwidth_mode),
         "save_live_debug": bool(args.save_live_debug),
+        "compute_depth_valid_ratio": bool(args.compute_depth_valid_ratio),
     }
     fast_stereo = {
         "model_path": resolved_path_text(args.fast_model_path),
@@ -1615,7 +1616,7 @@ def write_live_debug(
     frame_index: int,
     camera_id: str,
     depth_source: str,
-    rgb: np.ndarray,
+    rgb: np.ndarray | torch.Tensor,
     ir_left: np.ndarray | None,
     ir_right: np.ndarray | None,
     depth_aligned_m: np.ndarray | torch.Tensor,
@@ -1631,7 +1632,11 @@ def write_live_debug(
             json.dumps(to_jsonable(camera_payload), indent=2),
             encoding="utf-8",
         )
-    cv2.imwrite(str(frame_dir / "rgb.png"), rgb[..., ::-1])
+    if torch.is_tensor(rgb):
+        rgb_np = rgb.detach().cpu().numpy()
+    else:
+        rgb_np = rgb
+    cv2.imwrite(str(frame_dir / "rgb.png"), rgb_np[..., ::-1])
     if ir_left_raw is not None:
         cv2.imwrite(str(frame_dir / "ir_left_raw.png"), ir_left_raw)
     if ir_right_raw is not None:
@@ -1742,6 +1747,7 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
         "low_bandwidth_mode": realsense_cfg.get("low_bandwidth_mode"),
         "max_frames": realsense_cfg.get("max_frames"),
         "save_live_debug": realsense_cfg.get("save_live_debug"),
+        "compute_depth_valid_ratio": realsense_cfg.get("compute_depth_valid_ratio"),
     }
     for key, value in realsense_values.items():
         if value is None:
@@ -1752,7 +1758,7 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults[key] = normalize_depth_source(value)
         elif key == "stereo_rectification_mode":
             defaults[key] = normalize_stereo_rectification_mode(value)
-        elif key in {"low_bandwidth_mode", "save_live_debug", "emitter_enabled"}:
+        elif key in {"low_bandwidth_mode", "save_live_debug", "emitter_enabled", "compute_depth_valid_ratio"}:
             defaults[key] = int(bool(value))
         else:
             defaults[key] = value
@@ -1870,6 +1876,8 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--emitter-enabled", type=int, choices=(0, 1), default=None)
     parser.add_argument("--depth-source", choices=DEPTH_SOURCE_CHOICES, default="fast")
     parser.add_argument("--low-bandwidth-mode", type=int, default=1)
+    parser.add_argument("--compute-depth-valid-ratio", type=int, default=1,
+                        help="计算深度有效比例并打印日志（需要 CUDA 同步），0 关闭可提速")
     parser.add_argument("--fast-model-path", type=Path, default=FAST_STEREO_DEFAULT_MODEL)
     parser.add_argument("--fast-valid-iters", type=int, default=8)
     parser.add_argument("--fast-max-disp", type=int, default=192)
@@ -1917,6 +1925,7 @@ def build_camera_inputs_from_live_frames(
     timing: dict[str, object] | None = None,
     fast_align_backend: str = "torch",
     fast_aligners: dict[str, LibrealsenseSoftwareAligner] | None = None,
+    compute_depth_valid_ratio: bool = True,
 ) -> dict[str, dict[str, object]]:
     total_t0 = time.perf_counter()
     camera_inputs: dict[str, dict[str, object]] = {}
@@ -1967,7 +1976,8 @@ def build_camera_inputs_from_live_frames(
                 raise RuntimeError("depth_source='fast' requires a Fast-FoundationStereo runner")
             ir_left_rect = np.asarray(payload["ir_left_rect"], dtype=np.uint8)
             ir_right_rect = np.asarray(payload["ir_right_rect"], dtype=np.uint8)
-            sync_cuda_if_needed(sync_timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             stereo_t0 = time.perf_counter()
             stereo_output = stereo_runner.infer_depth(
                 left_image=ir_left_rect,
@@ -1977,14 +1987,16 @@ def build_camera_inputs_from_live_frames(
                 return_torch=True,
                 include_input_images=False,
             )
-            sync_cuda_if_needed(sync_timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             stereo_time_sec = time.perf_counter() - stereo_t0
             rectified_depth_m = stereo_output["depth_m"]
             stereo_intrinsics = dict(stereo_output["rectified_intrinsics"])
             if bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "rectified":
                 if not torch.is_tensor(rectified_depth_m):
                     raise RuntimeError("Fast rectified depth edge filtering requires torch depth output")
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 edge_t0 = time.perf_counter()
                 valid_before = int(torch.count_nonzero(torch.isfinite(rectified_depth_m) & (rectified_depth_m > 0)).item())
                 rectified_depth_m = filter_depth_edges_torch(
@@ -1992,7 +2004,8 @@ def build_camera_inputs_from_live_frames(
                     threshold_m=float(fast_depth_edge_filter_threshold_m),
                 )
                 valid_after = int(torch.count_nonzero(rectified_depth_m > 0).item())
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 rectified_edge_filter_time_sec = time.perf_counter() - edge_t0
                 edge_filter_summary = {
                     "enabled": True,
@@ -2004,7 +2017,8 @@ def build_camera_inputs_from_live_frames(
                     "removed_pixels": int(max(valid_before - valid_after, 0)),
                 }
             if align_backend == "open3d":
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 align_t0 = time.perf_counter()
                 depth_aligned_m = align_rectified_depth_to_color_open3d(
                     rectified_depth_m,
@@ -2014,7 +2028,8 @@ def build_camera_inputs_from_live_frames(
                     color_shape=rgb.shape[:2],
                     depth_max_m=float(depth_max),
                 )
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 open3d_align_time_sec = time.perf_counter() - align_t0
                 depth_align_time_sec = open3d_align_time_sec
                 fast_alignment_direction = "depth_to_color"
@@ -2028,7 +2043,8 @@ def build_camera_inputs_from_live_frames(
                 pointcloud_frame = "rectified_depth"
                 fast_alignment_direction = "color_to_depth"
         if torch.is_tensor(depth_aligned_m):
-            sync_cuda_if_needed(sync_timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             range_t0 = time.perf_counter()
             depth_aligned_m = depth_aligned_m.to(dtype=torch.float32)
             depth_aligned_m = torch.where(
@@ -2038,10 +2054,12 @@ def build_camera_inputs_from_live_frames(
                 depth_aligned_m,
                 torch.zeros((), dtype=torch.float32, device=depth_aligned_m.device),
             )
-            sync_cuda_if_needed(sync_timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             depth_range_filter_time_sec = time.perf_counter() - range_t0
             if depth_source == "fast" and bool(fast_depth_edge_filter_enabled) and edge_filter_stage == "aligned":
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 aligned_edge_t0 = time.perf_counter()
                 valid_before = int(torch.count_nonzero(depth_aligned_m > 0).item())
                 depth_aligned_m = filter_depth_edges_torch(
@@ -2049,7 +2067,8 @@ def build_camera_inputs_from_live_frames(
                     threshold_m=float(fast_depth_edge_filter_threshold_m),
                 )
                 valid_after = int(torch.count_nonzero(depth_aligned_m > 0).item())
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 aligned_edge_filter_time_sec = time.perf_counter() - aligned_edge_t0
                 edge_filter_summary = {
                     "enabled": True,
@@ -2060,9 +2079,13 @@ def build_camera_inputs_from_live_frames(
                     "valid_pixels_after": valid_after,
                     "removed_pixels": int(max(valid_before - valid_after, 0)),
                 }
-            sync_cuda_if_needed(sync_timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             valid_t0 = time.perf_counter()
-            depth_valid_ratio = float((depth_aligned_m > 0).float().mean().item())
+            if compute_depth_valid_ratio:
+                depth_valid_ratio = float((depth_aligned_m > 0).float().mean().item())
+            else:
+                depth_valid_ratio = 0.0
             depth_valid_ratio_time_sec = time.perf_counter() - valid_t0
         else:
             range_t0 = time.perf_counter()
@@ -2089,7 +2112,10 @@ def build_camera_inputs_from_live_frames(
                     "removed_pixels": int(max(valid_before - valid_after, 0)),
                 }
             valid_t0 = time.perf_counter()
-            depth_valid_ratio = float((depth_aligned_m > 0).mean())
+            if compute_depth_valid_ratio:
+                depth_valid_ratio = float((depth_aligned_m > 0).mean())
+            else:
+                depth_valid_ratio = 0.0
             depth_valid_ratio_time_sec = time.perf_counter() - valid_t0
 
         if depth_source == "fast" and align_backend != "open3d":
@@ -2098,7 +2124,8 @@ def build_camera_inputs_from_live_frames(
             if align_backend == "librealsense":
                 if fast_aligners is None:
                     raise RuntimeError("fast_align_backend='librealsense' requires a fast_aligners cache")
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 align_total_t0 = time.perf_counter()
                 cpu_t0 = time.perf_counter()
                 if torch.is_tensor(depth_aligned_m):
@@ -2127,7 +2154,8 @@ def build_camera_inputs_from_live_frames(
                     depth_for_color = torch.as_tensor(np.ascontiguousarray(depth_aligned_m), dtype=torch.float32)
                 else:
                     depth_for_color = depth_aligned_m
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 align_t0 = time.perf_counter()
                 rgb_depth_t = align_color_to_rectified_depth_torch(
                     rgb,
@@ -2136,9 +2164,10 @@ def build_camera_inputs_from_live_frames(
                     rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
                     color_intrinsics=dict(payload["color_intrinsics"]),
                 )
-                sync_cuda_if_needed(sync_timing)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 depth_align_time_sec = time.perf_counter() - align_t0
-                rgb_for_points = rgb_depth_t.detach().cpu().numpy()
+                rgb_for_points = rgb_depth_t
 
         camera_inputs[camera_id] = {
             "rgb": rgb_for_points,
@@ -2372,6 +2401,8 @@ def run_live(args: argparse.Namespace) -> None:
                     )
                 capture_time = time.perf_counter() - capture_t0
                 rgbd_build_timing: dict[str, object] = {}
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 build_t0 = time.perf_counter()
                 camera_inputs = build_camera_inputs_from_live_frames(
                     captured_frames=captured_frames,
@@ -2388,11 +2419,13 @@ def run_live(args: argparse.Namespace) -> None:
                     timing=rgbd_build_timing,
                     fast_align_backend=str(args.fast_align_backend),
                     fast_aligners=fast_aligners,
+                    compute_depth_valid_ratio=bool(args.compute_depth_valid_ratio),
                 )
                 build_camera_inputs_time = time.perf_counter() - build_t0
                 frame_name = f"frame_{frame_index:05d}.png"
                 logging.info(f"Running single-seg for {frame_name}")
-                sync_cuda_if_needed(bool(args.sync_timing))
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 process_t0 = time.perf_counter()
                 result = segmenter.process_frame(
                     frame_name=frame_name,
@@ -2401,23 +2434,20 @@ def run_live(args: argparse.Namespace) -> None:
                         segmenter.output_dir / "live_rgbd_debug" if bool(args.save_live_debug) else None
                     ),
                 )
-                sync_cuda_if_needed(bool(args.sync_timing))
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 process_wall_time = time.perf_counter() - process_t0
                 loop_runtime = time.perf_counter() - loop_t0
-                if segmenter.timeline:
-                    segmenter.timeline[-1]["capture_time_sec"] = capture_time
-                    segmenter.timeline[-1]["build_camera_inputs_time_sec"] = build_camera_inputs_time
-                    segmenter.timeline[-1]["process_frame_wall_time_sec"] = process_wall_time
-                    segmenter.timeline[-1]["loop_runtime_sec"] = loop_runtime
-                    segmenter.timeline[-1]["live_timing_sec"] = {
-                        "sync_timing": bool(args.sync_timing),
-                        "capture_time_sec": capture_time,
-                        "capture_per_camera": capture_per_camera,
-                        "build_camera_inputs_time_sec": build_camera_inputs_time,
-                        "rgbd_build": rgbd_build_timing,
-                        "process_frame_wall_time_sec": process_wall_time,
-                        "loop_runtime_sec": loop_runtime,
-                    }
+                segmenter.update_frame_metadata({
+                    "total_frame_time_sec": loop_runtime,
+                    "capture_time_sec": capture_time,
+                    "capture_per_camera": capture_per_camera,
+                    "build_camera_inputs_time_sec": build_camera_inputs_time,
+                    "rgbd_build_timing_sec": rgbd_build_timing,
+                    "process_frame_time_sec": process_wall_time,
+                    "other_time_sec": max(0.0, loop_runtime - capture_time - build_camera_inputs_time - process_wall_time),
+                    "loop_runtime_sec": loop_runtime,
+                })
                 logging.info(
                     f"[frame {result['frame_index']:03d}] {frame_name} "
                     f"points={result['points_xyz'].shape[0]} cameras={len(camera_inputs)} "

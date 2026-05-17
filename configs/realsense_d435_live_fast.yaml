@@ -11,6 +11,13 @@
 #   --save-live-debug 1 \
 #   --overwrite-output
 
+
+# single-seg-realsense \
+#   --config configs/realsense_d435_live_fast.yaml \
+#   --camera-count 3 \
+#   --camera-serials "148522074762,243122075507,845112070307" \
+#   --camera-poses-json configs/refined_extrinsics.json \
+#   --overwrite-output
 # =============================================================================
 # 分割器配置
 # =============================================================================
@@ -31,19 +38,19 @@ segmenter:
   # # 输出目录
   # output_dir: tests/outputs/realsense_live_small_three_cam_fast_icp
 
-  target_name: redcup
+  target_name: book
 
   # Prompt 标注文件路径，包含目标物体的参考图片和边界框
-  prompt_task_info: assets/prompts/redcup/task_info.json
+  prompt_task_info: assets/prompts/book/task_info.json
 
   # Prompt 图片目录，存放参考图片
-  prompt_image_root: assets/prompts/redcup/
+  prompt_image_root: assets/prompts/book/
 
   # SAM3 模型权重路径
   checkpoint_path: checkpoints/sam3.pt
 
   # 输出目录
-  output_dir: tests/outputs/realsense_live_redcup_three_cam_fast_icp
+  output_dir: tests/outputs/realsense_live_book_three_cam_fast_icp
 
   
 
@@ -159,7 +166,7 @@ segmenter:
   # SAM3 tracker 输入图像尺寸
   # 值越大精度越高，但速度越慢
   # 推荐: 640, 896, 1024
-  tracker_image_size: 896
+  tracker_image_size: 560
 
   # 目标点云高亮颜色 R,G,B
   # 默认 null = 红色 (255,70,70)
@@ -240,6 +247,10 @@ realsense:
   # 包括: RGB, IR 左/右, 深度可视化
   save_live_debug: false
 
+  # 是否计算并打印深度有效比例（需要 CUDA 同步）
+  # 仅 debug 用，关闭可避免每相机 CUDA 同步，加速处理
+  compute_depth_valid_ratio: false
+
 # =============================================================================
 # Fast-FoundationStereo 深度估计配置
 # 仅当 depth_source=fast 时生效
@@ -258,13 +269,13 @@ fast_stereo:
   # - 4: 速度优先
   # - 6: 当前 D435 低带宽数据上的平衡档
   # - 8/12: 质量优先
-  valid_iters: 12
+  valid_iters: 4
 
   # 最大视差范围 (像素)
   # 物体越近需要越大的视差范围
   # 当前 480x270 rectified IR 下，depth_min=0.1m 时 192 已覆盖近距离视差
   # 只有需要小于约 0.1m 的深度时再考虑 256+
-  max_disp: 192
+  max_disp: 64
 
   # cost volume 构建后端
   # pytorch1: 当前数据上稳定且和 triton 速度接近
@@ -280,7 +291,7 @@ fast_stereo:
   # 输入图像缩放比例
   # 1.0: 原始分辨率
   # <1.0: 缩小图像以加速
-  scale: 1
+  scale: 0.6
 
   # 是否移除不可见点 (遮挡区域)
   remove_invisible: true

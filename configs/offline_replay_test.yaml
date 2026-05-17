@@ -57,7 +57,7 @@ video_mask_prob_threshold: 0.95
 depth_min: 0.1
 depth_max: 3.0
 stride: 2
-frame_voxel_size: 0.002
+frame_voxel_size: 0.003
 
 target_cluster_filter_enabled: false
 target_cluster_radius_m: 0.025
@@ -86,7 +86,7 @@ save_ply: false
 save_normal: false
 save_debug_2d: false
 save_live_debug: false
-tracker_image_size: 896
+tracker_image_size: 560
 target_vis_color: [30, 60, 180]
 
 overwrite_output: true
@@ -99,11 +99,17 @@ video_mask_prob_threshold: 0.95
 # ---------------------------------------------------------------------------
 # Fast-Stereo (passed to FastFoundationStereoRunner)
 # ---------------------------------------------------------------------------
+# 选项: serial, parallel_loading, multistream, multiprocess
+# parallel_loading 并行加载数据但是串行推理
+# multistream 使用 CUDA Streams 并行推理
+# multiprocess 使用多进程并行推理
+stereo_mode: parallel_loading    
+
 fast_stereo:
   model_path: third_party/fastfoundationstereo/weights/23-36-37/model_best_bp2_serialize.pth
-  valid_iters: 12
-  max_disp: 192
-  scale: 1.0
+  valid_iters: 4
+  max_disp: 64
+  scale: 0.6
   remove_invisible: true
   hiera: false
   optimize_build_volume: pytorch1

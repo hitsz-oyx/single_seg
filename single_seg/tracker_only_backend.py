@@ -324,6 +324,47 @@ def preprocess_pil_image(
     return tensor.squeeze(0), int(video_height), int(video_width)
 
 
+def preprocess_tensor_image(
+    tensor: torch.Tensor,
+    *,
+    image_size: int,
+    device: torch.device,
+    img_mean: torch.Tensor | None = None,
+    img_std: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int, int]:
+    if tensor.ndim == 4:
+        tensor = tensor.squeeze(0)
+    
+    if tensor.ndim == 3 and tensor.shape[0] == 3:
+        video_height, video_width = int(tensor.shape[1]), int(tensor.shape[2])
+    elif tensor.ndim == 3 and tensor.shape[2] == 3:
+        video_height, video_width = int(tensor.shape[0]), int(tensor.shape[1])
+        tensor = tensor.permute(2, 0, 1)
+    else:
+        raise ValueError(f"Expected 3xHxW or HxWx3 tensor, got shape {tensor.shape}")
+    
+    tensor = tensor.to(device, non_blocking=True)
+    
+    if tensor.dtype == torch.uint8:
+        tensor = tensor.to(dtype=torch.float32).div_(255.0)
+    
+    tensor = F.interpolate(
+        tensor.unsqueeze(0),
+        size=(int(image_size), int(image_size)),
+        mode="bilinear",
+        align_corners=False,
+        antialias=False,
+    ).squeeze(0)
+    
+    if img_mean is None:
+        img_mean = torch.tensor(IMG_MEAN, dtype=torch.float32, device=device)[:, None, None]
+    if img_std is None:
+        img_std = torch.tensor(IMG_STD, dtype=torch.float32, device=device)[:, None, None]
+    tensor = tensor.sub(img_mean).div(img_std)
+    
+    return tensor, int(video_height), int(video_width)
+
+
 @dataclass
 class TrackerOnlySession:
     session_id: str
@@ -447,6 +488,44 @@ def compose_camera_rgb_frame_resources(
             raise ValueError(f"rgb shape mismatch for {camera_id}: {rgb.shape[:2]} vs {(tile.height, tile.width)}")
         canvas[int(tile.y) : int(tile.y + tile.height), int(tile.x) : int(tile.x + tile.width)] = rgb
     return [canvas], layout
+
+
+def compose_camera_rgb_frame_resources_torch(
+    rgb_by_camera: dict[str, torch.Tensor],
+    camera_order: list[str],
+    layout: StitchedLayout | None = None,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, StitchedLayout]:
+    frame_sizes = {
+        camera_id: (int(rgb_by_camera[camera_id].shape[1]), int(rgb_by_camera[camera_id].shape[0]))
+        for camera_id in camera_order
+    }
+    if layout is None:
+        layout = build_stitched_layout(frame_sizes, camera_order)
+    else:
+        if [str(camera_id) for camera_id in camera_order] != list(layout.camera_ids):
+            raise ValueError("camera_order does not match stitched layout camera_ids")
+        for camera_id in camera_order:
+            expected = layout.tiles[camera_id]
+            width, height = frame_sizes[camera_id]
+            if int(width) != int(expected.width) or int(height) != int(expected.height):
+                raise ValueError(f"frame size mismatch for {camera_id}: {(width, height)} vs {(expected.width, expected.height)}")
+    
+    canvas = torch.zeros(
+        (int(layout.canvas_height), int(layout.canvas_width), 3),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for camera_id in camera_order:
+        tile = layout.tiles[camera_id]
+        rgb = rgb_by_camera[camera_id]
+        if rgb.shape[:2] != (int(tile.height), int(tile.width)):
+            raise ValueError(f"rgb shape mismatch for {camera_id}: {tuple(rgb.shape[:2])} vs {(tile.height, tile.width)}")
+        if rgb.device != canvas.device:
+            rgb = rgb.to(device=canvas.device, non_blocking=True)
+        canvas[int(tile.y) : int(tile.y + tile.height), int(tile.x) : int(tile.x + tile.width)] = rgb
+    
+    return canvas, layout
 
 
 def stitch_camera_binary_masks(
@@ -613,33 +692,41 @@ class TrackerOnlyVideoPredictor:
         self.img_mean = torch.tensor(IMG_MEAN, dtype=torch.float32, device=self.device)[:, None, None]
         self.img_std = torch.tensor(IMG_STD, dtype=torch.float32, device=self.device)[:, None, None]
 
-    def _ensure_frame_list(self, resource_path) -> list[Image.Image]:
-        if isinstance(resource_path, list):
-            frames = resource_path
-        else:
-            frames = [resource_path]
-        if not frames:
+    def _ensure_frame_list(self, resource_path):
+        if not resource_path:
             raise TypeError("resource_path must not be empty")
+        frames = resource_path if isinstance(resource_path, list) else [resource_path]
         for frame in frames:
             if isinstance(frame, Image.Image):
                 continue
             if isinstance(frame, np.ndarray):
                 continue
-            raise TypeError("resource_path must be a PIL.Image, np.ndarray, or a homogeneous list of them")
+            if torch.is_tensor(frame):
+                continue
+            raise TypeError("resource_path must be a PIL.Image, np.ndarray, torch.Tensor, or a homogeneous list of them")
         return frames
 
-    def _create_state_from_frames(self, frames: list[Image.Image]) -> dict[str, Any]:
+    def _create_state_from_frames(self, frames: list[Image.Image | np.ndarray | torch.Tensor]) -> dict[str, Any]:
         tensors: list[torch.Tensor] = []
         video_height: int | None = None
         video_width: int | None = None
         for frame in frames:
-            tensor, frame_h, frame_w = preprocess_pil_image(
-                frame,
-                image_size=self.image_size,
-                device=self.device,
-                img_mean=self.img_mean,
-                img_std=self.img_std,
-            )
+            if torch.is_tensor(frame):
+                tensor, frame_h, frame_w = preprocess_tensor_image(
+                    frame,
+                    image_size=self.image_size,
+                    device=self.device,
+                    img_mean=self.img_mean,
+                    img_std=self.img_std,
+                )
+            else:
+                tensor, frame_h, frame_w = preprocess_pil_image(
+                    frame,
+                    image_size=self.image_size,
+                    device=self.device,
+                    img_mean=self.img_mean,
+                    img_std=self.img_std,
+                )
             tensors.append(tensor)
             if video_height is None:
                 video_height = frame_h
@@ -697,13 +784,24 @@ class TrackerOnlyVideoPredictor:
         frames = self._ensure_frame_list(resource_path)
         if len(frames) != 1:
             raise RuntimeError("TrackerOnlyVideoPredictor.append_frame expects exactly one frame")
-        tensor, _, _ = preprocess_pil_image(
-            frames[0],
-            image_size=self.image_size,
-            device=self.device,
-            img_mean=self.img_mean,
-            img_std=self.img_std,
-        )
+        
+        frame = frames[0]
+        if torch.is_tensor(frame):
+            tensor, _, _ = preprocess_tensor_image(
+                frame,
+                image_size=self.image_size,
+                device=self.device,
+                img_mean=self.img_mean,
+                img_std=self.img_std,
+            )
+        else:
+            tensor, _, _ = preprocess_pil_image(
+                frame,
+                image_size=self.image_size,
+                device=self.device,
+                img_mean=self.img_mean,
+                img_std=self.img_std,
+            )
         session.state["images"].append(tensor)
         session.state["num_frames"] = len(session.state["images"])
         return {"frame_index": int(session.state["num_frames"] - 1), "num_frames": int(session.state["num_frames"])}

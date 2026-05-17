@@ -2387,10 +2387,14 @@ class SingleObjectPointCloudSegmenter:
         self.timeline: list[dict[str, object]] = []
         self._last_initialize_timing: dict[str, object] = {}
 
-    def _build_frame_resources(self, camera_inputs: dict[str, dict[str, object]]) -> dict[str, list[Image.Image]]:
-        resources: dict[str, list[Image.Image]] = {}
+    def _build_frame_resources(self, camera_inputs: dict[str, dict[str, object]]) -> dict[str, list[Image.Image | torch.Tensor]]:
+        resources: dict[str, list[Image.Image | torch.Tensor]] = {}
         for camera_id, payload in camera_inputs.items():
-            resources[camera_id] = [Image.fromarray(np.asarray(payload["rgb"], dtype=np.uint8))]
+            rgb = payload["rgb"]
+            if torch.is_tensor(rgb):
+                resources[camera_id] = [rgb]
+            else:
+                resources[camera_id] = [Image.fromarray(np.asarray(rgb, dtype=np.uint8))]
         return resources
 
     def _get_torch_backproject_scales(
@@ -2456,7 +2460,11 @@ class SingleObjectPointCloudSegmenter:
         seed_masks_by_camera: dict[str, np.ndarray] = {}
         active_camera_ids: list[str] = []
         for camera_id, payload in camera_inputs.items():
-            image = frame_resources[camera_id][0]
+            image_or_tensor = frame_resources[camera_id][0]
+            if torch.is_tensor(image_or_tensor):
+                image = Image.fromarray(image_or_tensor.detach().cpu().numpy())
+            else:
+                image = image_or_tensor
             debug_dir = self.output_dir / "prompt_debug" / camera_id if self.save_debug_2d else None
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             prompt_t0 = time.perf_counter()
@@ -2520,7 +2528,7 @@ class SingleObjectPointCloudSegmenter:
             seed_mask, seed_shape_mode = refine_seed_mask(
                 seed_mask,
                 seed_box,
-                image_shape=np.asarray(payload["rgb"], dtype=np.uint8).shape[:2],
+                image_shape=tuple(payload["rgb"].shape[:2]) if torch.is_tensor(payload["rgb"]) else np.asarray(payload["rgb"], dtype=np.uint8).shape[:2],
                 max_area_ratio=self.seed_max_area_ratio,
                 box_margin=self.seed_box_margin,
                 min_pixels=self.seed_min_pixels,
@@ -2543,11 +2551,16 @@ class SingleObjectPointCloudSegmenter:
             )
             per_camera_timing.append(per_camera_item)
             if self.save_debug_2d:
+                rgb_data = payload["rgb"]
+                if torch.is_tensor(rgb_data):
+                    rgb_np = rgb_data.detach().cpu().numpy()
+                else:
+                    rgb_np = np.asarray(rgb_data, dtype=np.uint8)
                 save_binary_mask_debug(
                     output_dir=self.output_dir,
                     frame_name=frame_name,
                     camera_id=camera_id,
-                    rgb=np.asarray(payload["rgb"], dtype=np.uint8),
+                    rgb=rgb_np,
                     mask=np.asarray(seed_mask, dtype=bool),
                     score=seed_score,
                 )
@@ -2555,18 +2568,31 @@ class SingleObjectPointCloudSegmenter:
         if not self.active_camera_ids:
             raise RuntimeError(f"No camera produced a usable seed for target {self.target_name!r}")
         try:
-            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, stitch_camera_binary_masks
+            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, compose_camera_rgb_frame_resources_torch, stitch_camera_binary_masks
         except ImportError:
-            from tracker_only_backend import compose_camera_rgb_frame_resources, stitch_camera_binary_masks
+            from tracker_only_backend import compose_camera_rgb_frame_resources, compose_camera_rgb_frame_resources_torch, stitch_camera_binary_masks
 
         compose_t0 = time.perf_counter()
-        composite_resources, self.stitched_layout = compose_camera_rgb_frame_resources(
-            rgb_by_camera={
-                camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
-                for camera_id in self.active_camera_ids
-            },
-            camera_order=self.active_camera_ids,
-        )
+        
+        first_rgb = camera_inputs[self.active_camera_ids[0]]["rgb"]
+        if torch.is_tensor(first_rgb):
+            canvas_tensor, self.stitched_layout = compose_camera_rgb_frame_resources_torch(
+                rgb_by_camera={
+                    camera_id: camera_inputs[camera_id]["rgb"]
+                    for camera_id in self.active_camera_ids
+                },
+                camera_order=self.active_camera_ids,
+                device=self.tensor_device,
+            )
+            composite_resources = [canvas_tensor]
+        else:
+            composite_resources, self.stitched_layout = compose_camera_rgb_frame_resources(
+                rgb_by_camera={
+                    camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
+                    for camera_id in self.active_camera_ids
+                },
+                camera_order=self.active_camera_ids,
+            )
         composite_mask = stitch_camera_binary_masks(seed_masks_by_camera, self.stitched_layout)
         compose_time = time.perf_counter() - compose_t0
         with autocast_context():
@@ -2648,19 +2674,33 @@ class SingleObjectPointCloudSegmenter:
         masks_by_camera: dict[str, torch.Tensor] = {}
         scores_by_camera: dict[str, float | None] = {}
         try:
-            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, split_stitched_binary_mask_torch
+            from single_seg.tracker_only_backend import compose_camera_rgb_frame_resources, compose_camera_rgb_frame_resources_torch, split_stitched_binary_mask_torch
         except ImportError:
-            from tracker_only_backend import compose_camera_rgb_frame_resources, split_stitched_binary_mask_torch
+            from tracker_only_backend import compose_camera_rgb_frame_resources, compose_camera_rgb_frame_resources_torch, split_stitched_binary_mask_torch
 
         compose_t0 = time.perf_counter()
-        composite_resources, current_layout = compose_camera_rgb_frame_resources(
-            rgb_by_camera={
-                camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
-                for camera_id in self.active_camera_ids
-            },
-            camera_order=self.active_camera_ids,
-            layout=self.stitched_layout,
-        )
+        
+        first_rgb = camera_inputs[self.active_camera_ids[0]]["rgb"]
+        if torch.is_tensor(first_rgb):
+            canvas_tensor, current_layout = compose_camera_rgb_frame_resources_torch(
+                rgb_by_camera={
+                    camera_id: camera_inputs[camera_id]["rgb"]
+                    for camera_id in self.active_camera_ids
+                },
+                camera_order=self.active_camera_ids,
+                layout=self.stitched_layout,
+                device=self.tensor_device,
+            )
+            composite_resources = [canvas_tensor]
+        else:
+            composite_resources, current_layout = compose_camera_rgb_frame_resources(
+                rgb_by_camera={
+                    camera_id: np.asarray(camera_inputs[camera_id]["rgb"], dtype=np.uint8)
+                    for camera_id in self.active_camera_ids
+                },
+                camera_order=self.active_camera_ids,
+                layout=self.stitched_layout,
+            )
         compose_inputs_time += time.perf_counter() - compose_t0
         if self.frame_index > 0:
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
@@ -2720,7 +2760,11 @@ class SingleObjectPointCloudSegmenter:
             stereo_time += float(payload.get("stereo_time_sec", 0.0))
 
             rgb_copy_t0 = time.perf_counter()
-            rgb = np.asarray(payload["rgb"], dtype=np.uint8)
+            rgb_input = payload["rgb"]
+            if torch.is_tensor(rgb_input):
+                rgb = rgb_input
+            else:
+                rgb = np.asarray(rgb_input, dtype=np.uint8)
             camera_rgb_copy_time += time.perf_counter() - rgb_copy_t0
 
             mask_convert_t0 = time.perf_counter()
@@ -2741,11 +2785,12 @@ class SingleObjectPointCloudSegmenter:
             score = scores_by_camera.get(camera_id)
             save_debug_t0 = time.perf_counter()
             if self.save_debug_2d:
+                rgb_for_debug = rgb.detach().cpu().numpy() if torch.is_tensor(rgb) else rgb
                 save_binary_mask_debug(
                     output_dir=self.output_dir,
                     frame_name=frame_name,
                     camera_id=camera_id,
-                    rgb=rgb,
+                    rgb=rgb_for_debug,
                     mask=mask_t.detach().cpu().numpy(),
                     score=score,
                 )
@@ -2835,8 +2880,13 @@ class SingleObjectPointCloudSegmenter:
                 if torch.is_tensor(depth_m)
                 else np.ascontiguousarray(depth_m[:: self.stride, :: self.stride])
             )
+            sampled_rgb = rgb[:: self.stride, :: self.stride]
+            if torch.is_tensor(sampled_rgb):
+                sampled_rgb = sampled_rgb.contiguous()
+            else:
+                sampled_rgb = np.ascontiguousarray(sampled_rgb)
             points, colors, point_labels, point_scores = backproject_scene_points_with_labels_torch(
-                sampled_rgb=np.ascontiguousarray(rgb[:: self.stride, :: self.stride]),
+                sampled_rgb=sampled_rgb,
                 sampled_depth_m=sampled_depth,
                 sampled_mask=mask_3d_t[:: self.stride, :: self.stride],
                 cam2world_gl=np.asarray(pose_record["cam2world_4x4"], dtype=np.float64),
@@ -3085,6 +3135,7 @@ class SingleObjectPointCloudSegmenter:
                 "num_labeled_points": int(torch.count_nonzero(labels_t > 0).item()),
                 "target_cluster_filter": target_cluster_summary,
                 "camera_summaries": camera_summaries,
+                "total_frame_time_sec": frame_runtime,
                 "append_frame_time_sec": append_frame_time,
                 "initialize_sessions_time_sec": initialize_sessions_time,
                 "propagate_time_sec": propagate_time,
@@ -3152,7 +3203,7 @@ class SingleObjectPointCloudSegmenter:
         """将处理摘要信息写入文件。"""
         later = self.timeline[1:] if len(self.timeline) > 1 else []
         later_mean = (
-            float(sum(item["frame_runtime_sec"] for item in later) / len(later))
+            float(sum(item.get("total_frame_time_sec", item.get("frame_runtime_sec", 0.0)) for item in later) / len(later))
             if later
             else None
         )
@@ -3166,7 +3217,7 @@ class SingleObjectPointCloudSegmenter:
         later_loop_mean = optional_later_mean("loop_runtime_sec")
         later_capture_mean = optional_later_mean("capture_time_sec")
         later_rgbd_mean = optional_later_mean("build_camera_inputs_time_sec")
-        later_process_wall_mean = optional_later_mean("process_frame_wall_time_sec")
+        later_process_wall_mean = optional_later_mean("process_frame_time_sec")
         summary = {
             "target_name": self.target_name,
             "prompt_task_info": str(self.prompt_task_info),
@@ -3205,7 +3256,7 @@ class SingleObjectPointCloudSegmenter:
             "later_loop_fps": None if later_loop_mean in {None, 0.0} else float(1.0 / later_loop_mean),
             "later_capture_time_sec_mean": later_capture_mean,
             "later_build_camera_inputs_time_sec_mean": later_rgbd_mean,
-            "later_process_frame_wall_time_sec_mean": later_process_wall_mean,
+            "later_process_frame_time_sec_mean": later_process_wall_mean,
             "timeline": self.timeline,
         }
         (self.output_dir.parent / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -3228,9 +3279,7 @@ class SingleObjectPointCloudSegmenter:
         self.close()
 
     def update_frame_metadata(self, metadata: dict[str, object]) -> None:
-        """更新最后一个 timeline 条目的元数据（用于添加外部计时的信息）。"""
-        if self.timeline:
-            self.timeline[-1].update(metadata)
+        self.timeline[-1].update(metadata)
 
 
 def parse_args() -> argparse.Namespace:
