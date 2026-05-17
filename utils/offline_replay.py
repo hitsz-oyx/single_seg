@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
 import time
 from typing import Any
@@ -74,22 +75,36 @@ def run_fast_stereo(
     depth_max: float,
     depth_edge_filter_enabled: bool,
     depth_edge_filter_threshold_m: float,
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, float], dict[str, dict[str, float]]]:
     frame_dir = input_dir / "live_rgbd_debug" / frame_name
     camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
     all_stereo_intrinsics: dict[str, dict[str, Any]] = {}
+    per_camera_times: dict[str, float] = {}
+    per_camera_timing: dict[str, dict[str, float]] = {}
 
     for camera_id in camera_ids:
         camera_dir = frame_dir / camera_id
+        timing: dict[str, float] = {}
+        
+        t0 = time.perf_counter()
         payload = load_json(camera_dir / "camera_payload.json")
+        timing["load_payload_sec"] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
+        timing["load_rgb_sec"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         left_ir = np.asarray(
             Image.open(camera_dir / "ir_left_rect.png").convert("L"), dtype=np.uint8
         )
+        timing["load_left_ir_sec"] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         right_ir = np.asarray(
             Image.open(camera_dir / "ir_right_rect.png").convert("L"), dtype=np.uint8
         )
+        timing["load_right_ir_sec"] = time.perf_counter() - t0
 
         color_intrinsics = dict(payload["color_intrinsics"])
         color_intrinsics["width"] = int(rgb.shape[1])
@@ -106,7 +121,7 @@ def run_fast_stereo(
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        infer_time = time.perf_counter() - t0
+        timing["stereo_infer_sec"] = time.perf_counter() - t0
 
         depth_rect = stereo_output["depth_m"].to(dtype=torch.float32)
         depth_rect = torch.where(
@@ -117,9 +132,12 @@ def run_fast_stereo(
             torch.zeros((), dtype=torch.float32, device=depth_rect.device),
         )
 
+        t0 = time.perf_counter()
         if depth_edge_filter_enabled:
             depth_rect = filter_depth_edges_torch(depth_rect, threshold_m=depth_edge_filter_threshold_m)
+        timing["depth_filter_sec"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         rgb_aligned_t = align_color_to_rectified_depth_torch(
             rgb,
             depth_rect,
@@ -127,24 +145,35 @@ def run_fast_stereo(
             rectified_to_color=np.asarray(payload["rectified_to_color"], dtype=np.float64),
             color_intrinsics=color_intrinsics,
         )
+        timing["align_color_sec"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         depth_rect_np = depth_rect.detach().cpu().numpy().astype(np.float32)
         np.save(camera_dir / "depth_aligned_m.npy", depth_rect_np)
+        timing["save_depth_sec"] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         rgb_aligned_np = rgb_aligned_t.detach().cpu().numpy()
         Image.fromarray(rgb_aligned_np).save(camera_dir / "rgb_aligned.png")
+        timing["save_rgb_aligned_sec"] = time.perf_counter() - t0
 
         all_stereo_intrinsics[camera_id] = stereo_output["rectified_intrinsics"]
+        
+        t0 = time.perf_counter()
         with open(camera_dir / "stereo_intrinsics.json", "w", encoding="utf-8") as f:
             json.dump(stereo_output["rectified_intrinsics"], f)
+        timing["save_intrinsics_sec"] = time.perf_counter() - t0
 
         valid = depth_rect_np > 0
+        infer_time = timing["stereo_infer_sec"]
+        per_camera_times[camera_id] = infer_time
+        per_camera_timing[camera_id] = timing
         print(
             f"  [{camera_id}] Fast depth: range=[{depth_rect_np[valid].min():.3f}, "
             f"{depth_rect_np[valid].max():.3f}]  infer={infer_time:.2f}s"
         )
 
-    return all_stereo_intrinsics
+    return all_stereo_intrinsics, per_camera_times, per_camera_timing
 
 
 # ---------------------------------------------------------------------------
@@ -157,19 +186,33 @@ def load_camera_input(
     device: torch.device,
     stereo_intrinsics: dict[str, Any],
     camera_poses: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, float]]:
+    timing = {}
+    
+    t0 = time.perf_counter()
     payload = load_json(camera_dir / "camera_payload.json")
+    timing["load_payload_time_sec"] = time.perf_counter() - t0
+    
     rgb_aligned_path = camera_dir / "rgb_aligned.png"
+    t0 = time.perf_counter()
     if rgb_aligned_path.exists():
         rgb = np.asarray(Image.open(rgb_aligned_path).convert("RGB"), dtype=np.uint8)
     else:
         rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
+    timing["load_rgb_time_sec"] = time.perf_counter() - t0
+    
+    t0 = time.perf_counter()
     depth_np = np.load(camera_dir / "depth_aligned_m.npy").astype(np.float32, copy=False)
+    timing["load_depth_time_sec"] = time.perf_counter() - t0
+    
     depth_m: np.ndarray | torch.Tensor
+    t0 = time.perf_counter()
     if device.type == "cuda":
         depth_m = torch.as_tensor(depth_np, dtype=torch.float32, device=device)
     else:
         depth_m = depth_np
+    timing["convert_depth_time_sec"] = time.perf_counter() - t0
+    
     intrinsics = dict(stereo_intrinsics)
     intrinsics["width"] = int(depth_np.shape[1])
     intrinsics["height"] = int(depth_np.shape[0])
@@ -186,7 +229,7 @@ def load_camera_input(
         "intrinsics": intrinsics,
         "pose_record": pose_record,
         "fovy_deg": None,
-    }
+    }, timing
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +337,16 @@ def main() -> None:
         target_vis_color=tuple(cfg["target_vis_color"]) if cfg.get("target_vis_color") else None,
         target_id=target_id,
     )
-
+    
+    if bool(cfg.get("overwrite_output", False)):
+        print("\n[overwrite_output=true] Cleaning up output directories...")
+        target_base_dir = base_output_dir / f"offline_{target_name}"
+        for frame_name in frames_to_process:
+            frame_output_dir = target_base_dir / frame_name
+            if frame_output_dir.exists():
+                shutil.rmtree(frame_output_dir)
+        print(f"[overwrite_output=true] Cleaned {len(frames_to_process)} frame directories.\n")
+    
     with segmenter:
         for frame_name in frames_to_process:
             print()
@@ -302,10 +354,12 @@ def main() -> None:
             print(f"Processing frame: {frame_name}")
             print("=" * 60)
 
+            frame_total_t0 = time.perf_counter()
+
             print()
             print("Step 1: Fast-Stereo depth estimation")
             print("-" * 40)
-            run_fast_stereo(
+            stereo_intrinsics, per_camera_stereo_times, per_camera_stereo_timing = run_fast_stereo(
                 input_dir=input_dir,
                 frame_name=frame_name,
                 stereo_runner=stereo_runner,
@@ -317,34 +371,114 @@ def main() -> None:
 
             frame_dir = live_debug_dir / frame_name
             camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
-            stereo_intrinsics: dict[str, dict[str, Any]] = {}
+            
+            other_t0 = time.perf_counter()
+            frame_stereo_intrinsics: dict[str, dict[str, Any]] = {}
             for cid in camera_ids:
                 with open(frame_dir / cid / "stereo_intrinsics.json") as f:
-                    stereo_intrinsics[cid] = json.load(f)
+                    frame_stereo_intrinsics[cid] = json.load(f)
+            load_intrinsics_time = time.perf_counter() - other_t0
 
             print()
             print("Step 2: SAM3 segmentation")
             print("-" * 40)
             target_output_dir = base_output_dir / f"offline_{target_name}" / frame_name
+            
             segmenter.output_dir = target_output_dir
             segmenter.frame_output_dir = target_output_dir / "frame_outputs"
+            
+            mkdir_t0 = time.perf_counter()
             segmenter.frame_output_dir.mkdir(parents=True, exist_ok=True)
+            mkdir_time = time.perf_counter() - mkdir_t0
+            
             print(f"  [{target_name} (id={target_id})]")
 
-            camera_inputs = {
-                cid: load_camera_input(frame_dir / cid, cid, device, stereo_intrinsics[cid], camera_poses)
-                for cid in camera_ids
-            }
+            per_camera_load_timing = {}
+            camera_inputs = {}
+            for cid in camera_ids:
+                input_data, timing = load_camera_input(frame_dir / cid, cid, device, frame_stereo_intrinsics[cid], camera_poses)
+                camera_inputs[cid] = input_data
+                per_camera_load_timing[cid] = timing
+            
+            load_camera_inputs_time = sum(sum(t.values()) for t in per_camera_load_timing.values())
+            
+            sam3_t0 = time.perf_counter()
             result = segmenter.process_frame(
                 frame_name=f"{frame_name}.png",
                 camera_inputs=camera_inputs,
                 live_debug_root=live_debug_root,
             )
+            sam3_time = time.perf_counter() - sam3_t0
+            total_frame_time = time.perf_counter() - frame_total_t0
+            
+            per_camera_load_summary = {
+                cid: {
+                    "load_payload_time_sec": t["load_payload_time_sec"],
+                    "load_rgb_time_sec": t["load_rgb_time_sec"],
+                    "load_depth_time_sec": t["load_depth_time_sec"],
+                    "convert_depth_time_sec": t["convert_depth_time_sec"],
+                    "total_time_sec": sum(t.values()),
+                }
+                for cid, t in per_camera_load_timing.items()
+            }
+            
+            load_payload_total = sum(t["load_payload_time_sec"] for t in per_camera_load_timing.values())
+            load_rgb_total = sum(t["load_rgb_time_sec"] for t in per_camera_load_timing.values())
+            load_depth_total = sum(t["load_depth_time_sec"] for t in per_camera_load_timing.values())
+            convert_depth_total = sum(t["convert_depth_time_sec"] for t in per_camera_load_timing.values())
+            
+            stereo_load_payload = sum(t.get("load_payload_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_load_rgb = sum(t.get("load_rgb_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_load_left_ir = sum(t.get("load_left_ir_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_load_right_ir = sum(t.get("load_right_ir_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_infer = sum(t.get("stereo_infer_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_depth_filter = sum(t.get("depth_filter_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_align = sum(t.get("align_color_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_save_depth = sum(t.get("save_depth_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_save_rgb = sum(t.get("save_rgb_aligned_sec", 0) for t in per_camera_stereo_timing.values())
+            stereo_save_intrinsics = sum(t.get("save_intrinsics_sec", 0) for t in per_camera_stereo_timing.values())
+            
+            remaining_other = (total_frame_time 
+                - stereo_load_payload - stereo_load_rgb - stereo_load_left_ir - stereo_load_right_ir
+                - stereo_infer - stereo_depth_filter - stereo_align 
+                - stereo_save_depth - stereo_save_rgb - stereo_save_intrinsics
+                - sam3_time - load_intrinsics_time - mkdir_time 
+                - load_payload_total - load_rgb_total - load_depth_total - convert_depth_total)
+
+            frame_metadata = {
+                "stereo_per_camera_time_sec": per_camera_stereo_times,
+                "stereo_per_camera_timing_sec": per_camera_stereo_timing,
+                "stereo_load_payload_time_sec": stereo_load_payload,
+                "stereo_load_rgb_time_sec": stereo_load_rgb,
+                "stereo_load_left_ir_time_sec": stereo_load_left_ir,
+                "stereo_load_right_ir_time_sec": stereo_load_right_ir,
+                "stereo_infer_time_sec": stereo_infer,
+                "stereo_depth_filter_time_sec": stereo_depth_filter,
+                "stereo_align_time_sec": stereo_align,
+                "stereo_save_depth_time_sec": stereo_save_depth,
+                "stereo_save_rgb_time_sec": stereo_save_rgb,
+                "stereo_save_intrinsics_time_sec": stereo_save_intrinsics,
+                "stereo_total_time_sec": sum(per_camera_stereo_times.values()),
+                "load_intrinsics_time_sec": load_intrinsics_time,
+                "mkdir_time_sec": mkdir_time,
+                "load_camera_per_camera_time_sec": per_camera_load_summary,
+                "load_payload_time_sec": load_payload_total,
+                "load_rgb_time_sec": load_rgb_total,
+                "load_depth_time_sec": load_depth_total,
+                "convert_depth_time_sec": convert_depth_total,
+                "load_camera_inputs_time_sec": load_camera_inputs_time,
+                "other_time_sec": max(0.0, remaining_other),
+                "sam3_time_sec": sam3_time,
+                "total_frame_time_sec": total_frame_time,
+            }
             print(
                 f"  {frame_name}: points={int(result['points_xyz'].shape[0])} "
                 f"labeled={int(torch.count_nonzero(result['instance_labels'] > 0).item())}"
             )
             print(f"    -> Output: {target_output_dir}")
+            print(f"    -> Total: {total_frame_time:.3f}s (stereo={sum(per_camera_stereo_times.values()):.3f}s, load_in={load_intrinsics_time:.3f}s, mkdir={mkdir_time:.3f}s, load_cam={load_camera_inputs_time:.3f}s, sam3={sam3_time:.3f}s, other={max(0.0, remaining_other):.3f}s)")
+            
+            segmenter.update_frame_metadata(frame_metadata)
 
     print()
     print(f"All done. Processed {len(frames_to_process)} frames for target '{target_name}'.")

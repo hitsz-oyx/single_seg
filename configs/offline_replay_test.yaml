@@ -82,10 +82,10 @@ target_3d_mask_erode_kernel: 0
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-save_ply: true
+save_ply: false
 save_normal: false
-save_debug_2d: true
-save_live_debug: true
+save_debug_2d: false
+save_live_debug: false
 tracker_image_size: 896
 target_vis_color: [30, 60, 180]
 

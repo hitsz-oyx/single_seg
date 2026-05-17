@@ -2635,6 +2635,9 @@ class SingleObjectPointCloudSegmenter:
         camera_depth_convert_time = 0.0
         camera_scale_compute_time = 0.0
         camera_bookkeeping_time = 0.0
+        camera_save_debug_time = 0.0
+        camera_mask_split_time = 0.0
+        camera_target_summary_time = 0.0
         target_plane_filter_time = 0.0
         target_cluster_filter_time = 0.0
         live_debug_object_ply_time = 0.0
@@ -2699,7 +2702,9 @@ class SingleObjectPointCloudSegmenter:
                 device=self.tensor_device,
             )
         stitched_score = None if stitched_output_t["score"] is None else float(stitched_output_t["score"])
+        mask_split_t0 = time.perf_counter()
         masks_by_camera = split_stitched_binary_mask_torch(stitched_output_t["mask"], current_layout)
+        camera_mask_split_time += time.perf_counter() - mask_split_t0
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         mask_postprocess_time += time.perf_counter() - mask_post_t0
         scores_by_camera = {camera_id: stitched_score for camera_id in self.active_camera_ids}
@@ -2734,6 +2739,7 @@ class SingleObjectPointCloudSegmenter:
             camera_mask_convert_time += time.perf_counter() - mask_convert_t0
 
             score = scores_by_camera.get(camera_id)
+            save_debug_t0 = time.perf_counter()
             if self.save_debug_2d:
                 save_binary_mask_debug(
                     output_dir=self.output_dir,
@@ -2743,6 +2749,7 @@ class SingleObjectPointCloudSegmenter:
                     mask=mask_t.detach().cpu().numpy(),
                     score=score,
                 )
+            camera_save_debug_time += time.perf_counter() - save_debug_t0
 
             normalize_t0 = time.perf_counter()
             intrinsics = normalize_intrinsics_payload(payload.get("intrinsics"))
@@ -2768,6 +2775,7 @@ class SingleObjectPointCloudSegmenter:
             camera_scale_compute_time += time.perf_counter() - scale_compute_t0
 
             camera_prepare_time += time.perf_counter() - camera_prepare_t0
+            target_summary_t0 = time.perf_counter()
             mask_3d_t = mask_t
             target_pixels_before_3d = int(torch.count_nonzero(mask_t).item())
             target_mask_erode_summary: dict[str, object] = {
@@ -2908,6 +2916,7 @@ class SingleObjectPointCloudSegmenter:
                 color_chunks.append(colors)
                 label_chunks.append(point_labels)
                 score_chunks.append(point_scores)
+            camera_target_summary_time += time.perf_counter() - target_summary_t0
             camera_summary = {
                 "camera_id": camera_id,
                 "target_pixels": target_pixels,
@@ -3088,6 +3097,7 @@ class SingleObjectPointCloudSegmenter:
                     "initialize_sessions_time_sec": initialize_sessions_time,
                     "compose_inputs_time_sec": compose_inputs_time,
                     "mask_postprocess_time_sec": mask_postprocess_time,
+                    "camera_mask_split_time_sec": camera_mask_split_time,
                     "target_mask_erode_time_sec": target_mask_erode_time,
                     "target_depth_band_filter_time_sec": target_depth_band_filter_time,
                     "target_plane_filter_time_sec": target_plane_filter_time,
@@ -3097,6 +3107,8 @@ class SingleObjectPointCloudSegmenter:
                     "camera_normalize_time_sec": camera_normalize_time,
                     "camera_depth_convert_time_sec": camera_depth_convert_time,
                     "camera_scale_compute_time_sec": camera_scale_compute_time,
+                    "camera_save_debug_time_sec": camera_save_debug_time,
+                    "camera_target_summary_time_sec": camera_target_summary_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
                     "live_debug_object_ply_time_sec": live_debug_object_ply_time,
@@ -3214,6 +3226,11 @@ class SingleObjectPointCloudSegmenter:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def update_frame_metadata(self, metadata: dict[str, object]) -> None:
+        """更新最后一个 timeline 条目的元数据（用于添加外部计时的信息）。"""
+        if self.timeline:
+            self.timeline[-1].update(metadata)
 
 
 def parse_args() -> argparse.Namespace:
