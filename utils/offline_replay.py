@@ -75,12 +75,15 @@ def run_fast_stereo(
     depth_max: float,
     depth_edge_filter_enabled: bool,
     depth_edge_filter_threshold_m: float,
-) -> tuple[dict[str, dict[str, Any]], dict[str, float], dict[str, dict[str, float]]]:
+    save_debug_files: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, float], dict[str, dict[str, float]], dict[str, np.ndarray], dict[str, np.ndarray]]:
     frame_dir = input_dir / "live_rgbd_debug" / frame_name
     camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
     all_stereo_intrinsics: dict[str, dict[str, Any]] = {}
     per_camera_times: dict[str, float] = {}
     per_camera_timing: dict[str, dict[str, float]] = {}
+    aligned_rgb_by_camera: dict[str, np.ndarray] = {}
+    aligned_depth_by_camera: dict[str, np.ndarray] = {}
 
     for camera_id in camera_ids:
         camera_dir = frame_dir / camera_id
@@ -149,12 +152,16 @@ def run_fast_stereo(
 
         t0 = time.perf_counter()
         depth_rect_np = depth_rect.detach().cpu().numpy().astype(np.float32)
-        np.save(camera_dir / "depth_aligned_m.npy", depth_rect_np)
+        if save_debug_files:
+            np.save(camera_dir / "depth_aligned_m.npy", depth_rect_np)
+        aligned_depth_by_camera[camera_id] = depth_rect_np
         timing["save_depth_sec"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         rgb_aligned_np = rgb_aligned_t.detach().cpu().numpy()
-        Image.fromarray(rgb_aligned_np).save(camera_dir / "rgb_aligned.png")
+        if save_debug_files:
+            Image.fromarray(rgb_aligned_np).save(camera_dir / "rgb_aligned.png")
+        aligned_rgb_by_camera[camera_id] = rgb_aligned_np
         timing["save_rgb_aligned_sec"] = time.perf_counter() - t0
 
         all_stereo_intrinsics[camera_id] = stereo_output["rectified_intrinsics"]
@@ -173,7 +180,7 @@ def run_fast_stereo(
             f"{depth_rect_np[valid].max():.3f}]  infer={infer_time:.2f}s"
         )
 
-    return all_stereo_intrinsics, per_camera_times, per_camera_timing
+    return all_stereo_intrinsics, per_camera_times, per_camera_timing, aligned_rgb_by_camera, aligned_depth_by_camera
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +193,8 @@ def load_camera_input(
     device: torch.device,
     stereo_intrinsics: dict[str, Any],
     camera_poses: dict[str, dict[str, Any]],
+    aligned_rgb: np.ndarray | None = None,
+    aligned_depth: np.ndarray | None = None,
 ) -> tuple[dict[str, Any], dict[str, float]]:
     timing = {}
     
@@ -193,16 +202,22 @@ def load_camera_input(
     payload = load_json(camera_dir / "camera_payload.json")
     timing["load_payload_time_sec"] = time.perf_counter() - t0
     
-    rgb_aligned_path = camera_dir / "rgb_aligned.png"
     t0 = time.perf_counter()
-    if rgb_aligned_path.exists():
-        rgb = np.asarray(Image.open(rgb_aligned_path).convert("RGB"), dtype=np.uint8)
+    if aligned_rgb is not None:
+        rgb = aligned_rgb
     else:
-        rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
+        rgb_aligned_path = camera_dir / "rgb_aligned.png"
+        if rgb_aligned_path.exists():
+            rgb = np.asarray(Image.open(rgb_aligned_path).convert("RGB"), dtype=np.uint8)
+        else:
+            rgb = np.asarray(Image.open(camera_dir / "rgb.png").convert("RGB"), dtype=np.uint8)
     timing["load_rgb_time_sec"] = time.perf_counter() - t0
     
     t0 = time.perf_counter()
-    depth_np = np.load(camera_dir / "depth_aligned_m.npy").astype(np.float32, copy=False)
+    if aligned_depth is not None:
+        depth_np = aligned_depth.astype(np.float32, copy=False)
+    else:
+        depth_np = np.load(camera_dir / "depth_aligned_m.npy").astype(np.float32, copy=False)
     timing["load_depth_time_sec"] = time.perf_counter() - t0
     
     depth_m: np.ndarray | torch.Tensor
@@ -359,7 +374,8 @@ def main() -> None:
             print()
             print("Step 1: Fast-Stereo depth estimation")
             print("-" * 40)
-            stereo_intrinsics, per_camera_stereo_times, per_camera_stereo_timing = run_fast_stereo(
+            (stereo_intrinsics, per_camera_stereo_times, per_camera_stereo_timing, 
+             aligned_rgb_by_camera, aligned_depth_by_camera) = run_fast_stereo(
                 input_dir=input_dir,
                 frame_name=frame_name,
                 stereo_runner=stereo_runner,
@@ -367,6 +383,7 @@ def main() -> None:
                 depth_max=float(cfg["depth_max"]),
                 depth_edge_filter_enabled=bool(fs_cfg.get("depth_edge_filter_enabled", False)),
                 depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
+                save_debug_files=bool(cfg.get("save_debug_2d", False)),
             )
 
             frame_dir = live_debug_dir / frame_name
@@ -396,7 +413,11 @@ def main() -> None:
             per_camera_load_timing = {}
             camera_inputs = {}
             for cid in camera_ids:
-                input_data, timing = load_camera_input(frame_dir / cid, cid, device, frame_stereo_intrinsics[cid], camera_poses)
+                input_data, timing = load_camera_input(
+                    frame_dir / cid, cid, device, frame_stereo_intrinsics[cid], camera_poses,
+                    aligned_rgb=aligned_rgb_by_camera.get(cid),
+                    aligned_depth=aligned_depth_by_camera.get(cid),
+                )
                 camera_inputs[cid] = input_data
                 per_camera_load_timing[cid] = timing
             
