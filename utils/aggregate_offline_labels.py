@@ -280,21 +280,20 @@ def main() -> None:
         combined_points, combined_labels, combined_vis_colors = voxel_merge_by_confidence(
             all_points, all_labels, all_vis_colors, all_confidences, voxel_size,
         )
-
-        label_path = output_dir / f"{frame_name}_aggregated.ply"
-        write_label_ply(label_path, combined_points, combined_labels)
-        print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {combined_points.shape[0]} points -> {label_path.name}")
-
-        rgb_path = output_dir / f"{frame_name}_aggregated_instance_rgb.ply"
-        write_ply_with_label(rgb_path, combined_points, combined_vis_colors, combined_labels)
-        print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {combined_points.shape[0]} points -> {rgb_path.name}")
-
         _, _, combined_orig_colors = voxel_merge_by_confidence(
             all_points, all_labels, all_orig_colors, all_confidences, voxel_size,
         )
-        orig_path = output_dir / f"{frame_name}_aggregated_original_rgb.ply"
+
+        frame_out_dir = output_dir / frame_name
+        frame_out_dir.mkdir(parents=True, exist_ok=True)
+
+        rgb_path = frame_out_dir / f"{frame_name}_instance_rgb.ply"
+        write_ply_with_label(rgb_path, combined_points, combined_vis_colors, combined_labels)
+        print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {combined_points.shape[0]} points -> {rgb_path}")
+
+        orig_path = frame_out_dir / f"{frame_name}_original_rgb.ply"
         write_ply_with_label(orig_path, combined_points, combined_orig_colors, combined_labels)
-        print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {combined_points.shape[0]} points -> {orig_path.name}")
+        print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {combined_points.shape[0]} points -> {orig_path}")
 
         if full_all_points and scene_colors is not None:
             full_points, full_labels, full_colors = voxel_merge_by_confidence(
@@ -302,9 +301,9 @@ def main() -> None:
                 [scene_colors] * len(full_all_points),
                 full_all_confidences, voxel_size,
             )
-            full_path = output_dir / f"{frame_name}_full_scene.ply"
+            full_path = frame_out_dir / f"{frame_name}_full_scene.ply"
             write_ply_with_label(full_path, full_points, full_colors, full_labels)
-            print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {full_points.shape[0]} points -> {full_path.name}")
+            print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: {full_points.shape[0]} points -> {full_path}")
 
     print(f"\nAll done. Aggregated {total_frames} frames to {output_dir}")
 

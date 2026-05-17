@@ -10,24 +10,24 @@
 #     --frame-name frame_00000 \
 #     --overwrite
 
-#   python utils/offline_replay.py --config configs/offline_replay.yaml
+#   python utils/offline_replay.py --config configs/offline_replay_test.yaml
 
 
   # python utils/aggregate_offline_labels.py \
-  #   --base-output-dir tests/outputs/demo0_1_ds3_offline \
+  #   --base-output-dir tests/outputs/demo0_1_ds3_offline_test \
   #   --targets-json assets/prompts/targets.json \
   #   --targets redcup book graycup plate porcelain whitecup \
   #   --voxel-size 0.003 \
-  #   --output-dir tests/outputs/demo0_1_ds3_offline/aggregate
+  #   --output-dir tests/outputs/demo0_1_ds3_offline_test/aggregate
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 input_dir: tests/outputs/demo0_1_ds3_live
-output_dir: tests/outputs/demo0_1_ds3_offline
+output_dir: tests/outputs/demo0_1_ds3_offline_test
 
 frame_start: 0
-frame_end: 1
+frame_end: 2
 
 # ---------------------------------------------------------------------------
 # Targets (multi-object segmentation)
@@ -35,7 +35,7 @@ frame_end: 1
 
 # 写法: 一个个传
 # for t in redcup book graycup plate porcelain whitecup; do
-#   python utils/offline_replay.py --config configs/offline_replay.yaml --target "$t"
+#   python utils/offline_replay.py --config configs/offline_replay_test.yaml --target "$t"
 # done
 
 targets: [redcup]

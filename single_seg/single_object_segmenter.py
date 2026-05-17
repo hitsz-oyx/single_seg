@@ -2629,6 +2629,11 @@ class SingleObjectPointCloudSegmenter:
         target_mask_erode_time = 0.0
         target_depth_band_filter_time = 0.0
         camera_prepare_time = 0.0
+        camera_rgb_copy_time = 0.0
+        camera_mask_convert_time = 0.0
+        camera_normalize_time = 0.0
+        camera_depth_convert_time = 0.0
+        camera_scale_compute_time = 0.0
         camera_bookkeeping_time = 0.0
         target_plane_filter_time = 0.0
         target_cluster_filter_time = 0.0
@@ -2708,7 +2713,12 @@ class SingleObjectPointCloudSegmenter:
             camera_prepare_t0 = time.perf_counter()
             payload = camera_inputs[camera_id]
             stereo_time += float(payload.get("stereo_time_sec", 0.0))
+
+            rgb_copy_t0 = time.perf_counter()
             rgb = np.asarray(payload["rgb"], dtype=np.uint8)
+            camera_rgb_copy_time += time.perf_counter() - rgb_copy_t0
+
+            mask_convert_t0 = time.perf_counter()
             mask_value = masks_by_camera.get(camera_id)
             if torch.is_tensor(mask_value):
                 mask_t = mask_value.to(device=self.tensor_device, dtype=torch.bool, non_blocking=True)
@@ -2721,6 +2731,8 @@ class SingleObjectPointCloudSegmenter:
                     dtype=torch.bool,
                     device=self.tensor_device,
                 )
+            camera_mask_convert_time += time.perf_counter() - mask_convert_t0
+
             score = scores_by_camera.get(camera_id)
             if self.save_debug_2d:
                 save_binary_mask_debug(
@@ -2731,20 +2743,30 @@ class SingleObjectPointCloudSegmenter:
                     mask=mask_t.detach().cpu().numpy(),
                     score=score,
                 )
+
+            normalize_t0 = time.perf_counter()
             intrinsics = normalize_intrinsics_payload(payload.get("intrinsics"))
             pose_record = normalize_pose_record(camera_id, payload)
+            camera_normalize_time += time.perf_counter() - normalize_t0
+
+            depth_convert_t0 = time.perf_counter()
             depth_value = payload["depth_m"]
             if torch.is_tensor(depth_value):
                 depth_m = depth_value.to(device=self.tensor_device, dtype=torch.float32, non_blocking=True)
             else:
                 depth_m = np.asarray(depth_value, dtype=np.float32)
+            camera_depth_convert_time += time.perf_counter() - depth_convert_t0
+
             fovy_deg = float(payload["fovy_deg"]) if payload.get("fovy_deg") is not None else None
+            scale_compute_t0 = time.perf_counter()
             x_scale, y_scale = self._get_torch_backproject_scales(
                 height=rgb.shape[0],
                 width=rgb.shape[1],
                 intrinsics=intrinsics,
                 fovy_deg=fovy_deg,
             )
+            camera_scale_compute_time += time.perf_counter() - scale_compute_t0
+
             camera_prepare_time += time.perf_counter() - camera_prepare_t0
             mask_3d_t = mask_t
             target_pixels_before_3d = int(torch.count_nonzero(mask_t).item())
@@ -3070,6 +3092,11 @@ class SingleObjectPointCloudSegmenter:
                     "target_depth_band_filter_time_sec": target_depth_band_filter_time,
                     "target_plane_filter_time_sec": target_plane_filter_time,
                     "camera_prepare_time_sec": camera_prepare_time,
+                    "camera_rgb_copy_time_sec": camera_rgb_copy_time,
+                    "camera_mask_convert_time_sec": camera_mask_convert_time,
+                    "camera_normalize_time_sec": camera_normalize_time,
+                    "camera_depth_convert_time_sec": camera_depth_convert_time,
+                    "camera_scale_compute_time_sec": camera_scale_compute_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
                     "live_debug_object_ply_time_sec": live_debug_object_ply_time,
@@ -3169,7 +3196,7 @@ class SingleObjectPointCloudSegmenter:
             "later_process_frame_wall_time_sec_mean": later_process_wall_mean,
             "timeline": self.timeline,
         }
-        (self.output_dir / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (self.output_dir.parent / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     def close(self) -> None:
         """关闭分割器，释放资源并保存摘要信息。"""

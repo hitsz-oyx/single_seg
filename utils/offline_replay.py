@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import shutil
 import sys
 import time
 from typing import Any
@@ -190,80 +189,6 @@ def load_camera_input(
     }
 
 
-def run_sam3_segmentation(
-    input_dir: Path,
-    output_dir: Path,
-    frame_name: str,
-    cfg: dict[str, Any],
-    stereo_intrinsics: dict[str, dict[str, Any]],
-    camera_poses: dict[str, dict[str, Any]],
-    target_name: str,
-    target_id: int,
-) -> None:
-    frame_dir = input_dir / "live_rgbd_debug" / frame_name
-    camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    live_debug_root = input_dir / "live_rgbd_debug" if cfg.get("save_live_debug") else None
-
-    prompt_task_info = Path(cfg["prompts_root"]) / target_name / "task_info.json"
-    prompt_image_root = Path(cfg["prompts_root"]) / target_name
-
-    segmenter = SingleObjectPointCloudSegmenter(
-        target_name=target_name,
-        prompt_task_info=prompt_task_info.expanduser().resolve(),
-        prompt_image_root=prompt_image_root.expanduser().resolve(),
-        checkpoint_path=Path(cfg["checkpoint_path"]).expanduser().resolve(),
-        output_dir=output_dir,
-        overwrite_output=bool(cfg.get("overwrite_output")),
-        confidence=float(cfg["confidence"]),
-        mask_threshold=float(cfg["mask_threshold"]),
-        prompt_keep_score_threshold=float(cfg["prompt_keep_score_threshold"]),
-        video_mask_prob_threshold=float(cfg["video_mask_prob_threshold"]),
-        depth_scale=1.0,
-        depth_min=float(cfg["depth_min"]),
-        depth_max=float(cfg["depth_max"]),
-        stride=int(cfg["stride"]),
-        frame_voxel_size=float(cfg["frame_voxel_size"]),
-        target_cluster_filter_enabled=bool(cfg["target_cluster_filter_enabled"]),
-        target_cluster_radius_m=float(cfg["target_cluster_radius_m"]),
-        target_cluster_min_points=int(cfg["target_cluster_min_points"]),
-        target_cluster_keep_largest=bool(cfg["target_cluster_keep_largest"]),
-        target_plane_filter_enabled=bool(cfg["target_plane_filter_enabled"]),
-        target_plane_filter_distance_m=float(cfg["target_plane_filter_distance_m"]),
-        target_plane_filter_min_points=int(cfg["target_plane_filter_min_points"]),
-        target_plane_filter_min_inlier_ratio=float(cfg["target_plane_filter_min_inlier_ratio"]),
-        target_plane_filter_max_inlier_ratio=float(cfg["target_plane_filter_max_inlier_ratio"]),
-        target_plane_filter_max_planes=int(cfg["target_plane_filter_max_planes"]),
-        target_plane_filter_ransac_iterations=int(cfg["target_plane_filter_ransac_iterations"]),
-        target_depth_band_filter_enabled=bool(cfg["target_depth_band_filter_enabled"]),
-        target_depth_band_filter_range_m=float(cfg["target_depth_band_filter_range_m"]),
-        target_depth_band_filter_min_valid_pixels=int(cfg["target_depth_band_filter_min_valid_pixels"]),
-        target_depth_band_filter_min_keep_pixels=int(cfg["target_depth_band_filter_min_keep_pixels"]),
-        target_3d_mask_erode_kernel=int(cfg["target_3d_mask_erode_kernel"]),
-        save_ply=bool(cfg.get("save_ply", True)),
-        save_normal=bool(cfg.get("save_normal", False)),
-        save_debug_2d=bool(cfg.get("save_debug_2d", True)),
-        tracker_image_size=int(cfg.get("tracker_image_size", 896)),
-        target_vis_color=tuple(cfg["target_vis_color"]) if cfg.get("target_vis_color") else None,
-        target_id=target_id,
-    )
-
-    with segmenter:
-        camera_inputs = {
-            cid: load_camera_input(frame_dir / cid, cid, device, stereo_intrinsics[cid], camera_poses)
-            for cid in camera_ids
-        }
-        result = segmenter.process_frame(
-            frame_name=f"{frame_name}.png",
-            camera_inputs=camera_inputs,
-            live_debug_root=live_debug_root,
-        )
-        print(
-            f"  {frame_name}: points={int(result['points_xyz'].shape[0])} "
-            f"labeled={int(torch.count_nonzero(result['instance_labels'] > 0).item())}"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -323,48 +248,103 @@ def main() -> None:
         optimize_build_volume=str(fs_cfg.get("optimize_build_volume", "pytorch1")),
     )
 
-    for frame_name in frames_to_process:
-        print()
-        print("=" * 60)
-        print(f"Processing frame: {frame_name}")
-        print("=" * 60)
+    prompt_task_info = Path(cfg["prompts_root"]) / target_name / "task_info.json"
+    prompt_image_root = Path(cfg["prompts_root"]) / target_name
+    first_output_dir = base_output_dir / f"offline_{target_name}" / frames_to_process[0]
 
-        print()
-        print("Step 1: Fast-Stereo depth estimation")
-        print("-" * 40)
-        run_fast_stereo(
-            input_dir=input_dir,
-            frame_name=frame_name,
-            stereo_runner=stereo_runner,
-            depth_min=float(cfg["depth_min"]),
-            depth_max=float(cfg["depth_max"]),
-            depth_edge_filter_enabled=bool(fs_cfg.get("depth_edge_filter_enabled", False)),
-            depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
-        )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    live_debug_root = input_dir / "live_rgbd_debug" if cfg.get("save_live_debug") else None
 
-        frame_dir = live_debug_dir / frame_name
-        camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
-        stereo_intrinsics: dict[str, dict[str, Any]] = {}
-        for cid in camera_ids:
-            with open(frame_dir / cid / "stereo_intrinsics.json") as f:
-                stereo_intrinsics[cid] = json.load(f)
+    segmenter = SingleObjectPointCloudSegmenter(
+        target_name=target_name,
+        prompt_task_info=prompt_task_info.expanduser().resolve(),
+        prompt_image_root=prompt_image_root.expanduser().resolve(),
+        checkpoint_path=Path(cfg["checkpoint_path"]).expanduser().resolve(),
+        output_dir=first_output_dir,
+        overwrite_output=bool(cfg.get("overwrite_output")),
+        confidence=float(cfg["confidence"]),
+        mask_threshold=float(cfg["mask_threshold"]),
+        prompt_keep_score_threshold=float(cfg["prompt_keep_score_threshold"]),
+        video_mask_prob_threshold=float(cfg["video_mask_prob_threshold"]),
+        depth_scale=1.0,
+        depth_min=float(cfg["depth_min"]),
+        depth_max=float(cfg["depth_max"]),
+        stride=int(cfg["stride"]),
+        frame_voxel_size=float(cfg["frame_voxel_size"]),
+        target_cluster_filter_enabled=bool(cfg["target_cluster_filter_enabled"]),
+        target_cluster_radius_m=float(cfg["target_cluster_radius_m"]),
+        target_cluster_min_points=int(cfg["target_cluster_min_points"]),
+        target_cluster_keep_largest=bool(cfg["target_cluster_keep_largest"]),
+        target_plane_filter_enabled=bool(cfg["target_plane_filter_enabled"]),
+        target_plane_filter_distance_m=float(cfg["target_plane_filter_distance_m"]),
+        target_plane_filter_min_points=int(cfg["target_plane_filter_min_points"]),
+        target_plane_filter_min_inlier_ratio=float(cfg["target_plane_filter_min_inlier_ratio"]),
+        target_plane_filter_max_inlier_ratio=float(cfg["target_plane_filter_max_inlier_ratio"]),
+        target_plane_filter_max_planes=int(cfg["target_plane_filter_max_planes"]),
+        target_plane_filter_ransac_iterations=int(cfg["target_plane_filter_ransac_iterations"]),
+        target_depth_band_filter_enabled=bool(cfg["target_depth_band_filter_enabled"]),
+        target_depth_band_filter_range_m=float(cfg["target_depth_band_filter_range_m"]),
+        target_depth_band_filter_min_valid_pixels=int(cfg["target_depth_band_filter_min_valid_pixels"]),
+        target_depth_band_filter_min_keep_pixels=int(cfg["target_depth_band_filter_min_keep_pixels"]),
+        target_3d_mask_erode_kernel=int(cfg["target_3d_mask_erode_kernel"]),
+        save_ply=bool(cfg.get("save_ply", True)),
+        save_normal=bool(cfg.get("save_normal", False)),
+        save_debug_2d=bool(cfg.get("save_debug_2d", True)),
+        tracker_image_size=int(cfg.get("tracker_image_size", 896)),
+        target_vis_color=tuple(cfg["target_vis_color"]) if cfg.get("target_vis_color") else None,
+        target_id=target_id,
+    )
 
-        print()
-        print("Step 2: SAM3 segmentation")
-        print("-" * 40)
-        target_output_dir = base_output_dir / f"offline_{target_name}" / frame_name
-        print(f"  [{target_name} (id={target_id})]")
-        run_sam3_segmentation(
-            input_dir=input_dir,
-            output_dir=target_output_dir,
-            frame_name=frame_name,
-            cfg=cfg,
-            stereo_intrinsics=stereo_intrinsics,
-            camera_poses=camera_poses,
-            target_name=target_name,
-            target_id=target_id,
-        )
-        print(f"    -> Output: {target_output_dir}")
+    with segmenter:
+        for frame_name in frames_to_process:
+            print()
+            print("=" * 60)
+            print(f"Processing frame: {frame_name}")
+            print("=" * 60)
+
+            print()
+            print("Step 1: Fast-Stereo depth estimation")
+            print("-" * 40)
+            run_fast_stereo(
+                input_dir=input_dir,
+                frame_name=frame_name,
+                stereo_runner=stereo_runner,
+                depth_min=float(cfg["depth_min"]),
+                depth_max=float(cfg["depth_max"]),
+                depth_edge_filter_enabled=bool(fs_cfg.get("depth_edge_filter_enabled", False)),
+                depth_edge_filter_threshold_m=float(fs_cfg.get("depth_edge_filter_threshold_m", 0.5)),
+            )
+
+            frame_dir = live_debug_dir / frame_name
+            camera_ids = sorted([d.name for d in frame_dir.iterdir() if d.is_dir()])
+            stereo_intrinsics: dict[str, dict[str, Any]] = {}
+            for cid in camera_ids:
+                with open(frame_dir / cid / "stereo_intrinsics.json") as f:
+                    stereo_intrinsics[cid] = json.load(f)
+
+            print()
+            print("Step 2: SAM3 segmentation")
+            print("-" * 40)
+            target_output_dir = base_output_dir / f"offline_{target_name}" / frame_name
+            segmenter.output_dir = target_output_dir
+            segmenter.frame_output_dir = target_output_dir / "frame_outputs"
+            segmenter.frame_output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  [{target_name} (id={target_id})]")
+
+            camera_inputs = {
+                cid: load_camera_input(frame_dir / cid, cid, device, stereo_intrinsics[cid], camera_poses)
+                for cid in camera_ids
+            }
+            result = segmenter.process_frame(
+                frame_name=f"{frame_name}.png",
+                camera_inputs=camera_inputs,
+                live_debug_root=live_debug_root,
+            )
+            print(
+                f"  {frame_name}: points={int(result['points_xyz'].shape[0])} "
+                f"labeled={int(torch.count_nonzero(result['instance_labels'] > 0).item())}"
+            )
+            print(f"    -> Output: {target_output_dir}")
 
     print()
     print(f"All done. Processed {len(frames_to_process)} frames for target '{target_name}'.")
