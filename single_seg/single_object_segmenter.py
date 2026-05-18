@@ -2628,6 +2628,7 @@ class SingleObjectPointCloudSegmenter:
         frame_name: str,
         camera_inputs: dict[str, dict[str, object]],
         live_debug_root: Path | None = None,
+        view_root: Path | None = None,
     ) -> dict[str, object]:
         """处理一帧多相机 RGBD 输入，并返回标记的点云。"""
         if self.closed:
@@ -3029,7 +3030,7 @@ class SingleObjectPointCloudSegmenter:
             )
             maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
             target_cluster_filter_time += time.perf_counter() - target_cluster_t0
-        need_cpu_output = self.save_ply or live_debug_root is not None
+        need_cpu_output = self.save_ply or live_debug_root is not None or view_root is not None
         points_xyz: np.ndarray | None = None
         raw_colors: np.ndarray | None = None
         labels: np.ndarray | None = None
@@ -3177,6 +3178,7 @@ class SingleObjectPointCloudSegmenter:
             "points_xyz": points_xyz_t,
             "instance_labels": labels_t,
             "instance_colors": vis_colors_t,
+            "vis_colors": vis_colors,
             "raw_colors": raw_colors_t,
             "semantic_labels": labels_t,
             "semantic_colors": vis_colors_t,
@@ -3219,6 +3221,7 @@ class SingleObjectPointCloudSegmenter:
         later_rgbd_mean = optional_later_mean("build_camera_inputs_time_sec")
         later_process_wall_mean = optional_later_mean("process_frame_time_sec")
         later_icp_mean = optional_later_mean("icp_time_sec")
+        later_view_mean = optional_later_mean("view_time_sec")
         summary = {
             "target_name": self.target_name,
             "prompt_task_info": str(self.prompt_task_info),
@@ -3259,6 +3262,7 @@ class SingleObjectPointCloudSegmenter:
             "later_build_camera_inputs_time_sec_mean": later_rgbd_mean,
             "later_process_frame_time_sec_mean": later_process_wall_mean,
             "later_icp_time_sec_mean": later_icp_mean,
+            "later_view_time_sec_mean": later_view_mean,
             "timeline": self.timeline,
         }
         (self.output_dir / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

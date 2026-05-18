@@ -17,7 +17,6 @@
   #   --base-output-dir tests/outputs/demo0_1_ds3_offline \
   #   --targets-json assets/prompts/targets.json \
   #   --targets redcup book graycup plate porcelain whitecup \
-  #   --voxel-size 0.003 \
   #   --output-dir tests/outputs/demo0_1_ds3_offline/aggregate
 
 # ---------------------------------------------------------------------------
@@ -56,8 +55,8 @@ video_mask_prob_threshold: 0.95
 # ---------------------------------------------------------------------------
 depth_min: 0.1
 depth_max: 3.0
-stride: 2
-frame_voxel_size: 0.002
+stride: 1
+frame_voxel_size: 0
 
 target_cluster_filter_enabled: false
 target_cluster_radius_m: 0.025

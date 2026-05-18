@@ -115,6 +115,68 @@ def _sample_obj_surface_points(obj_path: Path, sample_points: int = 10000) -> np
     return points
 
 
+class _PointCloudViewer:
+    def __init__(self) -> None:
+        import queue
+        import threading
+
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def update(self, points: np.ndarray, colors: np.ndarray | None) -> None:
+        if self._closed:
+            return
+        import queue as _queue_mod
+        try:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except _queue_mod.Empty:
+                    break
+            self._queue.put_nowait((points, colors))
+        except _queue_mod.Full:
+            pass
+
+    def _run(self) -> None:
+        import queue as _queue_mod
+        import open3d as o3d
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name="Single-Seg Live", width=1280, height=720)
+        pcd = o3d.geometry.PointCloud()
+        first_frame = True
+        while not self._closed:
+            try:
+                points, colors = self._queue.get(timeout=0.1)
+            except _queue_mod.Empty:
+                vis.poll_events()
+                if hasattr(vis, "update_renderer"):
+                    vis.update_renderer()
+                continue
+            if points.shape[0] == 0:
+                continue
+            pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+            if colors is not None and colors.shape[0] == points.shape[0]:
+                pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64) / 255.0)
+            if first_frame:
+                vis.add_geometry(pcd)
+                first_frame = False
+                opt = vis.get_render_option()
+                opt.point_size = 2.0
+            else:
+                vis.update_geometry(pcd)
+            vis.poll_events()
+            if hasattr(vis, "update_renderer"):
+                vis.update_renderer()
+            elif hasattr(vis, "render"):
+                vis.render()
+
+    def close(self) -> None:
+        self._closed = True
+        self._thread.join(timeout=2.0)
+
+
 def sync_cuda_if_needed(enabled: bool) -> None:
     """Synchronize CUDA so wall-clock timing reflects queued GPU work."""
     if bool(enabled) and torch.cuda.is_available():
@@ -1886,6 +1948,16 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults["use_icp"] = bool(icp_cfg["use_icp"])
         if "icp_obj_path" in icp_cfg:
             defaults["icp_obj_path"] = resolve_repo_path(icp_cfg["icp_obj_path"])
+        if "reference_sample_points" in icp_cfg:
+            defaults["icp_reference_sample_points"] = int(icp_cfg["reference_sample_points"])
+        if "o3d_max_correspondence_distance" in icp_cfg:
+            defaults["icp_o3d_max_corr_dist"] = float(icp_cfg["o3d_max_correspondence_distance"])
+        if "o3d_max_iterations" in icp_cfg:
+            defaults["icp_o3d_max_iterations"] = int(icp_cfg["o3d_max_iterations"])
+        if "o3d_relative_rmse" in icp_cfg:
+            defaults["icp_o3d_relative_rmse"] = float(icp_cfg["o3d_relative_rmse"])
+        if "view" in icp_cfg:
+            defaults["view"] = bool(icp_cfg["view"])
     return defaults
 
 
@@ -1975,9 +2047,19 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
         help="同步 CUDA 后再计时，1 开启会让耗时归因更准确，但会降低吞吐",
     )
     parser.add_argument("--use-icp", action="store_true", default=False,
-                        help="启用 Go-ICP 配准，实时计算物体位姿")
+                        help="启用 ICP 配准，实时计算物体位姿")
     parser.add_argument("--icp-obj-path", type=Path, default=None,
-                        help="Go-ICP 配准参考物体 OBJ 文件路径")
+                        help="ICP 配准参考物体 OBJ 文件路径")
+    parser.add_argument("--icp-reference-sample-points", type=int, default=3000,
+                        help="OBJ 参考点云采样点数")
+    parser.add_argument("--icp-o3d-max-corr-dist", type=float, default=0.02,
+                        help="Open3D ICP 最大对应距离（米）")
+    parser.add_argument("--icp-o3d-max-iterations", type=int, default=50,
+                        help="Open3D ICP 最大迭代次数")
+    parser.add_argument("--icp-o3d-relative-rmse", type=float, default=1e-4,
+                        help="Open3D ICP 相对 RMSE 收敛阈值")
+    parser.add_argument("--view", action="store_true", default=False,
+                        help="启用 Open3D 实时点云可视化（需要 DISPLAY 环境变量）")
     if defaults:
         parser.set_defaults(**defaults)
     return parser
@@ -2366,6 +2448,8 @@ def run_live(args: argparse.Namespace) -> None:
     pose_map = load_live_camera_pose_map(args.camera_poses_json)
     cameras: list[RealSenseRgbdCamera] = []
     fast_aligners: dict[str, LibrealsenseSoftwareAligner] = {}
+    viewer: _PointCloudViewer | None = None
+    icp_log_file = None
     try:
         for index, serial in enumerate(serials):
             pose = resolve_live_pose(
@@ -2462,6 +2546,10 @@ def run_live(args: argparse.Namespace) -> None:
             frame_limit = None if int(args.max_frames) <= 0 else int(args.max_frames)
             frame_index = 0
 
+            use_view = bool(args.view)
+            if use_view:
+                viewer = _PointCloudViewer()
+
             use_icp = bool(args.use_icp)
             icp_reference_points = None
             icp_solver_ctx = None
@@ -2476,7 +2564,10 @@ def run_live(args: argparse.Namespace) -> None:
                     use_icp = False
                 else:
                     logging.info(f"Loading ICP reference OBJ: {icp_obj_path.resolve()}")
-                    icp_reference_points = _sample_obj_surface_points(icp_obj_path.resolve())
+                    icp_reference_points = _sample_obj_surface_points(
+                        icp_obj_path.resolve(),
+                        sample_points=int(args.icp_reference_sample_points),
+                    )
                     if icp_reference_points.shape[0] < 4:
                         logging.warning("ICP 参考 OBJ 顶点数 < 4，将跳过 ICP 配准")
                         use_icp = False
@@ -2485,6 +2576,13 @@ def run_live(args: argparse.Namespace) -> None:
                         icp_initialized = False
                         T_cam_to_book = np.eye(4, dtype=np.float64)
                         logging.info(f"Loaded ICP reference: {icp_reference_points.shape[0]} vertices")
+
+            icp_log_file = None
+            if use_icp:
+                icp_log_path = segmenter.output_dir / "icp_pose_log.csv"
+                icp_log_file = open(icp_log_path, "w")
+                icp_log_file.write("frame,type,fitness,rmse,time_sec,t_x,t_y,t_z,qw,qx,qy,qz\n")
+                icp_log_file.flush()
 
             while frame_limit is None or frame_index < frame_limit:
                 loop_t0 = time.perf_counter()
@@ -2526,7 +2624,6 @@ def run_live(args: argparse.Namespace) -> None:
                 )
                 build_camera_inputs_time = time.perf_counter() - build_t0
                 frame_name = f"frame_{frame_index:05d}.png"
-                logging.info(f"Running single-seg for {frame_name}")
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 process_t0 = time.perf_counter()
@@ -2537,14 +2634,33 @@ def run_live(args: argparse.Namespace) -> None:
                     live_debug_root=(
                         segmenter.output_dir / "live_rgbd_debug" if bool(args.save_live_debug) else None
                     ),
+                    view_root=Path("/tmp") if use_view else None,
                 )
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 process_wall_time = time.perf_counter() - process_t0
 
+                view_time_sec = 0.0
+                if use_view and viewer is not None:
+                    view_t0 = time.perf_counter()
+                    points_xyz_np = result["points_xyz"].cpu().numpy().astype(np.float32)
+                    vis_colors_np: np.ndarray | None = result["vis_colors"]
+                    if vis_colors_np is None:
+                        raw_colors_np = result["raw_colors"].cpu().numpy().astype(np.uint8)
+                        labels_np = result["instance_labels"].cpu().numpy()
+                        vis_colors_np = raw_colors_np.copy()
+                        target_mask_v = labels_np > 0
+                        if target_mask_v.any():
+                            vis_colors_np[target_mask_v] = np.array(
+                                [0, 255, 0], dtype=np.uint8
+                            )
+                    viewer.update(points_xyz_np, vis_colors_np)
+                    view_time_sec = time.perf_counter() - view_t0
+
                 icp_time_sec = 0.0
                 icp_result = None
+                icp_type = "Open3D ICP"
 
                 if use_icp and icp_reference_points is not None:
                     points_xyz_t = result["points_xyz"]
@@ -2570,12 +2686,14 @@ def run_live(args: argparse.Namespace) -> None:
                                 )
                                 icp_result = goicp_result
                                 icp_initialized = True
+                                icp_type = "Go-ICP"
                             except Exception as e:
                                 logging.warning(f"Go-ICP failed: {e}, falling back to Open3D ICP")
                                 icp_initialized = True
                             icp_time_sec = time.perf_counter() - icp_t0
                         else:
                             logging.info(f"[Frame {frame_index}] Using Open3D ICP for tracking")
+                            icp_type = "Open3D ICP"
                             import open3d as o3d
 
                             source_pcd = o3d.geometry.PointCloud()
@@ -2586,10 +2704,13 @@ def run_live(args: argparse.Namespace) -> None:
                             o3d_icp_result = o3d.pipelines.registration.registration_icp(
                                 source=source_pcd,
                                 target=reference_pcd,
-                                max_correspondence_distance=0.01,
+                                max_correspondence_distance=float(args.icp_o3d_max_corr_dist),
                                 init=T_cam_to_book,
                                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+                                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                                    max_iteration=int(args.icp_o3d_max_iterations),
+                                    relative_rmse=float(args.icp_o3d_relative_rmse),
+                                ),
                             )
 
                             icp_time_sec = time.perf_counter() - icp_t0
@@ -2612,8 +2733,9 @@ def run_live(args: argparse.Namespace) -> None:
                     "build_camera_inputs_time_sec": build_camera_inputs_time,
                     "rgbd_build_timing_sec": rgbd_build_timing,
                     "process_frame_time_sec": process_wall_time,
+                    "view_time_sec": view_time_sec,
                     "icp_time_sec": icp_time_sec,
-                    "other_time_sec": max(0.0, loop_runtime - capture_time - build_camera_inputs_time - process_wall_time - icp_time_sec),
+                    "other_time_sec": max(0.0, loop_runtime - capture_time - build_camera_inputs_time - process_wall_time - view_time_sec - icp_time_sec),
                     "loop_runtime_sec": loop_runtime,
                 })
 
@@ -2623,13 +2745,21 @@ def run_live(args: argparse.Namespace) -> None:
                     R_book = T_book_in_world[:3, :3]
                     t_book = T_book_in_world[:3, 3]
 
-                    icp_type = "Go-ICP" if not icp_initialized else "Open3D ICP"
                     print(f"\n=== {icp_type} Pose [frame {result['frame_index']:03d}] ===")
                     print(f"  Time: {icp_time_sec:.4f}s  FPS: {fps:.1f}")
                     print(f"  Fitness: {icp_result.fitness:.6f}  RMSE: {icp_result.inlier_rmse:.6f}")
                     print(f"\n  Book pose in world:")
                     print(_format_icp_pose(R_book, t_book))
                     print(f"\n========================================\n")
+                    if icp_log_file is not None:
+                        qw, qx, qy, qz = _rotation_matrix_to_quaternion(R_book)
+                        icp_log_file.write(
+                            f"{result['frame_index']},{icp_type},{icp_result.fitness:.6f},"
+                            f"{icp_result.inlier_rmse:.6f},{icp_time_sec:.6f},"
+                            f"{t_book[0]:.6f},{t_book[1]:.6f},{t_book[2]:.6f},"
+                            f"{qw:.6f},{qx:.6f},{qy:.6f},{qz:.6f}\n"
+                        )
+                        icp_log_file.flush()
                 else:
                     print(f"\rFPS: {fps:.1f}  frame={result['frame_index']:03d}  loop={loop_runtime:.3f}s", end="")
 
@@ -2642,6 +2772,10 @@ def run_live(args: argparse.Namespace) -> None:
                 )
                 frame_index += 1
     finally:
+        if icp_log_file is not None:
+            icp_log_file.close()
+        if viewer is not None:
+            viewer.close()
         for aligner in fast_aligners.values():
             aligner.close()
         for camera in cameras:

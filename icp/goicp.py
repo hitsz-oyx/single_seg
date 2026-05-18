@@ -265,7 +265,7 @@ def _run_goicp_registration(
         ctx.dt_built = True
         built_dt_this_call = True
 
-    register_timeout = 10
+    register_timeout = 30
     def _timeout_handler(signum, frame):
         raise TimeoutError(f"Go-ICP Register() timed out after {register_timeout}s")
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
@@ -273,6 +273,7 @@ def _run_goicp_registration(
 
     try:
         solver.Register()
+        print(f"[GOICP] solver.Register() returned", flush=True)
     except TimeoutError:
         logging.getLogger("goicp").warning("Go-ICP Register() timed out, returning identity")
         T_unit = np.eye(4, dtype=np.float64)
