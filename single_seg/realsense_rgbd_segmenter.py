@@ -8,10 +8,15 @@ import logging
 from pathlib import Path
 import sys
 import time
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from typing import Any
 
 import cv2
 import numpy as np
+import open3d as o3d
 import torch
 import yaml
 from omegaconf import OmegaConf
@@ -41,6 +46,73 @@ _RECTIFIED_RAY_GRID_CACHE: dict[tuple[object, ...], tuple[torch.Tensor, torch.Te
 
 if str(FAST_STEREO_ROOT) not in sys.path:
     sys.path.insert(0, str(FAST_STEREO_ROOT))
+
+ICP_DIR = REPO_ROOT / "icp"
+if str(ICP_DIR) not in sys.path:
+    sys.path.insert(0, str(ICP_DIR))
+
+
+def _transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
+    return (points @ T[:3, :3].T + T[:3, 3][None, :]).astype(np.float64)
+
+
+def _invert_transform(T: np.ndarray) -> np.ndarray:
+    R, t = T[:3, :3], T[:3, 3]
+    T_inv = np.eye(4, dtype=np.float64)
+    T_inv[:3, :3] = R.T
+    T_inv[:3, 3] = -R.T @ t
+    return T_inv
+
+
+def _rotation_matrix_to_quaternion(R: np.ndarray) -> tuple:
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return w, x, y, z
+
+
+def _format_icp_pose(R: np.ndarray, t: np.ndarray) -> str:
+    qw, qx, qy, qz = _rotation_matrix_to_quaternion(R)
+    return (
+        f"  position: [{t[0]:.6f}, {t[1]:.6f}, {t[2]:.6f}]\n"
+        f"  orientation (R):\n"
+        f"    [{R[0,0]:.6f}, {R[0,1]:.6f}, {R[0,2]:.6f}]\n"
+        f"    [{R[1,0]:.6f}, {R[1,1]:.6f}, {R[1,2]:.6f}]\n"
+        f"    [{R[2,0]:.6f}, {R[2,1]:.6f}, {R[2,2]:.6f}]\n"
+        f"  orientation (quat): [qw={qw:.6f}, qx={qx:.6f}, qy={qy:.6f}, qz={qz:.6f}]"
+    )
+
+
+def _sample_obj_surface_points(obj_path: Path, sample_points: int = 10000) -> np.ndarray:
+    mesh = o3d.io.read_triangle_mesh(str(obj_path), enable_post_processing=True)
+    if mesh.is_empty():
+        raise ValueError(f"Mesh is empty: {obj_path}")
+    sampled = mesh.sample_points_uniformly(number_of_points=sample_points)
+    points = np.asarray(sampled.points, dtype=np.float64)
+    logging.info(f"Sampled mesh {obj_path.name}: {len(points)} points")
+    return points
 
 
 def sync_cuda_if_needed(enabled: bool) -> None:
@@ -1807,6 +1879,13 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults[key] = int(bool(value))
         else:
             defaults[key] = value
+
+    icp_cfg = payload.get("icp", {})
+    if isinstance(icp_cfg, dict):
+        if "use_icp" in icp_cfg:
+            defaults["use_icp"] = bool(icp_cfg["use_icp"])
+        if "icp_obj_path" in icp_cfg:
+            defaults["icp_obj_path"] = resolve_repo_path(icp_cfg["icp_obj_path"])
     return defaults
 
 
@@ -1890,12 +1969,15 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--fast-hiera", type=int, default=0)
     parser.add_argument("--fast-optimize-build-volume", choices=("pytorch1", "triton"), default="pytorch1")
     parser.add_argument("--save-live-debug", type=int, default=1)
-    parser.add_argument(
-        "--sync-timing",
+    parser.add_argument("--sync-timing",
         type=int,
         default=0,
         help="同步 CUDA 后再计时，1 开启会让耗时归因更准确，但会降低吞吐",
     )
+    parser.add_argument("--use-icp", action="store_true", default=False,
+                        help="启用 Go-ICP 配准，实时计算物体位姿")
+    parser.add_argument("--icp-obj-path", type=Path, default=None,
+                        help="Go-ICP 配准参考物体 OBJ 文件路径")
     if defaults:
         parser.set_defaults(**defaults)
     return parser
@@ -2247,10 +2329,6 @@ def build_camera_inputs_from_live_frames(
             + depth_valid_ratio_time_sec
         )
         debug_write_total += live_debug_write_time_sec
-        logging.info(
-            f"Built RGBD for {camera_id}: source={depth_source} rgb={rgb.shape} "
-            f"depth_valid_ratio={depth_valid_ratio:.3f}"
-        )
     if timing is not None:
         timing.clear()
         timing.update(
@@ -2383,6 +2461,31 @@ def run_live(args: argparse.Namespace) -> None:
                 logging.info(f"Saved live debug config snapshot to {segmenter.output_dir / 'live_debug_config.yaml'}")
             frame_limit = None if int(args.max_frames) <= 0 else int(args.max_frames)
             frame_index = 0
+
+            use_icp = bool(args.use_icp)
+            icp_reference_points = None
+            icp_solver_ctx = None
+            if use_icp:
+                icp_obj_path = args.icp_obj_path
+                if icp_obj_path is None:
+                    icp_obj_path = resolve_repo_path("assets/icp_assets/book.obj")
+                else:
+                    icp_obj_path = Path(icp_obj_path)
+                if not icp_obj_path.exists():
+                    logging.warning(f"ICP 参考 OBJ 文件不存在: {icp_obj_path}，将跳过 ICP 配准")
+                    use_icp = False
+                else:
+                    logging.info(f"Loading ICP reference OBJ: {icp_obj_path.resolve()}")
+                    icp_reference_points = _sample_obj_surface_points(icp_obj_path.resolve())
+                    if icp_reference_points.shape[0] < 4:
+                        logging.warning("ICP 参考 OBJ 顶点数 < 4，将跳过 ICP 配准")
+                        use_icp = False
+                        icp_reference_points = None
+                    else:
+                        icp_initialized = False
+                        T_cam_to_book = np.eye(4, dtype=np.float64)
+                        logging.info(f"Loaded ICP reference: {icp_reference_points.shape[0]} vertices")
+
             while frame_limit is None or frame_index < frame_limit:
                 loop_t0 = time.perf_counter()
                 logging.info(f"Capturing live frame {frame_index:05d}")
@@ -2427,6 +2530,7 @@ def run_live(args: argparse.Namespace) -> None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 process_t0 = time.perf_counter()
+
                 result = segmenter.process_frame(
                     frame_name=frame_name,
                     camera_inputs=camera_inputs,
@@ -2434,10 +2538,73 @@ def run_live(args: argparse.Namespace) -> None:
                         segmenter.output_dir / "live_rgbd_debug" if bool(args.save_live_debug) else None
                     ),
                 )
+
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 process_wall_time = time.perf_counter() - process_t0
+
+                icp_time_sec = 0.0
+                icp_result = None
+
+                if use_icp and icp_reference_points is not None:
+                    points_xyz_t = result["points_xyz"]
+                    labels_t = result["instance_labels"]
+                    target_mask = labels_t > 0
+                    target_count = int(torch.sum(target_mask).item())
+                    if torch.any(target_mask):
+                        icp_t0 = time.perf_counter()
+                        target_points = points_xyz_t[target_mask].cpu().numpy().astype(np.float64)
+
+                        if not icp_initialized:
+                            logging.info(f"[Frame {frame_index}] Using Go-ICP for initial registration")
+                            from icp.goicp import GoICPConfig, register_point_clouds
+                            config = GoICPConfig()
+                            config.goicp_mse_thresh = 0.01
+                            config.goicp_epsilon = 0.001
+                            config.goicp_quiet = True
+                            try:
+                                goicp_result, _ = register_point_clouds(
+                                    moving_points=target_points,
+                                    reference_points=icp_reference_points,
+                                    config=config,
+                                )
+                                icp_result = goicp_result
+                                icp_initialized = True
+                            except Exception as e:
+                                logging.warning(f"Go-ICP failed: {e}, falling back to Open3D ICP")
+                                icp_initialized = True
+                            icp_time_sec = time.perf_counter() - icp_t0
+                        else:
+                            logging.info(f"[Frame {frame_index}] Using Open3D ICP for tracking")
+                            import open3d as o3d
+
+                            source_pcd = o3d.geometry.PointCloud()
+                            source_pcd.points = o3d.utility.Vector3dVector(target_points)
+                            reference_pcd = o3d.geometry.PointCloud()
+                            reference_pcd.points = o3d.utility.Vector3dVector(icp_reference_points)
+
+                            o3d_icp_result = o3d.pipelines.registration.registration_icp(
+                                source=source_pcd,
+                                target=reference_pcd,
+                                max_correspondence_distance=0.01,
+                                init=T_cam_to_book,
+                                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+                            )
+
+                            icp_time_sec = time.perf_counter() - icp_t0
+
+                            class FakeICPResult:
+                                def __init__(self, data):
+                                    self.transformation = data.transformation
+                                    self.fitness = data.fitness
+                                    self.inlier_rmse = data.inlier_rmse
+                            icp_result = FakeICPResult(o3d_icp_result)
+
+
                 loop_runtime = time.perf_counter() - loop_t0
+                fps = 1.0 / loop_runtime if loop_runtime > 0 else float("inf")
+
                 segmenter.update_frame_metadata({
                     "total_frame_time_sec": loop_runtime,
                     "capture_time_sec": capture_time,
@@ -2445,14 +2612,33 @@ def run_live(args: argparse.Namespace) -> None:
                     "build_camera_inputs_time_sec": build_camera_inputs_time,
                     "rgbd_build_timing_sec": rgbd_build_timing,
                     "process_frame_time_sec": process_wall_time,
-                    "other_time_sec": max(0.0, loop_runtime - capture_time - build_camera_inputs_time - process_wall_time),
+                    "icp_time_sec": icp_time_sec,
+                    "other_time_sec": max(0.0, loop_runtime - capture_time - build_camera_inputs_time - process_wall_time - icp_time_sec),
                     "loop_runtime_sec": loop_runtime,
                 })
+
+                if icp_result is not None and icp_result is not False:
+                    T_cam_to_book = icp_result.transformation
+                    T_book_in_world = _invert_transform(T_cam_to_book)
+                    R_book = T_book_in_world[:3, :3]
+                    t_book = T_book_in_world[:3, 3]
+
+                    icp_type = "Go-ICP" if not icp_initialized else "Open3D ICP"
+                    print(f"\n=== {icp_type} Pose [frame {result['frame_index']:03d}] ===")
+                    print(f"  Time: {icp_time_sec:.4f}s  FPS: {fps:.1f}")
+                    print(f"  Fitness: {icp_result.fitness:.6f}  RMSE: {icp_result.inlier_rmse:.6f}")
+                    print(f"\n  Book pose in world:")
+                    print(_format_icp_pose(R_book, t_book))
+                    print(f"\n========================================\n")
+                else:
+                    print(f"\rFPS: {fps:.1f}  frame={result['frame_index']:03d}  loop={loop_runtime:.3f}s", end="")
+
                 logging.info(
                     f"[frame {result['frame_index']:03d}] {frame_name} "
                     f"points={result['points_xyz'].shape[0]} cameras={len(camera_inputs)} "
-                    f"loop={loop_runtime:.3f}s capture={capture_time:.3f}s "
-                    f"rgbd={build_camera_inputs_time:.3f}s process={process_wall_time:.3f}s"
+                    f"loop={loop_runtime:.3f}s fps={fps:.1f} "
+                    f"capture={capture_time:.3f}s rgbd={build_camera_inputs_time:.3f}s "
+                    f"process={process_wall_time:.3f}s icp={icp_time_sec:.3f}s"
                 )
                 frame_index += 1
     finally:

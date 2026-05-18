@@ -189,7 +189,7 @@ realsense:
   camera_poses_json: configs/camera_poses_apriltag.json
 
   # 最大处理帧数，0 表示无限制
-  max_frames: 2
+  max_frames: 5
 
   # 相机预热帧数，启动后等待 N 帧稳定
   camera_warmup_frames: 5
@@ -311,3 +311,14 @@ fast_stereo:
 
   # 是否使用分层推理 (更精细但更慢)
   hiera: false
+
+# =============================================================================
+# Go-ICP 实时位姿配准配置
+# =============================================================================
+icp:
+  # 是否启用 Go-ICP 实时配准，启用后每帧会计算物体位姿并打印到终端
+  use_icp: true
+
+  # Go-ICP 配准参考物体 OBJ 文件路径
+  # 物体需要预先扫描或建模，保存为 OBJ 格式
+  icp_obj_path: assets/icp_assets/book.obj

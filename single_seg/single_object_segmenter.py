@@ -3218,6 +3218,7 @@ class SingleObjectPointCloudSegmenter:
         later_capture_mean = optional_later_mean("capture_time_sec")
         later_rgbd_mean = optional_later_mean("build_camera_inputs_time_sec")
         later_process_wall_mean = optional_later_mean("process_frame_time_sec")
+        later_icp_mean = optional_later_mean("icp_time_sec")
         summary = {
             "target_name": self.target_name,
             "prompt_task_info": str(self.prompt_task_info),
@@ -3257,9 +3258,10 @@ class SingleObjectPointCloudSegmenter:
             "later_capture_time_sec_mean": later_capture_mean,
             "later_build_camera_inputs_time_sec_mean": later_rgbd_mean,
             "later_process_frame_time_sec_mean": later_process_wall_mean,
+            "later_icp_time_sec_mean": later_icp_mean,
             "timeline": self.timeline,
         }
-        (self.output_dir.parent / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (self.output_dir / "single_object_timeline.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     def close(self) -> None:
         """关闭分割器，释放资源并保存摘要信息。"""

@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import logging
 import os
+import signal
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -249,6 +251,7 @@ def _run_goicp_registration(
     config: GoICPConfig,
     solver_ctx: Optional[GoICPSolverContext] = None,
 ) -> Tuple[np.ndarray, bool, GoICPSolverContext]:
+    os.environ["OMP_NUM_THREADS"] = "1"
     ctx = _prepare_solver_context(reference_down_np=reference_down_np, config=config, solver_ctx=solver_ctx)
     solver = ctx.solver
     point_cls = ctx.point_cls
@@ -262,25 +265,21 @@ def _run_goicp_registration(
         ctx.dt_built = True
         built_dt_this_call = True
 
-    devnull_fd = None
-    saved_stdout = None
-    saved_stderr = None
-    if bool(config.goicp_quiet):
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        saved_stdout = os.dup(1)
-        saved_stderr = os.dup(2)
-        os.dup2(devnull_fd, 1)
-        os.dup2(devnull_fd, 2)
+    register_timeout = 10
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(f"Go-ICP Register() timed out after {register_timeout}s")
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(register_timeout)
 
     try:
         solver.Register()
+    except TimeoutError:
+        logging.getLogger("goicp").warning("Go-ICP Register() timed out, returning identity")
+        T_unit = np.eye(4, dtype=np.float64)
+        return T_unit, built_dt_this_call, ctx
     finally:
-        if bool(config.goicp_quiet):
-            os.dup2(saved_stdout, 1)
-            os.dup2(saved_stderr, 2)
-            os.close(saved_stdout)
-            os.close(saved_stderr)
-            os.close(devnull_fd)
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
     rotation = np.asarray(solver.optimalRotation(), dtype=np.float64)
     translation = np.asarray(solver.optimalTranslation(), dtype=np.float64).reshape(-1)
