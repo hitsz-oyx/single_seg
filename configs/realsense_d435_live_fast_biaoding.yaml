@@ -10,7 +10,6 @@
 #   --camera-poses-json configs/camera_poses_apriltag.json \
 #   --save-ply \
 #   --save-debug-2d \
-#   --save-normal \
 #   --save-live-debug 1 \
 #   --overwrite-output
 
@@ -22,7 +21,6 @@
 #   --camera-poses-json configs/refined_extrinsics.json \
 #   --save-ply \
 #   --save-debug-2d \
-#   --save-normal \
 #   --save-live-debug 1 \
 #   --overwrite-output
 
@@ -56,7 +54,7 @@ segmenter:
 
   # 置信度阈值，用于过滤低置信度的分割结果
   # 范围: 0.0-1.0，值越高越严格
-  confidence: 0.25
+  confidence: 0.3
 
   # 掩码二值化阈值，用于将概率图转换为二值掩码
   # 范围: 0.0-1.0，值越高越严格
@@ -81,11 +79,11 @@ segmenter:
 
   # 点云采样步长，每隔 stride 个像素采样一个点
   # 值越大点云越稀疏，但处理更快
-  stride: 2
+  stride: 1
 
   # 帧内点云体素大小 (米)，用于降采样
   # 值越小点云越精细，但点数更多
-  frame_voxel_size: 0.002
+  frame_voxel_size: 0
 
   # 是否启用目标点 3D 聚类去散点
   # true: 在最终 3D 分割结果里过滤由深度估计噪声造成的零散目标点

@@ -933,7 +933,7 @@ def test_fuse_scene_geometry_torch_matches_numpy() -> None:
         np.array([1, 1], dtype=np.int32),
     ]
     np_points, np_colors, np_labels = fuse_scene_geometry(point_chunks, color_chunks, label_chunks, voxel_size=0.01)
-    t_points, t_colors, t_labels = fuse_scene_geometry_torch(
+    t_points, t_colors, t_labels, _, _ = fuse_scene_geometry_torch(
         [torch.from_numpy(chunk) for chunk in point_chunks],
         [torch.from_numpy(chunk) for chunk in color_chunks],
         [torch.from_numpy(chunk) for chunk in label_chunks],

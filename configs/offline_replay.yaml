@@ -22,8 +22,8 @@
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-input_dir: tests/outputs/demo0_1_ds3_live
-output_dir: tests/outputs/demo0_1_ds3_offline
+input_dir: tests/outputs/demo4_0_live
+output_dir: tests/outputs/demo4_0_offline
 
 frame_start: 0
 frame_end: 1
@@ -33,7 +33,7 @@ frame_end: 1
 # ---------------------------------------------------------------------------
 
 # 写法: 一个个传
-# for t in redcup book graycup plate porcelain whitecup; do
+# for t in redcup book graycup plate porcelain whitecup bowl; do
 #   python utils/offline_replay.py --config configs/offline_replay.yaml --target "$t"
 # done
 
@@ -45,8 +45,8 @@ camera_poses_json: configs/refined_extrinsics.json
 
 checkpoint_path: checkpoints/sam3.pt
 
-confidence: 0.7
-mask_threshold: 0.6
+confidence: 0.5
+mask_threshold: 0.4
 prompt_keep_score_threshold: 0.2
 video_mask_prob_threshold: 0.95
 
@@ -77,6 +77,18 @@ target_depth_band_filter_min_valid_pixels: 50
 target_depth_band_filter_min_keep_pixels: 30
 
 target_3d_mask_erode_kernel: 0
+
+
+# ---------------------------------------------------------------------------
+# single_object_mode: 单一物体模式（离线回放专用）
+# 对每个相机独立聚类找出离群相机，整体剔除后再融合
+#   多数投票选共识：邻居最多的相机簇中心为共识点
+# ---------------------------------------------------------------------------
+single_object_mode_enabled: false
+single_object_cluster_radius_m: 0.05      # DBSCAN 半径(m)
+single_object_cluster_min_points: 50      # 有效簇最少点数
+single_object_cluster_max_points: 300     # 聚类降采样上限
+single_object_camera_distance_ratio: 3.0  # 距离阈值 = radius × ratio = 0.15m
 
 # ---------------------------------------------------------------------------
 # Output

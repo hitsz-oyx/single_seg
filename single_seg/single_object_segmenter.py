@@ -22,6 +22,7 @@ import numpy as np
 import open3d as o3d
 from PIL import Image
 from PIL import ImageDraw
+import scipy.spatial
 import torch
 
 
@@ -1404,15 +1405,16 @@ def fuse_scene_geometry_torch(
     *,
     device: torch.device,
     score_chunks: list[torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """融合场景几何信息（PyTorch 实现），生成下采样后的点云、颜色、标签和置信度（求和）。"""
+    camera_idx_chunks: list[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """融合场景几何信息（PyTorch 实现），生成下采样后的点云、颜色、标签、置信度和相机计数值。"""
     points = torch.cat(point_chunks, dim=0)
     colors = torch.cat(color_chunks, dim=0)
     labels = torch.cat(label_chunks, dim=0).to(torch.int32)
     has_scores = score_chunks is not None and len(score_chunks) > 0
     scores: torch.Tensor | None = torch.cat(score_chunks, dim=0).to(torch.float32) if has_scores else None
     if points.numel() == 0 or float(voxel_size) <= 0.0:
-        return points.to(torch.float32), colors.to(torch.uint8), labels, scores
+        return points.to(torch.float32), colors.to(torch.uint8), labels, scores, None
 
     with no_autocast_context(device):
         voxel_keys = torch.floor(points.to(torch.float64) / float(voxel_size)).to(torch.int64)
@@ -1438,84 +1440,67 @@ def fuse_scene_geometry_torch(
             score_sum = torch.zeros((num_groups,), dtype=torch.float32, device=device)
             score_sum.scatter_add_(0, inverse, scores)
             down_scores = score_sum
-        return down_points, down_colors, label_max, down_scores
+        down_camera_counts: torch.Tensor | None = None
+        if camera_idx_chunks is not None and len(camera_idx_chunks) > 0:
+            camera_ids = torch.cat(camera_idx_chunks, dim=0).to(torch.int64)
+            num_cameras = int(camera_ids.max().item()) + 1
+            cam_one_hot = torch.zeros((points.shape[0], num_cameras), dtype=torch.float32, device=device)
+            cam_one_hot.scatter_(1, camera_ids[:, None], 1.0)
+            cam_count_sum = torch.zeros((num_groups, num_cameras), dtype=torch.float32, device=device)
+            cam_count_sum.scatter_add_(0, inverse[:, None].expand(-1, num_cameras), cam_one_hot)
+            down_camera_counts = (cam_count_sum > 0.5).to(torch.int32)
+        return down_points, down_colors, label_max, down_scores, down_camera_counts
 
 
 def dbscan_labels_from_points(points: np.ndarray, radius_m: float, min_points: int) -> np.ndarray:
-    """用网格邻域查询对 3D 点执行轻量 DBSCAN，返回每个点的簇 ID，噪声为 -1。"""
-    points = np.asarray(points, dtype=np.float32)
-    num_points = int(points.shape[0])
-    labels = np.full((num_points,), -2, dtype=np.int32)
-    if num_points == 0:
+    """用 scipy cKDTree 对 3D 点执行 DBSCAN（批量查询 + 并查集），返回每个点的簇 ID，噪声为 -1。"""
+    points = np.asarray(points, dtype=np.float64)
+    n = int(points.shape[0])
+    labels = np.full((n,), -1, dtype=np.int32)
+    if n == 0:
         return labels
     radius = float(radius_m)
     if radius <= 0.0:
-        return np.full((num_points,), -1, dtype=np.int32)
+        return labels
     min_points = max(int(min_points), 1)
-    radius_sq = radius * radius
-    voxel_keys = np.floor(points / radius).astype(np.int64, copy=False)
-    buckets: dict[tuple[int, int, int], list[int]] = {}
-    for index, key in enumerate(voxel_keys):
-        buckets.setdefault((int(key[0]), int(key[1]), int(key[2])), []).append(index)
-
-    neighbor_offsets = [
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-    ]
-
-    def region_query(point_index: int) -> np.ndarray:
-        key = voxel_keys[point_index]
-        candidates: list[int] = []
-        for dx, dy, dz in neighbor_offsets:
-            candidates.extend(
-                buckets.get(
-                    (int(key[0]) + dx, int(key[1]) + dy, int(key[2]) + dz),
-                    [],
-                )
-            )
-        candidate_ids = np.asarray(candidates, dtype=np.int64)
-        if candidate_ids.size == 0:
-            return candidate_ids
-        delta = points[candidate_ids] - points[point_index]
-        return candidate_ids[np.einsum("ij,ij->i", delta, delta) <= radius_sq]
-
+    tree = scipy.spatial.cKDTree(points)
+    neighbor_lists = tree.query_ball_point(points, radius)
+    core_mask = np.array([len(nb) >= min_points for nb in neighbor_lists], dtype=bool)
+    if not np.any(core_mask):
+        return labels
+    parent = np.arange(n, dtype=np.int32)
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(x: int, y: int) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+    for i in range(n):
+        if not core_mask[i]:
+            continue
+        for j in neighbor_lists[i]:
+            if core_mask[j]:
+                union(i, j)
+    root_to_cid: dict[int, int] = {}
     cluster_id = 0
-    for point_index in range(num_points):
-        if labels[point_index] != -2:
+    for i in range(n):
+        if not core_mask[i]:
             continue
-        neighbors = region_query(point_index)
-        if int(neighbors.size) < min_points:
-            labels[point_index] = -1
+        root = find(i)
+        if root not in root_to_cid:
+            root_to_cid[root] = cluster_id
+            cluster_id += 1
+        labels[i] = root_to_cid[root]
+    for i in range(n):
+        if core_mask[i] or labels[i] != -1:
             continue
-        labels[point_index] = cluster_id
-        queued = np.zeros((num_points,), dtype=bool)
-        seeds = []
-        for value in neighbors:
-            seed_value = int(value)
-            if seed_value == point_index:
-                continue
-            seeds.append(seed_value)
-            queued[seed_value] = True
-        seed_cursor = 0
-        while seed_cursor < len(seeds):
-            seed_index = seeds[seed_cursor]
-            seed_cursor += 1
-            if labels[seed_index] == -1:
-                labels[seed_index] = cluster_id
-            if labels[seed_index] != -2:
-                continue
-            labels[seed_index] = cluster_id
-            seed_neighbors = region_query(seed_index)
-            if int(seed_neighbors.size) >= min_points:
-                for neighbor_index in seed_neighbors:
-                    neighbor_int = int(neighbor_index)
-                    if labels[neighbor_int] in {-2, -1} and not bool(queued[neighbor_int]):
-                        seeds.append(neighbor_int)
-                        queued[neighbor_int] = True
-        cluster_id += 1
-    labels[labels == -2] = -1
+        for j in neighbor_lists[i]:
+            if core_mask[j]:
+                labels[i] = labels[j]
+                break
     return labels
 
 
@@ -2286,6 +2271,11 @@ class SingleObjectPointCloudSegmenter:
         target_depth_band_filter_min_valid_pixels: int = 50,
         target_depth_band_filter_min_keep_pixels: int = 20,
         target_3d_mask_erode_kernel: int = 0,
+        single_object_mode_enabled: bool = False,
+        single_object_cluster_radius_m: float = 0.05,
+        single_object_cluster_min_points: int = 50,
+        single_object_cluster_max_points: int = 500,
+        single_object_camera_distance_ratio: float = 3.0,
         save_ply: bool = True,
         save_normal: bool = False,
         save_debug_2d: bool = False,
@@ -2327,6 +2317,11 @@ class SingleObjectPointCloudSegmenter:
         if target_erode_kernel > 1 and target_erode_kernel % 2 == 0:
             target_erode_kernel += 1
         self.target_3d_mask_erode_kernel = target_erode_kernel
+        self.single_object_mode_enabled = bool(single_object_mode_enabled)
+        self.single_object_cluster_radius_m = float(single_object_cluster_radius_m)
+        self.single_object_cluster_min_points = int(single_object_cluster_min_points)
+        self.single_object_cluster_max_points = int(single_object_cluster_max_points)
+        self.single_object_camera_distance_ratio = float(single_object_camera_distance_ratio)
         self.save_ply = bool(save_ply)
         self.save_normal = bool(save_normal)
         self.save_debug_2d = bool(save_debug_2d)
@@ -2667,6 +2662,7 @@ class SingleObjectPointCloudSegmenter:
         camera_target_summary_time = 0.0
         target_plane_filter_time = 0.0
         target_cluster_filter_time = 0.0
+        single_object_filter_time = 0.0
         live_debug_object_ply_time = 0.0
         cpu_transfer_time = 0.0
         colorize_time = 0.0
@@ -2754,8 +2750,9 @@ class SingleObjectPointCloudSegmenter:
         color_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
         score_chunks: list[torch.Tensor] = []
+        camera_idx_chunks: list[torch.Tensor] = []
         camera_summaries: list[dict[str, object]] = []
-        for camera_id in self.active_camera_ids:
+        for camera_idx, camera_id in enumerate(self.active_camera_ids):
             camera_prepare_t0 = time.perf_counter()
             payload = camera_inputs[camera_id]
             stereo_time += float(payload.get("stereo_time_sec", 0.0))
@@ -2967,6 +2964,10 @@ class SingleObjectPointCloudSegmenter:
                 color_chunks.append(colors)
                 label_chunks.append(point_labels)
                 score_chunks.append(point_scores)
+                if self.single_object_mode_enabled:
+                    camera_idx_chunks.append(
+                        torch.full((points.shape[0],), camera_idx, dtype=torch.int32, device=points.device)
+                    )
             camera_target_summary_time += time.perf_counter() - target_summary_t0
             camera_summary = {
                 "camera_id": camera_id,
@@ -2988,6 +2989,14 @@ class SingleObjectPointCloudSegmenter:
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_t0 = time.perf_counter()
         scores_t: torch.Tensor | None = None
+        if self.single_object_mode_enabled and len(point_chunks) > 1:
+            good_mask = self._filter_bad_cameras(point_chunks, label_chunks)
+            for i, g in enumerate(good_mask):
+                if not g:
+                    label_chunks[i] = torch.zeros_like(label_chunks[i])
+                    score_chunks[i] = torch.zeros_like(score_chunks[i])
+            camera_summaries = [s for s, g in zip(camera_summaries, good_mask) if g]
+            camera_idx_chunks = camera_idx_chunks if any(g for g in good_mask) else []
         if point_chunks:
             fuse_result = fuse_scene_geometry_torch(
                 point_chunks=point_chunks,
@@ -2996,13 +3005,15 @@ class SingleObjectPointCloudSegmenter:
                 voxel_size=self.frame_voxel_size,
                 device=self.tensor_device,
                 score_chunks=score_chunks,
+                camera_idx_chunks=camera_idx_chunks if self.single_object_mode_enabled else None,
             )
-            points_xyz_t, raw_colors_t, labels_t, scores_t = fuse_result
+            points_xyz_t, raw_colors_t, labels_t, scores_t, camera_counts_t = fuse_result
         else:
             points_xyz_t = torch.empty((0, 3), dtype=torch.float32, device=self.tensor_device)
             raw_colors_t = torch.empty((0, 3), dtype=torch.uint8, device=self.tensor_device)
             labels_t = torch.empty((0,), dtype=torch.int32, device=self.tensor_device)
             scores_t = torch.empty((0,), dtype=torch.float32, device=self.tensor_device)
+            camera_counts_t = None
         maybe_cuda_synchronize(self.tensor_device, self.sync_timing)
         fuse_time = time.perf_counter() - fuse_t0
         target_cluster_summary: dict[str, object] = {
@@ -3163,6 +3174,7 @@ class SingleObjectPointCloudSegmenter:
                     "camera_target_summary_time_sec": camera_target_summary_time,
                     "camera_bookkeeping_time_sec": camera_bookkeeping_time,
                     "target_cluster_filter_time_sec": target_cluster_filter_time,
+                    "single_object_filter_time_sec": single_object_filter_time,
                     "live_debug_object_ply_time_sec": live_debug_object_ply_time,
                     "cpu_transfer_time_sec": cpu_transfer_time,
                     "colorize_time_sec": colorize_time,
@@ -3283,6 +3295,77 @@ class SingleObjectPointCloudSegmenter:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def _filter_bad_cameras(
+        self,
+        point_chunks: list[torch.Tensor],
+        label_chunks: list[torch.Tensor],
+    ) -> list[bool]:
+        num_cameras = len(point_chunks)
+        if num_cameras <= 1:
+            return [True] * num_cameras
+        centers: list[np.ndarray | None] = []
+        sizes: list[int] = []
+        for i in range(num_cameras):
+            pts = point_chunks[i].detach().cpu().numpy().astype(np.float64)
+            lbls = label_chunks[i].detach().cpu().numpy()
+            target_mask = lbls > 0
+            target_count = int(np.sum(target_mask))
+            if target_count < self.single_object_cluster_min_points:
+                centers.append(None)
+                sizes.append(0)
+                continue
+            target_pts = pts[target_mask]
+            if target_count > self.single_object_cluster_max_points:
+                rng = np.random.default_rng(0)
+                idx = rng.choice(target_count, size=self.single_object_cluster_max_points, replace=False)
+                cluster_input = target_pts[idx]
+            else:
+                cluster_input = target_pts
+            cluster_labels = dbscan_labels_from_points(
+                cluster_input,
+                radius_m=self.single_object_cluster_radius_m,
+                min_points=self.single_object_cluster_min_points,
+            )
+            valid = cluster_labels[cluster_labels >= 0]
+            if len(valid) == 0:
+                centers.append(None)
+                sizes.append(0)
+                continue
+            best_cid = int(np.bincount(valid).argmax())
+            best_pts = cluster_input[cluster_labels == best_cid]
+            centers.append(best_pts.mean(axis=0))
+            sizes.append(len(best_pts))
+        best_idx = max(range(num_cameras), key=lambda i: sizes[i])
+        consensus_center = centers[best_idx]
+        if consensus_center is None:
+            return [True] * num_cameras
+        dist_thresh = self.single_object_cluster_radius_m * self.single_object_camera_distance_ratio
+        valid_indices = [i for i, c in enumerate(centers) if c is not None]
+        if len(valid_indices) >= 2:
+            neighbor_counts = []
+            for i in valid_indices:
+                cnt = sum(
+                    1 for j in valid_indices
+                    if np.linalg.norm(centers[i] - centers[j]) <= dist_thresh
+                )
+                neighbor_counts.append(cnt)
+            consensus_idx = valid_indices[int(np.argmax(neighbor_counts))]
+            consensus_center = centers[consensus_idx]
+        good = []
+        for i in range(num_cameras):
+            if centers[i] is None:
+                good.append(False)
+            else:
+                good.append(bool(np.linalg.norm(centers[i] - consensus_center) <= dist_thresh))
+        if not any(good):
+            good = [c is not None for c in centers]
+        if not any(good):
+            good = [True] * num_cameras
+        excluded_names = [str(i) for i, g in enumerate(good) if not g]
+        if excluded_names:
+            print(f"    [single_object_mode] bad cameras: {', '.join(excluded_names)}")
+        return good
 
     def update_frame_metadata(self, metadata: dict[str, object]) -> None:
         self.timeline[-1].update(metadata)

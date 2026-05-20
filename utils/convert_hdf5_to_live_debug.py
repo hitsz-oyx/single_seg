@@ -4,11 +4,12 @@
 Handles demo0_X_ds3.hdf5 files from the Demo directory.
 
 Example:
-    python utils/convert_hdf5_to_live_debug.py \\
-        --hdf5-path /home/franka-client/oyx_ws/Demo/demo0_1_ds3.hdf5 \\
-        --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \\
-        --output-dir tests/outputs/demo0_1_ds3_live \\
-        --frame-start 0 --frame-end 10
+    python utils/convert_hdf5_to_live_debug.py \
+        --hdf5-path /home/franka-client/oyx_ws/Demo/demo0_1_ds3.hdf5 \
+        --realsense-para-dir /home/franka-client/oyx_ws/realsense_para \
+        --output-dir tests/outputs/demo0_1_ds3_live \  
+        --frame-start 0 \
+        --frame-end 10
 """
 
 from __future__ import annotations
