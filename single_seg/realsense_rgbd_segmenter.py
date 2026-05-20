@@ -1948,8 +1948,10 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults["use_icp"] = bool(icp_cfg["use_icp"])
         if "icp_obj_path" in icp_cfg:
             defaults["icp_obj_path"] = resolve_repo_path(icp_cfg["icp_obj_path"])
-        if "reference_sample_points" in icp_cfg:
-            defaults["icp_reference_sample_points"] = int(icp_cfg["reference_sample_points"])
+        if "goicp_sample_points" in icp_cfg:
+            defaults["icp_goicp_sample_points"] = int(icp_cfg["goicp_sample_points"])
+        if "open3d_sample_points" in icp_cfg:
+            defaults["icp_open3d_sample_points"] = int(icp_cfg["open3d_sample_points"])
         if "o3d_max_correspondence_distance" in icp_cfg:
             defaults["icp_o3d_max_corr_dist"] = float(icp_cfg["o3d_max_correspondence_distance"])
         if "o3d_max_iterations" in icp_cfg:
@@ -2050,8 +2052,10 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
                         help="启用 ICP 配准，实时计算物体位姿")
     parser.add_argument("--icp-obj-path", type=Path, default=None,
                         help="ICP 配准参考物体 OBJ 文件路径")
-    parser.add_argument("--icp-reference-sample-points", type=int, default=3000,
-                        help="OBJ 参考点云采样点数")
+    parser.add_argument("--icp-goicp-sample-points", type=int, default=5000,
+                        help="Go-ICP 配准使用的参考点云采样点数（第一帧初始化时使用）")
+    parser.add_argument("--icp-open3d-sample-points", type=int, default=3000,
+                        help="Open3D ICP 配准使用的参考点云采样点数（后续帧跟踪时使用）")
     parser.add_argument("--icp-o3d-max-corr-dist", type=float, default=0.02,
                         help="Open3D ICP 最大对应距离（米）")
     parser.add_argument("--icp-o3d-max-iterations", type=int, default=50,
@@ -2551,7 +2555,8 @@ def run_live(args: argparse.Namespace) -> None:
                 viewer = _PointCloudViewer()
 
             use_icp = bool(args.use_icp)
-            icp_reference_points = None
+            icp_goicp_reference_points = None
+            icp_open3d_reference_points = None
             icp_solver_ctx = None
             if use_icp:
                 icp_obj_path = args.icp_obj_path
@@ -2563,14 +2568,35 @@ def run_live(args: argparse.Namespace) -> None:
                     logging.warning(f"ICP 参考 OBJ 文件不存在: {icp_obj_path}，将跳过 ICP 配准")
                     use_icp = False
                 else:
+                    goicp_sample_points = int(args.icp_goicp_sample_points)
+                    open3d_sample_points = int(args.icp_open3d_sample_points)
                     logging.info(f"Loading ICP reference OBJ: {icp_obj_path.resolve()}")
-                    icp_reference_points = _sample_obj_surface_points(
-                        icp_obj_path.resolve(),
-                        sample_points=int(args.icp_reference_sample_points),
-                    )
+                    if goicp_sample_points == open3d_sample_points:
+                        shared_points = _sample_obj_surface_points(
+                            icp_obj_path.resolve(),
+                            sample_points=goicp_sample_points,
+                        )
+                        icp_goicp_reference_points = shared_points
+                        icp_open3d_reference_points = shared_points
+                        logging.info(f"Sampled {shared_points.shape[0]} shared reference points for both Go-ICP and Open3D")
+                    else:
+                        icp_goicp_reference_points = _sample_obj_surface_points(
+                            icp_obj_path.resolve(),
+                            sample_points=goicp_sample_points,
+                        )
+                        icp_open3d_reference_points = _sample_obj_surface_points(
+                            icp_obj_path.resolve(),
+                            sample_points=open3d_sample_points,
+                        )
+                        logging.info(f"Sampled {icp_goicp_reference_points.shape[0]} points for Go-ICP")
+                        logging.info(f"Sampled {icp_open3d_reference_points.shape[0]} points for Open3D")
+
+                    icp_reference_points = icp_goicp_reference_points
                     if icp_reference_points.shape[0] < 4:
                         logging.warning("ICP 参考 OBJ 顶点数 < 4，将跳过 ICP 配准")
                         use_icp = False
+                        icp_goicp_reference_points = None
+                        icp_open3d_reference_points = None
                         icp_reference_points = None
                     else:
                         icp_initialized = False
@@ -2662,7 +2688,7 @@ def run_live(args: argparse.Namespace) -> None:
                 icp_result = None
                 icp_type = "Open3D ICP"
 
-                if use_icp and icp_reference_points is not None:
+                if use_icp and icp_goicp_reference_points is not None and icp_open3d_reference_points is not None:
                     points_xyz_t = result["points_xyz"]
                     labels_t = result["instance_labels"]
                     target_mask = labels_t > 0
@@ -2681,7 +2707,7 @@ def run_live(args: argparse.Namespace) -> None:
                             try:
                                 goicp_result, _ = register_point_clouds(
                                     moving_points=target_points,
-                                    reference_points=icp_reference_points,
+                                    reference_points=icp_goicp_reference_points,
                                     config=config,
                                 )
                                 icp_result = goicp_result
@@ -2699,7 +2725,7 @@ def run_live(args: argparse.Namespace) -> None:
                             source_pcd = o3d.geometry.PointCloud()
                             source_pcd.points = o3d.utility.Vector3dVector(target_points)
                             reference_pcd = o3d.geometry.PointCloud()
-                            reference_pcd.points = o3d.utility.Vector3dVector(icp_reference_points)
+                            reference_pcd.points = o3d.utility.Vector3dVector(icp_open3d_reference_points)
 
                             o3d_icp_result = o3d.pipelines.registration.registration_icp(
                                 source=source_pcd,

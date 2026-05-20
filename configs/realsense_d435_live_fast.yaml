@@ -323,10 +323,15 @@ icp:
   # 物体需要预先扫描或建模，保存为 OBJ 格式
   icp_obj_path: assets/icp_assets/book.obj
 
-  # 从 OBJ 上均匀采样的参考点云点数
-  # 值越小 Open3D ICP 查找对应点越快，但精度会下降
-  # 500~3000 是速度与精度的平衡区间
-  reference_sample_points: 3000
+  # Go-ICP 配准使用的参考点云采样点数（第一帧初始化时使用）
+  # 值越大精度越高，但初始化速度越慢
+  # 典型值: 2000 ~ 10000
+  goicp_sample_points: 10000
+
+  # Open3D ICP 配准使用的参考点云采样点数（后续帧跟踪时使用）
+  # 值越小 ICP 查找对应点越快，但精度会下降
+  # 典型值: 500 ~ 3000
+  open3d_sample_points: 3000
 
   # Open3D ICP 点对点匹配的最大对应距离（米）
   # 值越小 ICP 只考虑局部精细匹配，收敛快但容易丢失
