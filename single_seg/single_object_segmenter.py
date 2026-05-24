@@ -2518,6 +2518,25 @@ class SingleObjectPointCloudSegmenter:
             }
             if selection is None:
                 per_camera_timing.append(per_camera_item)
+                seed_mask_shape = (
+                    tuple(payload["rgb"].shape[:2]) if torch.is_tensor(payload["rgb"])
+                    else np.asarray(payload["rgb"], dtype=np.uint8).shape[:2]
+                )
+                seed_mask = np.zeros(seed_mask_shape, dtype=bool)
+                active_camera_ids.append(camera_id)
+                seed_masks_by_camera[camera_id] = seed_mask
+                self.seed_info_by_camera[camera_id] = {
+                    "seed_score": 0.0,
+                    "seed_pixels": 0,
+                    "seed_box_xyxy": [0, 0, 0, 0],
+                    "seed_source": seed_source,
+                    "seed_shape_mode": "none",
+                }
+                per_camera_item.update({
+                    "seed_score": 0.0,
+                    "seed_pixels": 0,
+                    "seed_shape_mode": "none",
+                })
                 continue
             seed_mask, seed_score, seed_box = selection
             seed_mask, seed_shape_mode = refine_seed_mask(

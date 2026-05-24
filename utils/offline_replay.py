@@ -722,12 +722,16 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True, help="YAML config file")
     parser.add_argument("--target", type=str, default=None,
                         help="Single target name to process (overrides config targets list)")
+    parser.add_argument("--input-dir", type=Path, default=None,
+                        help="Input directory with live_rgbd_debug (overrides config input_dir)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory for results (overrides config output_dir)")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
-    input_dir = Path(cfg["input_dir"]).expanduser().resolve()
-    base_output_dir = Path(cfg["output_dir"]).expanduser().resolve()
+    input_dir = (args.input_dir if args.input_dir else Path(cfg["input_dir"])).expanduser().resolve()
+    base_output_dir = (args.output_dir if args.output_dir else Path(cfg["output_dir"])).expanduser().resolve()
 
     live_debug_dir = input_dir / "live_rgbd_debug"
     if not live_debug_dir.is_dir():

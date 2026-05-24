@@ -1,7 +1,11 @@
 # RealSense D435/D435i 实时分割配置文件
 # 使用 Fast-FoundationStereo 进行真 RGBD 深度估计
 # 相对路径基于仓库根目录解析
-
+#产生原始外参
+# python utils/calibrate_realsense_apriltag_extrinsics.py \
+#   --serials 243122075507,148522074762,845112070307 \
+#   --num-frames 30 \
+#   --debug-dir tests/outputs/apriltag_calibration_debug
 #原始外参
 # single-seg-realsense \
 #   --config configs/realsense_d435_live_fast_biaoding.yaml \
