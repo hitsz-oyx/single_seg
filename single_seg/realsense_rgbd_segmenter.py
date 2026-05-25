@@ -115,6 +115,59 @@ def _sample_obj_surface_points(obj_path: Path, sample_points: int = 10000) -> np
     return points
 
 
+def _render_view2d(
+    rgb_image: np.ndarray,
+    *,
+    intrinsics: dict[str, float],
+    world2cam: np.ndarray,
+    T_book_in_world: np.ndarray | None = None,
+    axis_length: float = 0.05,
+    window_name: str = "view2d",
+) -> None:
+    img_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+    h, w = img_bgr.shape[:2]
+
+    if T_book_in_world is not None:
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+
+        axis_local = np.array([
+            [0.0, 0.0, 0.0, 1.0],
+            [axis_length, 0.0, 0.0, 1.0],
+            [0.0, axis_length, 0.0, 1.0],
+            [0.0, 0.0, axis_length, 1.0],
+        ], dtype=np.float64).T
+
+        T_l2c = np.asarray(world2cam, dtype=np.float64) @ np.asarray(T_book_in_world, dtype=np.float64)
+        cam_pts_gl = (T_l2c @ axis_local)[:3, :]
+        cam_pts = CV_TO_GL[:3, :3] @ cam_pts_gl
+
+        z = cam_pts[2, :]
+        valid = z > 1e-6
+        if valid[0]:
+            u = np.round(cam_pts[0, :] * fx / z + cx).astype(np.int32)
+            v = np.round(cam_pts[1, :] * fy / z + cy).astype(np.int32)
+
+            logging.debug(
+                f"[view2d] img=({h}x{w}) fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f} "
+                f"origin_z={z[0]:.3f}m origin_px=({u[0]},{v[0]})"
+            )
+
+            if 0 <= u[0] < w and 0 <= v[0] < h:
+                axis_bgr = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
+
+                for i in range(3):
+                    idx = i + 1
+                    if not (valid[0] and valid[idx]):
+                        continue
+                    cv2.arrowedLine(img_bgr, (u[0], v[0]), (u[idx], v[idx]), axis_bgr[i], 2, tipLength=0.15)
+
+    cv2.imshow(window_name, img_bgr)
+    cv2.waitKey(1)
+
+
 class _PointCloudViewer:
     def __init__(self) -> None:
         import queue
@@ -124,8 +177,18 @@ class _PointCloudViewer:
         self._closed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._coordinate_frame: "o3d.geometry.TriangleMesh | None" = None
+        self._registered_pcd: "o3d.geometry.PointCloud | None" = None
+        self._registered_pcd_added = False
 
-    def update(self, points: np.ndarray, colors: np.ndarray | None) -> None:
+    def update(
+        self,
+        points: np.ndarray,
+        colors: np.ndarray | None,
+        pose_position: np.ndarray | None = None,
+        pose_quaternion: tuple[float, float, float, float] | None = None,
+        registered_points: np.ndarray | None = None,
+    ) -> None:
         if self._closed:
             return
         import queue as _queue_mod
@@ -135,9 +198,29 @@ class _PointCloudViewer:
                     self._queue.get_nowait()
                 except _queue_mod.Empty:
                     break
-            self._queue.put_nowait((points, colors))
+            self._queue.put_nowait((points, colors, pose_position, pose_quaternion, registered_points))
         except _queue_mod.Full:
             pass
+
+    def _create_coordinate_frame(
+        self,
+        position: np.ndarray,
+        quaternion: tuple[float, float, float, float],
+        scale: float = 0.05,
+    ) -> "o3d.geometry.TriangleMesh":
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=scale)
+        qw, qx, qy, qz = quaternion
+        R = np.array(
+            [
+                [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+                [2 * (qx * qy + qw * qz), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qw * qx)],
+                [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx**2 + qy**2)],
+            ],
+            dtype=np.float64,
+        )
+        mesh.rotate(R, center=(0, 0, 0))
+        mesh.translate(position)
+        return mesh
 
     def _run(self) -> None:
         import queue as _queue_mod
@@ -148,7 +231,7 @@ class _PointCloudViewer:
         first_frame = True
         while not self._closed:
             try:
-                points, colors = self._queue.get(timeout=0.1)
+                points, colors, pose_position, pose_quaternion, registered_points = self._queue.get(timeout=0.1)
             except _queue_mod.Empty:
                 vis.poll_events()
                 if hasattr(vis, "update_renderer"):
@@ -166,6 +249,32 @@ class _PointCloudViewer:
                 opt.point_size = 2.0
             else:
                 vis.update_geometry(pcd)
+
+            if registered_points is not None and registered_points.shape[0] > 0:
+                if self._registered_pcd is None:
+                    self._registered_pcd = o3d.geometry.PointCloud()
+                self._registered_pcd.points = o3d.utility.Vector3dVector(registered_points.astype(np.float64))
+                registered_colors = np.full((registered_points.shape[0], 3), [1.0, 0.0, 0.0], dtype=np.float64)
+                self._registered_pcd.colors = o3d.utility.Vector3dVector(registered_colors)
+                if not self._registered_pcd_added:
+                    vis.add_geometry(self._registered_pcd, reset_bounding_box=False)
+                    self._registered_pcd_added = True
+                else:
+                    vis.update_geometry(self._registered_pcd)
+            elif self._registered_pcd is not None and self._registered_pcd_added:
+                vis.remove_geometry(self._registered_pcd, reset_bounding_box=False)
+                self._registered_pcd_added = False
+
+            if pose_position is not None and pose_quaternion is not None:
+                if self._coordinate_frame is not None:
+                    vis.remove_geometry(self._coordinate_frame, reset_bounding_box=False)
+                self._coordinate_frame = self._create_coordinate_frame(
+                    pose_position.astype(np.float64),
+                    pose_quaternion,
+                    scale=0.05,
+                )
+                vis.add_geometry(self._coordinate_frame, reset_bounding_box=False)
+
             vis.poll_events()
             if hasattr(vis, "update_renderer"):
                 vis.update_renderer()
@@ -1960,6 +2069,8 @@ def load_live_arg_defaults(config_path: Path | str | None) -> dict[str, Any]:
             defaults["icp_o3d_relative_rmse"] = float(icp_cfg["o3d_relative_rmse"])
         if "view" in icp_cfg:
             defaults["view"] = bool(icp_cfg["view"])
+        if "view2d" in icp_cfg:
+            defaults["view2d"] = bool(icp_cfg["view2d"])
     return defaults
 
 
@@ -2064,6 +2175,8 @@ def build_arg_parser(defaults: dict[str, Any] | None = None) -> argparse.Argumen
                         help="Open3D ICP 相对 RMSE 收敛阈值")
     parser.add_argument("--view", action="store_true", default=False,
                         help="启用 Open3D 实时点云可视化（需要 DISPLAY 环境变量）")
+    parser.add_argument("--view2d", action="store_true", default=False,
+                        help="启用 2D 实时可视化，在 cam00 RGB 主图上投影 ICP 位姿坐标轴")
     if defaults:
         parser.set_defaults(**defaults)
     return parser
@@ -2554,6 +2667,11 @@ def run_live(args: argparse.Namespace) -> None:
             if use_view:
                 viewer = _PointCloudViewer()
 
+            use_view2d = bool(args.view2d)
+            if use_view2d:
+                cv2.namedWindow("view2d", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("view2d", 960, 540)
+
             use_icp = bool(args.use_icp)
             icp_goicp_reference_points = None
             icp_open3d_reference_points = None
@@ -2667,26 +2785,27 @@ def run_live(args: argparse.Namespace) -> None:
                     torch.cuda.synchronize()
                 process_wall_time = time.perf_counter() - process_t0
 
-                view_time_sec = 0.0
-                if use_view and viewer is not None:
-                    view_t0 = time.perf_counter()
-                    points_xyz_np = result["points_xyz"].cpu().numpy().astype(np.float32)
-                    vis_colors_np: np.ndarray | None = result["vis_colors"]
-                    if vis_colors_np is None:
-                        raw_colors_np = result["raw_colors"].cpu().numpy().astype(np.uint8)
-                        labels_np = result["instance_labels"].cpu().numpy()
-                        vis_colors_np = raw_colors_np.copy()
-                        target_mask_v = labels_np > 0
-                        if target_mask_v.any():
-                            vis_colors_np[target_mask_v] = np.array(
-                                [0, 255, 0], dtype=np.uint8
-                            )
-                    viewer.update(points_xyz_np, vis_colors_np)
-                    view_time_sec = time.perf_counter() - view_t0
-
                 icp_time_sec = 0.0
                 icp_result = None
                 icp_type = "Open3D ICP"
+
+                points_xyz_np = result["points_xyz"].cpu().numpy().astype(np.float32)
+                vis_colors_np: np.ndarray | None = result["vis_colors"]
+                if vis_colors_np is None:
+                    raw_colors_np = result["raw_colors"].cpu().numpy().astype(np.uint8)
+                    labels_np = result["instance_labels"].cpu().numpy()
+                    vis_colors_np = raw_colors_np.copy()
+                    target_mask_v = labels_np > 0
+                    if target_mask_v.any():
+                        vis_colors_np[target_mask_v] = np.array(
+                            [0, 255, 0], dtype=np.uint8
+                        )
+
+                view_time_sec = 0.0
+                if use_view and viewer is not None:
+                    view_t0 = time.perf_counter()
+                    viewer.update(points_xyz_np, vis_colors_np, None, None)
+                    view_time_sec = time.perf_counter() - view_t0
 
                 if use_icp and icp_goicp_reference_points is not None and icp_open3d_reference_points is not None:
                     points_xyz_t = result["points_xyz"]
@@ -2748,6 +2867,58 @@ def run_live(args: argparse.Namespace) -> None:
                                     self.inlier_rmse = data.inlier_rmse
                             icp_result = FakeICPResult(o3d_icp_result)
 
+                T_book_in_world = None
+                if (use_view or use_view2d) and icp_result is not None and icp_result is not False:
+                    T_book_in_world = _invert_transform(T_cam_to_book)
+                    pose_position = T_book_in_world[:3, 3].astype(np.float32)
+                    R_book = T_book_in_world[:3, :3]
+
+                    if use_view and viewer is not None:
+                        qw, qx, qy, qz = _rotation_matrix_to_quaternion(R_book)
+                        pose_quaternion = (qw, qx, qy, qz)
+
+                        registered_points_np = None
+                        labels_np = result["instance_labels"].cpu().numpy()
+                        target_mask_v = labels_np > 0
+                        if target_mask_v.any() and icp_open3d_reference_points is not None:
+                            num_ref_points = min(icp_open3d_reference_points.shape[0], 1000)
+                            ref_indices = np.random.choice(
+                                icp_open3d_reference_points.shape[0],
+                                size=num_ref_points,
+                                replace=False
+                            )
+                            reference_sampled = icp_open3d_reference_points[ref_indices].astype(np.float64)
+                            R_book_for_vis = T_book_in_world[:3, :3]
+                            t_book_for_vis = T_book_in_world[:3, 3]
+                            registered_points_np = (reference_sampled @ R_book_for_vis.T + t_book_for_vis).astype(np.float32)
+
+                            logging.info(f"[Frame {frame_index}] ICP Debug:")
+                            logging.info(f"  target_points centroid: {points_xyz_np[target_mask_v].mean(axis=0)}")
+                            logging.info(f"  reference_points (sampled) centroid: {reference_sampled.mean(axis=0)}")
+                            logging.info(f"  registered_points centroid: {registered_points_np.mean(axis=0)}")
+
+                        viewer.update(points_xyz_np, vis_colors_np, pose_position, pose_quaternion, registered_points_np)
+
+                if use_view2d:
+                    cam00_id = "cam_00"
+                    cam00_data = camera_inputs.get(cam00_id)
+                    if cam00_data is None:
+                        cam00_id = next(iter(camera_inputs))
+                        cam00_data = camera_inputs[cam00_id]
+                    cam00_rgb = cam00_data["rgb"]
+                    if torch.is_tensor(cam00_rgb):
+                        cam00_rgb = cam00_rgb.detach().cpu().numpy().astype(np.uint8)
+                    else:
+                        cam00_rgb = np.asarray(cam00_rgb, dtype=np.uint8)
+                    cam00_intrinsics = cam00_data["intrinsics"]
+                    cam00_pose = cam00_data["pose_record"]
+                    world2cam = np.asarray(cam00_pose["world2cam_4x4"], dtype=np.float64)
+                    _render_view2d(
+                        cam00_rgb,
+                        intrinsics=cam00_intrinsics,
+                        world2cam=world2cam,
+                        T_book_in_world=T_book_in_world,
+                    )
 
                 loop_runtime = time.perf_counter() - loop_t0
                 fps = 1.0 / loop_runtime if loop_runtime > 0 else float("inf")
@@ -2802,6 +2973,8 @@ def run_live(args: argparse.Namespace) -> None:
             icp_log_file.close()
         if viewer is not None:
             viewer.close()
+        if use_view2d:
+            cv2.destroyWindow("view2d")
         for aligner in fast_aligners.values():
             aligner.close()
         for camera in cameras:

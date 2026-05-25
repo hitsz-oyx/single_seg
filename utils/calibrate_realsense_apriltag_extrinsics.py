@@ -495,7 +495,8 @@ class RealSenseColorCamera:
         return np.asanyarray(color_frame.get_data()).copy()
 
     def stop(self) -> None:
-        self.pipeline.stop()
+        if self.profile is not None:
+            self.pipeline.stop()
 
 
 def list_realsense_serials() -> list[str]:
