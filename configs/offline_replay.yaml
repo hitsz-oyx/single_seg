@@ -14,20 +14,19 @@
 
 
   # python utils/aggregate_offline_labels.py \
-  #   --base-output-dir tests/outputs/demo0_1_ds3_offline \
+  #   --base-output-dir tests/outputs/mpc2_rollout \
   #   --targets-json assets/prompts/targets.json \
-  #   --targets redcup book graycup plate porcelain whitecup \
-  #   --output-dir tests/outputs/demo0_1_ds3_offline/aggregate
+  #   --output-dir tests/outputs/mpc2_rollout/aggregate
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-input_dir: tests/outputs/demo6_0_ds2_live
-output_dir: tests/outputs/demo6_0_ds2_offline
+input_dir: tests/outputs/mpc2
+output_dir: tests/outputs/mpc2_rollout
 
 frame_start: 0
 # null 表示回放所有帧
-frame_end: 1
+frame_end: null
 
 # ---------------------------------------------------------------------------
 # Targets (multi-object segmentation)
@@ -42,7 +41,7 @@ frame_end: 1
 #     --target "$t"
 # done
 
-targets: [redcup]
+targets: [porcelain]
 
 targets_json: assets/prompts/targets.json
 prompts_root: assets/prompts

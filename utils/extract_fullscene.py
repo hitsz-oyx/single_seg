@@ -5,8 +5,8 @@ import argparse
 from pathlib import Path
 """
 python utils/extract_fullscene.py \
-    /home/franka-client/oyx_ws/single_seg/tests/outputs/demo5_0_ds2_offline/aggregate \
-    /home/franka-client/oyx_ws/single_seg/tests/outputs/demo5_0_ds2_offline/fullscene
+    /home/franka-client/oyx_ws/single_seg/tests/outputs/mpc2_rollout/aggregate \
+    /home/franka-client/oyx_ws/single_seg/tests/outputs/mpc2_rollout/fullscene
 """
 def extract_fullscene(source_dir, output_dir):
     source_path = Path(source_dir)

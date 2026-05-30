@@ -1829,6 +1829,7 @@ class RealSenseRgbdCamera:
             "depth_source": self.depth_source,
             "emitter_enabled": self.applied_emitter_enabled,
             "rgb": cv2.cvtColor(color_undistorted_bgr, cv2.COLOR_BGR2RGB),
+            "raw_rgb": cv2.cvtColor(color_raw_bgr, cv2.COLOR_BGR2RGB),
             "ir_left_raw": left_raw,
             "ir_right_raw": right_raw,
             "ir_left_rect": left_rect,
