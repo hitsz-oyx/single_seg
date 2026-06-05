@@ -4,7 +4,9 @@
 Reads instance_label.ply (labels only) and scene_rgb.ply (points + colors) from
 offline_{target_name}/frame_XXXXX/ directories. All targets share the same scene
 point cloud with different label annotations (0=background, N=target_id).
-Labels are merged by taking the per-point maximum across all targets.
+Labels are merged by taking the per-point maximum across all targets, then each
+target's labeled points are clustered (DBSCAN) and only the dominant cluster is
+retained — outlier points are relabeled as background.
 
 Outputs per frame:
   - frame_XXXXX_instance_rgb.ply   : target-colored points (label > 0 only)
@@ -32,6 +34,7 @@ from typing import Any
 
 import numpy as np
 import yaml
+from scipy.spatial import KDTree
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -127,6 +130,95 @@ def detect_targets_from_dir(base_output_dir: Path, target_info: dict[str, Any]) 
     return targets
 
 
+def refine_labels_by_cluster(
+    points: np.ndarray,
+    labels: np.ndarray,
+    eps: float = 0.03,
+    min_samples: int = 10,
+    knn_iter: int = 2,
+) -> np.ndarray:
+    """多轮质心距离 + KNN 双重检查修正标签。
+
+    每轮迭代：
+    1. 重新计算当前 label 下各目标的质心和半径
+    2. 对每个标记点检查：
+       - 如果离自己质心过远 → 噪声，标为 0
+       - 最近质心属于别的目标，且 KNN 多数也属于该目标 → 修正
+    3. 修正后的 label 影响下一轮的质心和 KNN 计算
+    """
+    current = labels.copy()
+
+    for iteration in range(knn_iter):
+        unique_targets = np.unique(current[current > 0])
+        if len(unique_targets) == 0:
+            break
+
+        centroids: dict[int, np.ndarray] = {}
+        radii: dict[int, float] = {}
+
+        for tid in unique_targets:
+            mask = current == tid
+            pts = points[mask]
+            centroid = pts.mean(axis=0)
+            centroids[int(tid)] = centroid
+            dists = np.sqrt(((pts - centroid) ** 2).sum(axis=1))
+            radii[int(tid)] = float(np.percentile(dists, 95))
+
+        tid_list = np.array(list(centroids.keys()), dtype=np.int32)
+        centroid_arr = np.array([centroids[t] for t in tid_list])
+
+        labeled_mask = current > 0
+        labeled_idx = np.where(labeled_mask)[0]
+        n_labeled = len(labeled_idx)
+
+        if n_labeled <= min_samples:
+            break
+
+        tree = KDTree(points[labeled_idx])
+        k = min(min_samples, n_labeled - 1)
+        _, indices = tree.query(points[labeled_idx], k=k + 1)
+
+        n_relabeled = 0
+        n_noise = 0
+        changes = np.zeros(len(current), dtype=bool)
+
+        for i, pt_idx in enumerate(labeled_idx):
+            pt = points[pt_idx]
+            current_label = int(current[pt_idx])
+
+            dists = np.sqrt(((centroid_arr - pt) ** 2).sum(axis=1))
+            nearest_idx = int(np.argmin(dists))
+            nearest_tid = int(tid_list[nearest_idx])
+
+            own_radius = radii[current_label]
+            own_dist = float(dists[tid_list == current_label][0])
+
+            if own_dist > eps + own_radius:
+                current[pt_idx] = 0
+                changes[pt_idx] = True
+                n_noise += 1
+                continue
+
+            if nearest_tid == current_label:
+                continue
+
+            neighbor_labels = current[labeled_idx[indices[i, 1:]]]
+            values, counts = np.unique(neighbor_labels, return_counts=True)
+            majority_label = int(values[np.argmax(counts)])
+
+            if majority_label == nearest_tid and majority_label != current_label:
+                current[pt_idx] = nearest_tid
+                changes[pt_idx] = True
+                n_relabeled += 1
+
+        if n_relabeled > 0 or n_noise > 0:
+            print(f"    iter {iteration + 1}: relabeled {n_relabeled}, removed {n_noise} noise")
+        if not changes.any():
+            break
+
+    return current
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate multi-target offline segmentation results")
     parser.add_argument("--config", type=Path, default=None, help="YAML config file")
@@ -138,7 +230,14 @@ def main() -> None:
                         help="List of target names to aggregate (e.g. redcup bowl); if omitted, auto-detect from base_output_dir")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Output directory for aggregated PLY files")
+    parser.add_argument("--cluster-eps", type=float, default=0.03,
+                        help="DBSCAN 聚类半径(m)，用于离群点过滤（默认0.03）")
+    parser.add_argument("--cluster-min-samples", type=int, default=10,
+                        help="DBSCAN/KNN 最小样本数（默认10）")
+    parser.add_argument("--knn-iter", type=int, default=2,
+                        help="KNN 迭代次数（默认2，多次迭代逐渐修正边界点）")
     args = parser.parse_args()
+    cfg: dict[str, Any] = {}
 
     if args.config:
         cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -205,9 +304,20 @@ def main() -> None:
             print(f"  [{frame_idx+1}/{total_frames}] {frame_name}: no valid labels from any target, skipping")
             continue
 
+        cluster_eps = args.cluster_eps or (cfg.get("cluster_eps", 0.03) if args.config else 0.03)
+        cluster_min_samples = args.cluster_min_samples or (cfg.get("cluster_min_samples", 10) if args.config else 10)
+
         merged_labels = np.zeros_like(all_labels[0])
         for labels in all_labels:
             np.maximum(merged_labels, labels, out=merged_labels)
+
+        if cluster_eps > 0 and scene_points is not None:
+            merged_labels = refine_labels_by_cluster(
+                scene_points, merged_labels,
+                eps=float(cluster_eps),
+                min_samples=int(cluster_min_samples),
+                knn_iter=int(args.knn_iter or (cfg.get("knn_iter", 2) if args.config else 2)),
+            )
 
         scene_rgb_ply = (base_output_dir / f"offline_{first_target}" / frame_name
                          / "frame_outputs" / f"{frame_name}_scene_rgb.ply")

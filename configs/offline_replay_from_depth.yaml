@@ -1,0 +1,83 @@
+# Offline replay from depth config
+# 直接使用已有深度数据运行 SAM3 分割（跳过 Fast-Stereo）
+# 
+# 用法:
+#   python utils/offline_replay_from_depth.py --config configs/offline_replay_from_depth.yaml
+# 
+# CLI 参数可覆盖配置文件中的对应值:
+#   python utils/offline_replay_from_depth.py --config configs/offline_replay_from_depth.yaml --target bowl
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+input_dir: /home/franka-client/oyx_ws/rollout1/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_demo_pcd__demo_24/render/depth_frame_000005/predicted
+output_dir: /home/franka-client/oyx_ws/single_seg/tests/outputs/rollout1_virtual_seg
+
+# ---------------------------------------------------------------------------
+# Target
+# ---------------------------------------------------------------------------
+target: stove_burner_virtual
+
+targets_json: assets/prompts/targets.json
+prompts_root: assets/prompts
+
+checkpoint_path: checkpoints/sam3.pt
+
+overwrite_output: true
+
+# ---------------------------------------------------------------------------
+# Depth and point cloud
+# ---------------------------------------------------------------------------
+depth_min: 0.1
+depth_max: 3.0
+stride: 1
+frame_voxel_size: 0
+
+# ---------------------------------------------------------------------------
+# SAM3 inference
+# ---------------------------------------------------------------------------
+confidence: 0.25
+mask_threshold: 0.6
+prompt_keep_score_threshold: 0.2
+video_mask_prob_threshold: 0.95
+
+# ---------------------------------------------------------------------------
+# Filter options
+# ---------------------------------------------------------------------------
+target_cluster_filter_enabled: true
+target_cluster_radius_m: 0.025
+target_cluster_min_points: 35
+target_cluster_keep_largest: true
+
+target_plane_filter_enabled: false
+target_plane_filter_distance_m: 0.004
+target_plane_filter_min_points: 80
+target_plane_filter_min_inlier_ratio: 0.25
+target_plane_filter_max_inlier_ratio: 0.85
+target_plane_filter_max_planes: 1
+target_plane_filter_ransac_iterations: 256
+
+target_depth_band_filter_enabled: true
+target_depth_band_filter_range_m: 0.08
+target_depth_band_filter_min_valid_pixels: 50
+target_depth_band_filter_min_keep_pixels: 30
+
+target_3d_mask_erode_kernel: 0
+
+# ---------------------------------------------------------------------------
+# single_object_mode: 单一物体模式
+# ---------------------------------------------------------------------------
+single_object_mode_enabled: false
+single_object_cluster_radius_m: 0.05
+single_object_cluster_min_points: 50
+single_object_cluster_max_points: 300
+single_object_camera_distance_ratio: 3.0
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+save_ply: true
+save_normal: false
+save_debug_2d: true
+tracker_image_size: 896
+target_vis_color: [30, 60, 180]
